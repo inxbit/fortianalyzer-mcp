@@ -8,10 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Policy Traffic Analysis Tools** (3 tools) - Analyze traffic patterns per firewall policy for policy hardening
-  - `get_policy_traffic_profile`: Sampled traffic summary with top ports, services, and applications
-  - `get_policy_port_analysis`: Exact port/protocol enumeration with `is_exact` semantics
-  - `get_policy_protocol_summary`: Lightweight protocol breakdown (TCP/UDP/ICMP/other)
+- **Policy Traffic Analysis Tools** (3 tools) - Analyze observed traffic per firewall policy for policy review and tightening preparation
+  - `get_policy_traffic_profile`: Sampled discovery with exact recounts for top ports, services, and applications
+  - `get_policy_port_analysis`: Exact port/protocol enumeration with truthful `is_exact` semantics
+  - `get_policy_protocol_summary`: Exact protocol breakdown (TCP/UDP/ICMP/other)
 - Input validation for filter values (`sanitize_filter_value`) and action parameters (`validate_action`)
 - Concurrent policy query support with semaphore-bounded parallelism (`asyncio.Semaphore(5)`)
 

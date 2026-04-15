@@ -13,14 +13,18 @@ import logging
 import os
 import zipfile
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
     get_default_adom,
+    sanitize_filter_value,
     validate_adom,
+    validate_ips_action,
     validate_output_path,
+    validate_positive_int,
+    validate_severity,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,7 +35,7 @@ POLL_INTERVAL = 1.0
 MAX_PCAP_SIZE = 50 * 1024 * 1024  # 50MB per PCAP file
 
 
-def _get_client():
+def _get_client() -> Any:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -103,48 +107,49 @@ def _build_ips_filter(
 
     # Severity filter: (severity="critical" or severity="high")
     if severity:
+        normalized_severity = [validate_severity(item) for item in severity]
+        severity_terms = [f"severity=={sanitize_filter_value(item)}" for item in normalized_severity]
         if len(severity) == 1:
-            filters.append(f'severity="{severity[0]}"')
+            filters.append(severity_terms[0])
         else:
-            sev_parts = [f'severity="{s}"' for s in severity]
-            filters.append(f"({' or '.join(sev_parts)})")
+            filters.append(f"({' or '.join(severity_terms)})")
 
     # Attack name filter
     if attack_exact:
-        filters.append(f'attack="{attack_exact}"')
+        filters.append(f"attack=={sanitize_filter_value(attack_exact)}")
     elif attack_contains:
-        # Wildcard search: attack=*Remote.Code.Execution*
-        filters.append(f"attack=*{attack_contains}*")
+        filters.append(f"attack contain {sanitize_filter_value(attack_contains)}")
 
     # Action filter: (action="blocked" or action="dropped")
     if action:
+        normalized_actions = [validate_ips_action(item) for item in action]
+        action_terms = [f"action=={sanitize_filter_value(item)}" for item in normalized_actions]
         if len(action) == 1:
-            filters.append(f'action="{action[0]}"')
+            filters.append(action_terms[0])
         else:
-            act_parts = [f'action="{a}"' for a in action]
-            filters.append(f"({' or '.join(act_parts)})")
+            filters.append(f"({' or '.join(action_terms)})")
 
     # CVE filters
     if cve:
-        filters.append(f'cve="{cve}"')
+        filters.append(f"cve=={sanitize_filter_value(cve)}")
     elif has_cve:
         filters.append('cve!=""')
 
     # IP filters
     if srcip:
-        filters.append(f'srcip="{srcip}"')
+        filters.append(f"srcip=={sanitize_filter_value(srcip)}")
     if dstip:
-        filters.append(f'dstip="{dstip}"')
+        filters.append(f"dstip=={sanitize_filter_value(dstip)}")
 
     # Port filters
-    if srcport:
-        filters.append(f"srcport=={srcport}")
-    if dstport:
-        filters.append(f"dstport=={dstport}")
+    if srcport is not None:
+        filters.append(f"srcport=={validate_positive_int(srcport, 'srcport')}")
+    if dstport is not None:
+        filters.append(f"dstport=={validate_positive_int(dstport, 'dstport')}")
 
     # Session ID filter
-    if session_id:
-        filters.append(f"sessionid=={session_id}")
+    if session_id is not None:
+        filters.append(f"sessionid=={validate_positive_int(session_id, 'session_id')}")
 
     # PCAP availability filter
     if has_pcap:
@@ -401,9 +406,7 @@ async def get_pcap_by_session(
         # Validate inputs
         adom = validate_adom(adom or get_default_adom())
         output_path = validate_output_path(output_dir)
-
-        if session_id <= 0:
-            return {"status": "error", "message": "Invalid session ID"}
+        session_id = validate_positive_int(session_id, "session_id")
 
         client = _get_client()
 
@@ -1009,7 +1012,7 @@ async def list_available_pcaps(
         )
 
         if search_result.get("status") != "success":
-            return search_result
+            return cast(dict[str, Any], search_result)
 
         # Format results for easy reading
         events = []

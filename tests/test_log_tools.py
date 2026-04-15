@@ -4,9 +4,20 @@ Tests the client methods for log search and analysis operations.
 Follows the same pattern as test_system_tools.py to avoid server initialization.
 """
 
+import importlib
+import os
+
 import pytest
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
+
+os.environ.setdefault("FORTIANALYZER_HOST", "test-faz.local")
+
+
+@pytest.fixture
+def log_tools_module():
+    """Import the log tools module with a dummy FAZ host configured."""
+    return importlib.import_module("fortianalyzer_mcp.tools.log_tools")
 
 
 class TestLogToolsHelpers:
@@ -62,6 +73,83 @@ class TestLogToolsHelpers:
         else:
             result = [{"devname": device}]
         assert result == [{"devid": "All_FortiGate"}]
+
+
+class TestSearchFilterHardening:
+    """Tests for safe filter construction in log search helpers."""
+
+    async def test_search_traffic_logs_quotes_string_filters(self, monkeypatch, log_tools_module):
+        """Traffic log filters should validate actions and quote unsafe values."""
+        captured: dict[str, str | None] = {}
+
+        async def fake_query_logs(**kwargs):
+            captured["filter"] = kwargs.get("filter")
+            return {"status": "success", "logs": []}
+
+        monkeypatch.setattr(log_tools_module, "query_logs", fake_query_logs)
+
+        result = await log_tools_module.search_traffic_logs(
+            adom="root",
+            srcip="10.0.0.1 or policyid==1",
+            action="ACCEPT",
+            policy_id=7,
+        )
+
+        assert result["status"] == "success"
+        assert captured["filter"] == (
+            'srcip=="10.0.0.1 or policyid==1" and action==accept and policyid==7'
+        )
+
+    async def test_search_traffic_logs_rejects_invalid_action(self, log_tools_module):
+        """Traffic log helper should reject injected action values."""
+        result = await log_tools_module.search_traffic_logs(
+            adom="root",
+            action="accept or policyid==1",
+        )
+
+        assert result["status"] == "error"
+        assert "Validation error" in result["message"]
+
+    async def test_search_security_logs_quotes_attack_name(self, monkeypatch, log_tools_module):
+        """Security log helper should quote unsafe attack-name fragments."""
+        captured: dict[str, str | None] = {}
+
+        async def fake_query_logs(**kwargs):
+            captured["filter"] = kwargs.get("filter")
+            return {"status": "success", "logs": []}
+
+        monkeypatch.setattr(log_tools_module, "query_logs", fake_query_logs)
+
+        result = await log_tools_module.search_security_logs(
+            adom="root",
+            attack_name="Drupal REST or 1==1",
+            severity="HIGH",
+            srcip="10.0.0.1",
+        )
+
+        assert result["status"] == "success"
+        assert captured["filter"] == (
+            'attack contain "Drupal REST or 1==1" and severity==high and srcip==10.0.0.1'
+        )
+
+    async def test_search_event_logs_validates_enums(self, monkeypatch, log_tools_module):
+        """Event log helper should normalize known subtype and level values."""
+        captured: dict[str, str | None] = {}
+
+        async def fake_query_logs(**kwargs):
+            captured["filter"] = kwargs.get("filter")
+            return {"status": "success", "logs": []}
+
+        monkeypatch.setattr(log_tools_module, "query_logs", fake_query_logs)
+
+        result = await log_tools_module.search_event_logs(
+            adom="root",
+            subtype="VPN",
+            level="Warning",
+        )
+
+        assert result["status"] == "success"
+        assert captured["filter"] == "subtype==vpn and level==warning"
 
 
 class TestLogSearchClient:

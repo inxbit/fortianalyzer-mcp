@@ -7,14 +7,20 @@ Implements the two-step TID-based log search workflow.
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
     get_default_adom,
+    sanitize_filter_value,
     validate_adom,
+    validate_event_level,
+    validate_event_subtype,
     validate_log_type,
+    validate_positive_int,
+    validate_severity,
+    validate_traffic_action,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,7 +31,7 @@ DEFAULT_SEARCH_TIMEOUT = 60
 POLL_INTERVAL = 1.0
 
 
-def _get_client():
+def _get_client() -> Any:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -524,20 +530,21 @@ async def search_traffic_logs(
     """
     try:
         adom = adom or get_default_adom()
+        normalized_action = validate_traffic_action(action) if action else None
         # Build filter string using FortiAnalyzer syntax
         filters = []
         if srcip:
-            filters.append(f"srcip=={srcip}")
+            filters.append(f"srcip=={sanitize_filter_value(srcip)}")
         if dstip:
-            filters.append(f"dstip=={dstip}")
-        if srcport:
-            filters.append(f"srcport=={srcport}")
-        if dstport:
-            filters.append(f"dstport=={dstport}")
-        if action:
-            filters.append(f"action=={action}")
-        if policy_id:
-            filters.append(f"policyid=={policy_id}")
+            filters.append(f"dstip=={sanitize_filter_value(dstip)}")
+        if srcport is not None:
+            filters.append(f"srcport=={validate_positive_int(srcport, 'srcport')}")
+        if dstport is not None:
+            filters.append(f"dstport=={validate_positive_int(dstport, 'dstport')}")
+        if normalized_action:
+            filters.append(f"action=={sanitize_filter_value(normalized_action)}")
+        if policy_id is not None:
+            filters.append(f"policyid=={validate_positive_int(policy_id, 'policy_id')}")
 
         filter_str = " and ".join(filters) if filters else None
 
@@ -554,8 +561,10 @@ async def search_traffic_logs(
         if result.get("status") == "success":
             result["filter_applied"] = filter_str or "none"
 
-        return result
+        return cast(dict[str, Any], result)
 
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to search traffic logs: {e}")
         return {"status": "error", "message": str(e)}
@@ -607,16 +616,17 @@ async def search_security_logs(
     """
     try:
         adom = adom or get_default_adom()
+        normalized_severity = validate_severity(severity) if severity else None
         # Build filter string
         filters = []
         if attack_name:
-            filters.append(f"attack contain {attack_name}")
-        if severity:
-            filters.append(f"severity=={severity}")
+            filters.append(f"attack contain {sanitize_filter_value(attack_name)}")
+        if normalized_severity:
+            filters.append(f"severity=={sanitize_filter_value(normalized_severity)}")
         if srcip:
-            filters.append(f"srcip=={srcip}")
+            filters.append(f"srcip=={sanitize_filter_value(srcip)}")
         if dstip:
-            filters.append(f"dstip=={dstip}")
+            filters.append(f"dstip=={sanitize_filter_value(dstip)}")
 
         filter_str = " and ".join(filters) if filters else None
 
@@ -633,8 +643,10 @@ async def search_security_logs(
         if result.get("status") == "success":
             result["filter_applied"] = filter_str or "none"
 
-        return result
+        return cast(dict[str, Any], result)
 
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to search security logs: {e}")
         return {"status": "error", "message": str(e)}
@@ -688,12 +700,14 @@ async def search_event_logs(
     """
     try:
         adom = adom or get_default_adom()
+        normalized_subtype = validate_event_subtype(subtype) if subtype else None
+        normalized_level = validate_event_level(level) if level else None
         # Build filter string
         filters = []
-        if subtype:
-            filters.append(f"subtype=={subtype}")
-        if level:
-            filters.append(f"level=={level}")
+        if normalized_subtype:
+            filters.append(f"subtype=={sanitize_filter_value(normalized_subtype)}")
+        if normalized_level:
+            filters.append(f"level=={sanitize_filter_value(normalized_level)}")
 
         filter_str = " and ".join(filters) if filters else None
 
@@ -710,8 +724,10 @@ async def search_event_logs(
         if result.get("status") == "success":
             result["filter_applied"] = filter_str or "none"
 
-        return result
+        return cast(dict[str, Any], result)
 
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to search event logs: {e}")
         return {"status": "error", "message": str(e)}

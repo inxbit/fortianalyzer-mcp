@@ -4,9 +4,12 @@ Tests the client methods for PCAP download and IPS log search operations.
 Follows the same pattern as test_system_tools.py to avoid server initialization.
 """
 
+import importlib
+
 import pytest
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
+from fortianalyzer_mcp.utils.validation import ValidationError
 
 
 class TestPCAPHelpers:
@@ -41,6 +44,15 @@ class TestPCAPHelpers:
         assert "24-hour" in range_map
         assert "30-day" in range_map
         assert range_map["5-min"] == timedelta(minutes=5)
+
+
+@pytest.fixture
+def pcap_tools_module(monkeypatch):
+    """Import pcap_tools with minimal settings for filter-builder testing."""
+    monkeypatch.setenv("FORTIANALYZER_HOST", "test-faz.example.com")
+    monkeypatch.setenv("FORTIANALYZER_API_TOKEN", "test-token")
+    monkeypatch.setenv("FORTIANALYZER_VERIFY_SSL", "false")
+    return importlib.import_module("fortianalyzer_mcp.tools.pcap_tools")
 
 
 class TestIPSFilterBuilder:
@@ -151,6 +163,30 @@ class TestIPSFilterBuilder:
         filters = ['severity="critical"', 'action="blocked"', 'pcapurl!=""']
         result = " and ".join(filters)
         assert result == 'severity="critical" and action="blocked" and pcapurl!=""'
+
+    def test_build_ips_filter_quotes_unsafe_attack_values(self, pcap_tools_module) -> None:
+        """Actual IPS filter builder should quote unsafe partial-match strings."""
+        result = pcap_tools_module._build_ips_filter(
+            severity=["HIGH"],
+            attack_contains="Remote Code or 1==1",
+            action=["BLOCKED"],
+            srcip="10.0.0.1",
+        )
+
+        assert result == (
+            'severity==high and attack contain "Remote Code or 1==1" '
+            "and action==blocked and srcip==10.0.0.1"
+        )
+
+    def test_build_ips_filter_rejects_invalid_action(self, pcap_tools_module) -> None:
+        """Actual IPS filter builder should reject invalid actions."""
+        with pytest.raises(ValidationError, match="Invalid action"):
+            pcap_tools_module._build_ips_filter(action=["blocked or 1==1"])
+
+    def test_build_ips_filter_validates_numeric_fields(self, pcap_tools_module) -> None:
+        """Numeric filters should reject non-positive integers."""
+        with pytest.raises(ValidationError, match="dstport must be a positive integer"):
+            pcap_tools_module._build_ips_filter(dstport=0)
 
 
 class TestPCAPClient:

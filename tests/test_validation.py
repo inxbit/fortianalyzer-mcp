@@ -11,22 +11,33 @@ from fortianalyzer_mcp.utils.validation import (
     DEVICE_NAME_PATTERN,
     DEVICE_SERIAL_PATTERN,
     MASK_VALUE,
+    SAFE_FILTER_VALUE_PATTERN,
     SENSITIVE_FIELDS,
+    VALID_EVENT_LEVELS,
+    VALID_EVENT_SUBTYPES,
     VALID_FORTIVIEW_VIEWS,
+    VALID_IPS_ACTIONS,
     VALID_LOG_TYPES,
     VALID_SEVERITIES,
+    VALID_TRAFFIC_ACTIONS,
     ValidationError,
     get_allowed_output_dirs,
+    sanitize_filter_value,
     sanitize_for_logging,
     sanitize_json_for_logging,
     validate_adom,
     validate_device_name,
     validate_device_serial,
+    validate_event_level,
+    validate_event_subtype,
     validate_filename,
     validate_fortiview_view,
+    validate_ips_action,
     validate_log_type,
     validate_output_path,
+    validate_positive_int,
     validate_severity,
+    validate_traffic_action,
 )
 
 # =============================================================================
@@ -225,6 +236,14 @@ class TestPatterns:
         invalid = ["XX100FTK19001333", "FG123", "fg100ftk19001333", "12345678901234"]
         for serial in invalid:
             assert not DEVICE_SERIAL_PATTERN.match(serial), f"'{serial}' should be invalid"
+
+    def test_safe_filter_value_pattern(self):
+        """Safe filter values should only allow dots and underscores."""
+        assert SAFE_FILTER_VALUE_PATTERN.fullmatch("accept")
+        assert SAFE_FILTER_VALUE_PATTERN.fullmatch("10.0.0.1")
+        assert SAFE_FILTER_VALUE_PATTERN.fullmatch("svc_name")
+        assert not SAFE_FILTER_VALUE_PATTERN.fullmatch("svc-name")
+        assert not SAFE_FILTER_VALUE_PATTERN.fullmatch("icmp/3/3")
 
 
 # =============================================================================
@@ -510,6 +529,96 @@ class TestValidSeverities:
         """Test that all severity levels are included."""
         expected = {"critical", "high", "medium", "low", "info"}
         assert VALID_SEVERITIES == expected
+
+
+# =============================================================================
+# Filter Validation Tests
+# =============================================================================
+
+
+class TestSanitizeFilterValue:
+    """Tests for safe filter value formatting."""
+
+    def test_safe_value_passes_through(self):
+        """Dots and underscores should remain unquoted."""
+        assert sanitize_filter_value("accept") == "accept"
+        assert sanitize_filter_value("10.0.0.1") == "10.0.0.1"
+        assert sanitize_filter_value("svc_name") == "svc_name"
+
+    def test_hyphens_and_slashes_get_quoted(self):
+        """Unsafe punctuation should trigger quoting."""
+        assert sanitize_filter_value("svc-name") == '"svc-name"'
+        assert sanitize_filter_value("icmp/3/3") == '"icmp/3/3"'
+
+    def test_quotes_and_backslashes_are_escaped(self):
+        """Quoted values should escape special characters."""
+        assert sanitize_filter_value('say "hello"') == '"say \\"hello\\""'
+        assert sanitize_filter_value("path\\to") == '"path\\\\to"'
+
+    def test_empty_values_are_rejected(self):
+        """Blank values should fail validation."""
+        with pytest.raises(ValidationError, match="Filter value cannot be empty"):
+            sanitize_filter_value("")
+
+        with pytest.raises(ValidationError, match="Filter value cannot be empty"):
+            sanitize_filter_value("   ")
+
+
+class TestPositiveIntValidation:
+    """Tests for positive integer validation."""
+
+    def test_positive_int_is_returned(self):
+        """Positive integers should pass through."""
+        assert validate_positive_int(7, "policy_id") == 7
+
+    def test_non_positive_int_raises(self):
+        """Non-positive integers should be rejected."""
+        with pytest.raises(ValidationError, match="policy_id must be a positive integer"):
+            validate_positive_int(0, "policy_id")
+
+        with pytest.raises(ValidationError, match="policy_id must be a positive integer"):
+            validate_positive_int(-1, "policy_id")
+
+
+class TestActionValidation:
+    """Tests for shared action validators."""
+
+    @pytest.mark.parametrize("action", sorted(VALID_TRAFFIC_ACTIONS))
+    def test_valid_traffic_actions(self, action):
+        """Traffic action validator should normalize valid values."""
+        assert validate_traffic_action(action.upper()) == action
+
+    @pytest.mark.parametrize("action", sorted(VALID_IPS_ACTIONS))
+    def test_valid_ips_actions(self, action):
+        """IPS action validator should normalize valid values."""
+        assert validate_ips_action(action.upper()) == action
+
+    def test_invalid_action_raises(self):
+        """Unknown action values should fail fast."""
+        with pytest.raises(ValidationError, match="Invalid action"):
+            validate_traffic_action("accept or 1==1")
+
+
+class TestEventValidation:
+    """Tests for event subtype and level validators."""
+
+    @pytest.mark.parametrize("subtype", sorted(VALID_EVENT_SUBTYPES))
+    def test_valid_event_subtypes(self, subtype):
+        """Known event subtypes should validate."""
+        assert validate_event_subtype(subtype.upper()) == subtype
+
+    @pytest.mark.parametrize("level", sorted(VALID_EVENT_LEVELS))
+    def test_valid_event_levels(self, level):
+        """Known event levels should validate."""
+        assert validate_event_level(level.upper()) == level
+
+    def test_invalid_event_values_raise(self):
+        """Unknown event enums should fail validation."""
+        with pytest.raises(ValidationError, match="Invalid subtype"):
+            validate_event_subtype("vpn or 1==1")
+
+        with pytest.raises(ValidationError, match="Invalid level"):
+            validate_event_level("warn")
 
 
 # =============================================================================

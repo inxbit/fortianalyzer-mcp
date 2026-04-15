@@ -466,9 +466,11 @@ networks:
 
 | Tool | Description |
 |------|-------------|
-| `get_policy_traffic_profile` | Get sampled traffic summary per policy (top ports, services, apps) |
-| `get_policy_port_analysis` | Get exact port/protocol enumeration per policy with `is_exact` semantics |
-| `get_policy_protocol_summary` | Get lightweight protocol breakdown (TCP/UDP/ICMP/other) per policy |
+| `get_policy_traffic_profile` | Profile observed traffic per policy using sampled discovery plus exact recounts for top ports, services, and applications |
+| `get_policy_port_analysis` | Enumerate exact port/protocol usage per policy and report whether numeric-port coverage is fully exact via `is_exact` |
+| `get_policy_protocol_summary` | Summarize exact protocol distribution per policy for review and tightening workflows |
+
+These tools are read-only traffic analysis helpers for policy-review workflows. They do not modify firewall policy directly; they surface observed usage so policy changes can be planned safely.
 
 ### PCAP Tools (5 tools)
 
@@ -735,6 +737,13 @@ chmod 600 .env .env.*
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to submit bug reports, feature requests, and pull requests.
+
+## Additional Documentation
+
+- [Setup Guide](docs/SETUP_GUIDE.md)
+- [Security Review](docs/SECURITY_REVIEW.md)
+- [Internal Architecture](docs/INTERNAL_ARCHITECTURE.md)
+- [Policy Hardening Workflow](docs/policy-hardening-workflow.md)
 
 ## License
 

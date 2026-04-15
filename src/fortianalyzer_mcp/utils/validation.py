@@ -161,11 +161,89 @@ VALID_FORTIVIEW_VIEWS = {
 # Severity levels
 VALID_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 
+# Safe unquoted filter values in FortiAnalyzer expressions.
+SAFE_FILTER_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._]+$")
+
+# Enumerated filter values used by common log-search helpers.
+VALID_TRAFFIC_ACTIONS = {"accept", "deny", "close", "drop", "ip-conn", "timeout"}
+VALID_IPS_ACTIONS = {"detected", "blocked", "dropped", "reset"}
+VALID_EVENT_SUBTYPES = {"system", "vpn", "user", "router", "wireless"}
+VALID_EVENT_LEVELS = {
+    "emergency",
+    "alert",
+    "critical",
+    "error",
+    "warning",
+    "notice",
+    "information",
+    "debug",
+}
+
 
 class ValidationError(ValueError):
     """Raised when input validation fails."""
 
     pass
+
+
+def sanitize_filter_value(value: str) -> str:
+    """Sanitize a value for safe use in FAZ filter expressions.
+
+    Unquoted values are restricted to alphanumeric text, dots, and underscores.
+    Everything else is quoted with backslashes and double quotes escaped.
+    """
+    if not isinstance(value, str):
+        raise ValidationError(f"Filter value must be a string, got {type(value).__name__}")
+
+    value = value.strip()
+    if not value:
+        raise ValidationError("Filter value cannot be empty")
+
+    if SAFE_FILTER_VALUE_PATTERN.fullmatch(value):
+        return value
+
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _validate_enum(value: str, valid_values: set[str], label: str) -> str:
+    """Validate a case-insensitive enumerated string value."""
+    if not value:
+        raise ValidationError(f"{label} cannot be empty")
+
+    normalized = value.strip().lower()
+    if normalized not in valid_values:
+        raise ValidationError(
+            f"Invalid {label} '{normalized}'. Valid values: {', '.join(sorted(valid_values))}"
+        )
+    return normalized
+
+
+def validate_positive_int(value: int, label: str) -> int:
+    """Validate that a value is a positive integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValidationError(f"{label} must be a positive integer")
+    return value
+
+
+def validate_traffic_action(action: str) -> str:
+    """Validate a traffic log action value."""
+    return _validate_enum(action, VALID_TRAFFIC_ACTIONS, "action")
+
+
+def validate_ips_action(action: str) -> str:
+    """Validate an IPS/attack log action value."""
+    return _validate_enum(action, VALID_IPS_ACTIONS, "action")
+
+
+def validate_event_subtype(subtype: str) -> str:
+    """Validate an event log subtype."""
+    return _validate_enum(subtype, VALID_EVENT_SUBTYPES, "subtype")
+
+
+def validate_event_level(level: str) -> str:
+    """Validate an event log level."""
+    return _validate_enum(level, VALID_EVENT_LEVELS, "level")
 
 
 def validate_adom(adom: str) -> str:

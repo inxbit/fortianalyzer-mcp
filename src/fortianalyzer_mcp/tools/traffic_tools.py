@@ -1,130 +1,153 @@
 """Policy traffic analysis tools for FortiAnalyzer.
 
-Provides tools for analyzing traffic patterns per firewall policy:
-- Traffic profiling (top ports, services, applications)
-- Exact port/protocol enumeration
-- Protocol breakdown summaries
+Provides tools for analyzing observed traffic patterns per firewall policy:
+- sampled traffic profiling (top ports, services, applications)
+- exact port and protocol analysis with truthful exactness semantics
+- lightweight protocol distribution summaries
 
-These tools query FortiAnalyzer traffic logs filtered by policy ID and
-aggregate results for policy hardening workflows.
+These tools support policy-review and policy-tightening preparation workflows.
 """
 
 import asyncio
 import logging
-import re
+import math
 import time
 from collections import Counter
-from typing import Any
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
+from typing import Any, TypedDict, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
+from fortianalyzer_mcp.utils.errors import (
+    APIError,
+)
+from fortianalyzer_mcp.utils.errors import (
+    ConnectionError as FazConnectionError,
+)
+from fortianalyzer_mcp.utils.errors import (
+    TimeoutError as FazTimeoutError,
+)
 from fortianalyzer_mcp.utils.validation import (
+    VALID_TRAFFIC_ACTIONS,
     ValidationError,
     get_default_adom,
+    sanitize_filter_value,
     validate_adom,
+    validate_positive_int,
+    validate_traffic_action,
 )
 
 logger = logging.getLogger(__name__)
 
-# Concurrency limit for parallel policy queries
-_QUERY_SEMAPHORE = asyncio.Semaphore(5)
+# Concurrency limit for per-policy work.
+_POLICY_QUERY_SEMAPHORE = asyncio.Semaphore(5)
 
-# Default and max search parameters
+# Default and max search parameters.
 DEFAULT_SEARCH_TIMEOUT = 120
 POLL_INTERVAL = 1.0
 MAX_POLICY_IDS = 25
 DEFAULT_TOP_N = 10
+DEFAULT_POLICY_PROFILE_TIMEOUT = 20
+DEFAULT_POLICY_SAMPLE_LIMIT = 25
+DEFAULT_POLICY_CANDIDATE_LIMIT = 12
+DEFAULT_POLICY_MAX_DISCOVERY_SLICES = 4
+DEFAULT_BATCH_DISCOVERY_QUERY_BUDGET = 24
+DEFAULT_EXACT_MIN_SPLIT_HOURS = 6
+DEFAULT_EXACT_SLICE_DAYS = 15
 
-# Valid action values for FortiGate traffic logs
-VALID_ACTIONS = frozenset({"accept", "deny", "close", "drop", "ip-conn", "timeout"})
+PROTOCOL_NAMES = {
+    1: "ICMP",
+    6: "TCP",
+    17: "UDP",
+    33: "DCCP",
+    41: "IPv6",
+    47: "GRE",
+    50: "ESP",
+    51: "AH",
+    58: "ICMPv6",
+    89: "OSPF",
+    132: "SCTP",
+}
 
-# Regex for safe unquoted filter values: alphanumeric, dots, hyphens
-_SAFE_UNQUOTED_RE = re.compile(r"^[a-zA-Z0-9.\-]+$")
+PORT_BEARING_PROTOCOLS = {6, 17, 33, 132}
+VALID_ACTIONS = frozenset(VALID_TRAFFIC_ACTIONS)
+
+RETRYABLE_QUERY_EXCEPTIONS = (
+    RuntimeError,
+    OSError,
+    TimeoutError,
+    FazConnectionError,
+    FazTimeoutError,
+    APIError,
+)
 
 
-# =============================================================================
-# Validation helpers
-# =============================================================================
+class DiscoveryQueryShape(TypedDict):
+    """Configuration for one discovery-sampling query shape."""
+
+    name: str
+    extra_filter: str | None
+    offsets: list[int]
+
+
+class CountError(TypedDict):
+    """A structured recount error for one discovered value."""
+
+    field: str
+    value: str
+    message: str
+
+
+class PortHit(TypedDict):
+    """A destination port hit count."""
+
+    port: str
+    hits: int
+
+
+class ProtocolHit(TypedDict):
+    """A protocol hit count."""
+
+    protocol: str
+    hits: int
+
+
+class ICMPTypeHit(TypedDict):
+    """An ICMP type/code hit count."""
+
+    type_code: str
+    hits: int
 
 
 def validate_action(action: str | None) -> str | None:
-    """Validate traffic log action value against allowlist.
-
-    Args:
-        action: Action string to validate, or None.
-
-    Returns:
-        Validated action string (lowercase) or None.
-
-    Raises:
-        ValidationError: If action is not in the allowlist.
-    """
+    """Validate an optional traffic log action."""
     if action is None:
         return None
-    action = action.strip().lower()
-    if action not in VALID_ACTIONS:
-        raise ValidationError(
-            f"Invalid action '{action}'. Allowed values: {', '.join(sorted(VALID_ACTIONS))}"
-        )
-    return action
+    return validate_traffic_action(action)
 
 
 def validate_policy_ids(policy_ids: list[int]) -> list[int]:
-    """Validate a list of policy IDs.
-
-    Args:
-        policy_ids: List of integer policy IDs.
-
-    Returns:
-        Validated list of policy IDs.
-
-    Raises:
-        ValidationError: If list is empty, too large, or contains invalid IDs.
-    """
+    """Validate, normalize, and de-duplicate policy IDs."""
     if not policy_ids:
         raise ValidationError("policy_ids must not be empty")
-    if len(policy_ids) > MAX_POLICY_IDS:
+
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for policy_id in policy_ids:
+        value = validate_positive_int(policy_id, "policy_id")
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+
+    if len(normalized) > MAX_POLICY_IDS:
         raise ValidationError(
-            f"Too many policy IDs ({len(policy_ids)}). Maximum is {MAX_POLICY_IDS}."
+            f"Too many policy IDs ({len(normalized)}). Maximum is {MAX_POLICY_IDS}."
         )
-    for pid in policy_ids:
-        if not isinstance(pid, int) or pid <= 0:
-            raise ValidationError(f"Invalid policy ID: {pid}. Must be a positive integer.")
-    return policy_ids
+
+    return normalized
 
 
-def sanitize_filter_value(value: str) -> str:
-    """Sanitize a value for use in FAZ log filter expressions.
-
-    Safe alphanumeric values (including dots and hyphens) are returned as-is.
-    All other values are quoted with internal backslashes and double quotes escaped.
-
-    Args:
-        value: Raw filter value.
-
-    Returns:
-        Sanitized value safe for use in filter expressions.
-
-    Raises:
-        ValidationError: If value is empty.
-    """
-    if not value:
-        raise ValidationError("Filter value cannot be empty")
-    value = value.strip()
-    if not value:
-        raise ValidationError("Filter value cannot be empty after stripping")
-    if _SAFE_UNQUOTED_RE.match(value):
-        return value
-    # Escape backslashes first, then double quotes, then wrap in quotes
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-# =============================================================================
-# Internal query helpers
-# =============================================================================
-
-
-def _get_client():
+def _get_client() -> Any:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -132,34 +155,21 @@ def _get_client():
     return client
 
 
-def _build_policy_filter(policy_id: int, action: str | None = None) -> str:
-    """Build a FAZ filter string for a policy ID and optional action.
-
-    Args:
-        policy_id: Firewall policy ID.
-        action: Optional validated action value.
-
-    Returns:
-        Filter expression string.
-    """
-    parts = [f"policyid=={policy_id}"]
-    if action:
-        parts.append(f"action=={sanitize_filter_value(action)}")
-    return " and ".join(parts)
+async def _get_connected_client() -> Any:
+    """Get a connected FortiAnalyzer client."""
+    client = _get_client()
+    if not client.is_connected:
+        await client.connect()
+    return client
 
 
 def _parse_time_range(time_range: str) -> dict[str, str]:
-    """Parse time range string to API format.
-
-    Reuses the same format as log_tools._parse_time_range.
-    """
-    from datetime import datetime, timedelta
-
+    """Parse time range string to API format."""
     now = datetime.now()
     fmt = "%Y-%m-%d %H:%M:%S"
 
     if "|" in time_range:
-        parts = time_range.split("|")
+        parts = time_range.split("|", maxsplit=1)
         return {"start": parts[0].strip(), "end": parts[1].strip()}
 
     range_map = {
@@ -174,12 +184,11 @@ def _parse_time_range(time_range: str) -> dict[str, str]:
 
     delta = range_map.get(time_range, timedelta(hours=1))
     start = now - delta
-
     return {"start": start.strftime(fmt), "end": now.strftime(fmt)}
 
 
 def _build_device_filter(device: str | None) -> list[dict[str, str]]:
-    """Build device filter for API. Mirrors log_tools._build_device_filter."""
+    """Build device filter for the FAZ API."""
     if not device:
         return [{"devid": "All_FortiGate"}]
     if device.startswith(("FG", "FM", "FW", "FA", "FS", "FD", "FP", "FC")):
@@ -189,89 +198,1253 @@ def _build_device_filter(device: str | None) -> list[dict[str, str]]:
     return [{"devname": device}]
 
 
-async def _query_policy_logs(
-    adom: str,
-    device: str | None,
-    policy_id: int,
+def _combine_filters(*filters: str | None) -> str | None:
+    """Combine filter fragments using FortiAnalyzer syntax."""
+    parts = [item.strip() for item in filters if item and item.strip()]
+    return " and ".join(parts) if parts else None
+
+
+def _parse_time_range_bounds(time_range: str) -> tuple[datetime, datetime]:
+    """Parse a time range string into datetime bounds."""
+    parsed = _parse_time_range(time_range)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return datetime.strptime(parsed["start"], fmt), datetime.strptime(parsed["end"], fmt)
+
+
+def _format_time_range(start: datetime, end: datetime) -> dict[str, str]:
+    """Format datetime bounds for FortiAnalyzer APIs."""
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return {"start": start.strftime(fmt), "end": end.strftime(fmt)}
+
+
+def _parse_time_range_dict(time_range: dict[str, str]) -> tuple[datetime, datetime]:
+    """Parse a FortiAnalyzer time-range dict into datetime bounds."""
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return datetime.strptime(time_range["start"], fmt), datetime.strptime(time_range["end"], fmt)
+
+
+def _split_time_range_non_overlapping(
+    time_range: dict[str, str],
+) -> tuple[dict[str, str], dict[str, str]] | None:
+    """Split a time range into two non-overlapping second-aligned ranges."""
+    start, end = _parse_time_range_dict(time_range)
+    span_seconds = int((end - start).total_seconds())
+    if span_seconds <= 0:
+        return None
+
+    left_end = start + timedelta(seconds=span_seconds // 2)
+    right_start = left_end + timedelta(seconds=1)
+    if right_start > end:
+        return None
+
+    return _format_time_range(start, left_end), _format_time_range(right_start, end)
+
+
+def _build_exact_time_slices(
+    time_range: dict[str, str],
+    slice_days: int,
+) -> list[dict[str, str]]:
+    """Build non-overlapping exact-count slices with second-level boundaries."""
+    if slice_days <= 0:
+        return [time_range]
+
+    start, end = _parse_time_range_dict(time_range)
+    if end <= start:
+        return [time_range]
+
+    step_seconds = max(int(timedelta(days=slice_days).total_seconds()), 1)
+    cursor = start
+    slices = []
+    while cursor <= end:
+        slice_end = min(cursor + timedelta(seconds=step_seconds - 1), end)
+        slices.append(_format_time_range(cursor, slice_end))
+        cursor = slice_end + timedelta(seconds=1)
+    return slices
+
+
+def _build_exact_slice_day_candidates(preferred_slice_days: int) -> list[int]:
+    """Build descending exact slice-day candidates ending at 1 day."""
+    days = max(preferred_slice_days, 1)
+    candidates = []
+    while days > 1:
+        candidates.append(days)
+        next_days = max(days // 2, 1)
+        if next_days == days:
+            break
+        days = next_days
+    candidates.append(1)
+    return list(dict.fromkeys(candidates))
+
+
+def _estimate_slice_count(start: datetime, end: datetime, slice_days: int) -> int:
+    """Estimate how many slices a time range would produce."""
+    if end <= start:
+        return 1
+
+    step_seconds = max(int(timedelta(days=max(slice_days, 1)).total_seconds()), 1)
+    span_seconds = max(int((end - start).total_seconds()), 0)
+    return max(1, math.ceil(span_seconds / step_seconds))
+
+
+def _build_time_slices(
     time_range: str,
-    action: str | None,
-    limit: int = 1000,
-    timeout: int = DEFAULT_SEARCH_TIMEOUT,
-) -> list[dict[str, Any]]:
-    """Query traffic logs for a single policy ID.
+    slice_days: int,
+    max_slices: int = DEFAULT_POLICY_MAX_DISCOVERY_SLICES,
+) -> list[dict[str, str]]:
+    """Split a time range into smaller slices for discovery sampling."""
+    start, end = _parse_time_range_bounds(time_range)
+    if end <= start:
+        return [_format_time_range(start, end)]
 
-    Uses the TID-based log search workflow with semaphore-bounded concurrency.
+    requested_slice_days = max(slice_days, 1)
+    requested_slices = _estimate_slice_count(start, end, requested_slice_days)
 
-    Args:
-        adom: ADOM name.
-        device: Device filter.
-        policy_id: Policy ID to query.
-        time_range: Time range string.
-        action: Optional action filter.
-        limit: Max logs to return.
-        timeout: Search timeout in seconds.
+    effective_slice_days = requested_slice_days
+    if max_slices > 0 and requested_slices > max_slices:
+        span_days = max((end - start).total_seconds() / 86400, 0)
+        effective_slice_days = max(1, math.ceil(span_days / max_slices))
 
-    Returns:
-        List of log entries.
-    """
-    async with _QUERY_SEMAPHORE:
-        client = _get_client()
-        time_range_dict = _parse_time_range(time_range)
-        device_filter = _build_device_filter(device)
-        filter_str = _build_policy_filter(policy_id, action)
+    step = timedelta(days=effective_slice_days)
+    cursor = start
+    slices = []
+    while cursor < end:
+        next_cursor = min(cursor + step, end)
+        slices.append(_format_time_range(cursor, next_cursor))
+        cursor = next_cursor
+    return slices
 
-        start_result = await client.logsearch_start(
-            adom=adom,
-            logtype="traffic",
-            device=device_filter,
-            time_range=time_range_dict,
-            filter=filter_str,
-            limit=limit,
-        )
 
-        tid = start_result.get("tid")
-        if not tid:
-            logger.warning(f"No TID returned for policy {policy_id}: {start_result}")
-            return []
+def _estimate_discovery_queries_per_slice(fields: tuple[str, ...]) -> int:
+    """Estimate discovery query fan-out for one time slice."""
+    return 3 if "port_pair" in fields or "dstport" in fields else 1
 
-        start_time = time.monotonic()
-        while True:
-            elapsed = time.monotonic() - start_time
-            if elapsed > timeout:
-                try:
-                    await client.logsearch_cancel(adom, tid)
-                except (OSError, RuntimeError):
-                    pass
-                logger.warning(f"Search timed out for policy {policy_id}")
-                return []
 
-            fetch_result = await client.logsearch_fetch(
+def _plan_batch_slice_days(
+    *,
+    time_range: str,
+    slice_days: int,
+    policy_count: int,
+    fields: tuple[str, ...],
+) -> int:
+    """Increase slice size for large batch requests to keep discovery bounded."""
+    if policy_count <= 1:
+        return max(slice_days, 1)
+
+    start, end = _parse_time_range_bounds(time_range)
+    requested_slice_days = max(slice_days, 1)
+    requested_slices = _estimate_slice_count(start, end, requested_slice_days)
+    per_slice_queries = _estimate_discovery_queries_per_slice(fields)
+    max_slices_per_policy = max(
+        1,
+        DEFAULT_BATCH_DISCOVERY_QUERY_BUDGET // max(policy_count * per_slice_queries, 1),
+    )
+
+    if requested_slices <= max_slices_per_policy:
+        return requested_slice_days
+
+    span_days = max((end - start).total_seconds() / 86400, 0)
+    return max(requested_slice_days, math.ceil(span_days / max_slices_per_policy))
+
+
+def _normalize_sample_value(field: str, value: Any, row: dict[str, Any] | None = None) -> str | None:
+    """Normalize a sampled log value for counting/filtering."""
+    if field == "port_pair":
+        if row is None:
+            return None
+        proto = str(row.get("proto", "")).strip()
+        port = str(row.get("dstport", "")).strip()
+        if not proto or not proto.isdigit() or not port or not port.isdigit():
+            return None
+        if int(port) <= 0:
+            return None
+        return f"{proto}/{int(port)}"
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if field == "dstport":
+        if not text.isdigit():
+            return None
+        port_num = int(text)
+        if port_num <= 0:
+            return None
+        return str(port_num)
+
+    if text == "0":
+        return None
+
+    return text
+
+
+def _build_policy_filter(policy_id: int, action: str | None = None) -> str:
+    """Build a policy filter for one policy ID."""
+    parts = [f"policyid=={policy_id}"]
+    if action:
+        parts.append(f"action=={sanitize_filter_value(action)}")
+    return " and ".join(parts)
+
+
+def _build_port_range_filter(low: int, high: int) -> str:
+    """Build a dstport filter for a single port or inclusive range."""
+    if low == high:
+        return f"dstport=={low}"
+    return f"dstport>={low} and dstport<={high}"
+
+
+def _build_protocol_range_filter(low: int, high: int) -> str:
+    """Build a proto filter for a single IP protocol or inclusive range."""
+    if low == high:
+        return f"proto=={low}"
+    return f"proto>={low} and proto<={high}"
+
+
+def _build_residual_port_ranges(
+    excluded_ports: list[int],
+    low: int = 1,
+    high: int = 65535,
+) -> list[tuple[int, int]]:
+    """Build non-overlapping port ranges excluding known ports."""
+    ranges: list[tuple[int, int]] = []
+    cursor = low
+    for port in sorted({port for port in excluded_ports if low <= port <= high}):
+        if cursor <= port - 1:
+            ranges.append((cursor, port - 1))
+        cursor = port + 1
+    if cursor <= high:
+        ranges.append((cursor, high))
+    return ranges
+
+
+async def _run_log_count(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    filter_str: str | None,
+    timeout: int,
+    retries: int = 3,
+) -> int:
+    """Run a log search and return the exact matched log count."""
+    last_error: Exception | None = None
+
+    for attempt in range(retries):
+        tid: int | None = None
+        client = None
+        try:
+            client = await _get_connected_client()
+            start_result = await client.logsearch_start(
                 adom=adom,
-                tid=tid,
-                limit=limit,
+                logtype="traffic",
+                device=device_filter,
+                time_range=time_range,
+                filter=filter_str,
+                limit=1,
                 offset=0,
             )
+            tid = start_result.get("tid")
+            if not tid:
+                raise RuntimeError(f"No TID returned for count query: {start_result}")
 
-            percentage = fetch_result.get("percentage", 0)
-            if percentage >= 100:
-                logs = fetch_result.get("data", [])
-                if not isinstance(logs, list):
-                    logs = [logs] if logs else []
-                return logs
+            started = time.monotonic()
+            while True:
+                if time.monotonic() - started > timeout:
+                    raise TimeoutError(
+                        f"Count query timed out after {timeout}s for filter {filter_str}"
+                    )
 
-            await asyncio.sleep(POLL_INTERVAL)
+                result = await client.logsearch_count(adom, tid)
+                if result.get("progress-percent", 0) >= 100:
+                    return int(result.get("matched-logs", 0))
+
+                await asyncio.sleep(POLL_INTERVAL)
+        except RETRYABLE_QUERY_EXCEPTIONS as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                await asyncio.sleep(POLL_INTERVAL)
+        finally:
+            if tid and client is not None:
+                try:
+                    await client.logsearch_cancel(adom, tid)
+                except RETRYABLE_QUERY_EXCEPTIONS:
+                    pass
+
+    raise RuntimeError(f"Count query failed for filter {filter_str}: {last_error}")
 
 
-# =============================================================================
-# Aggregation helpers
-# =============================================================================
+async def _run_log_count_resilient(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    filter_str: str | None,
+    timeout: int,
+    stats: dict[str, int] | None = None,
+    min_split_hours: int = DEFAULT_EXACT_MIN_SPLIT_HOURS,
+) -> int:
+    """Run an exact count query, splitting the time range if needed."""
+    if stats is not None:
+        stats["count_attempts"] = stats.get("count_attempts", 0) + 1
+
+    try:
+        return await _run_log_count(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=time_range,
+            filter_str=filter_str,
+            timeout=timeout,
+        )
+    except RETRYABLE_QUERY_EXCEPTIONS:
+        start, end = _parse_time_range_dict(time_range)
+        span = end - start
+        if span <= timedelta(hours=max(min_split_hours, 1)):
+            raise
+
+        split_ranges = _split_time_range_non_overlapping(time_range)
+        if not split_ranges:
+            raise
+        left_range, right_range = split_ranges
+
+        if stats is not None:
+            stats["fallback_splits"] = stats.get("fallback_splits", 0) + 1
+
+        left_hits = await _run_log_count_resilient(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=left_range,
+            filter_str=filter_str,
+            timeout=timeout,
+            stats=stats,
+            min_split_hours=min_split_hours,
+        )
+        right_hits = await _run_log_count_resilient(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=right_range,
+            filter_str=filter_str,
+            timeout=timeout,
+            stats=stats,
+            min_split_hours=min_split_hours,
+        )
+        return left_hits + right_hits
+
+
+async def _run_log_count_over_slices(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_slices: list[dict[str, str]],
+    filter_str: str | None,
+    timeout: int,
+    stats: dict[str, int] | None = None,
+) -> int:
+    """Run exact counts over a fixed slice partition and sum the results."""
+    total = 0
+    for time_slice in time_slices:
+        if stats is not None:
+            stats["count_attempts"] = stats.get("count_attempts", 0) + 1
+        total += await _run_log_count(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=time_slice,
+            filter_str=filter_str,
+            timeout=timeout,
+        )
+    return total
+
+
+async def _run_log_count_exact(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    filter_str: str | None,
+    timeout: int,
+    stats: dict[str, int] | None = None,
+    slice_day_candidates: list[int] | None = None,
+    min_split_hours: int = DEFAULT_EXACT_MIN_SPLIT_HOURS,
+) -> int:
+    """Run an exact count using progressively smaller fixed slice partitions."""
+    candidates = slice_day_candidates or [1]
+    last_error: Exception | None = None
+
+    for slice_days in candidates:
+        try:
+            return await _run_log_count_over_slices(
+                adom=adom,
+                device_filter=device_filter,
+                time_slices=_build_exact_time_slices(time_range, slice_days),
+                filter_str=filter_str,
+                timeout=timeout,
+                stats=stats,
+            )
+        except RETRYABLE_QUERY_EXCEPTIONS as exc:
+            last_error = exc
+
+    if last_error is not None:
+        return await _run_log_count_resilient(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=time_range,
+            filter_str=filter_str,
+            timeout=timeout,
+            stats=stats,
+            min_split_hours=min_split_hours,
+        )
+
+    raise RuntimeError(f"Count query failed for filter {filter_str}")
+
+
+async def _run_log_sample(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    filter_str: str | None,
+    limit: int,
+    offset: int,
+    timeout: int,
+    retries: int = 2,
+) -> list[dict[str, Any]]:
+    """Run a bounded log query and return sampled log rows."""
+    last_error: Exception | None = None
+
+    for attempt in range(retries):
+        tid: int | None = None
+        client = None
+        try:
+            client = await _get_connected_client()
+            start_result = await client.logsearch_start(
+                adom=adom,
+                logtype="traffic",
+                device=device_filter,
+                time_range=time_range,
+                filter=filter_str,
+                limit=limit,
+                offset=offset,
+            )
+            tid = start_result.get("tid")
+            if not tid:
+                raise RuntimeError(f"No TID returned for sample query: {start_result}")
+
+            started = time.monotonic()
+            while True:
+                if time.monotonic() - started > timeout:
+                    raise TimeoutError(
+                        f"Sample query timed out after {timeout}s for filter {filter_str}"
+                    )
+
+                result = await client.logsearch_fetch(
+                    adom=adom,
+                    tid=tid,
+                    limit=limit,
+                    offset=offset,
+                )
+                if result.get("percentage", 0) >= 100:
+                    rows = result.get("data", [])
+                    if not isinstance(rows, list):
+                        rows = [rows] if rows else []
+                    return rows
+
+                await asyncio.sleep(POLL_INTERVAL)
+        except RETRYABLE_QUERY_EXCEPTIONS as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                await asyncio.sleep(POLL_INTERVAL)
+        finally:
+            if tid and client is not None:
+                try:
+                    await client.logsearch_cancel(adom, tid)
+                except RETRYABLE_QUERY_EXCEPTIONS:
+                    pass
+
+    logger.warning(f"Sample query failed for filter {filter_str}: {last_error}")
+    return []
+
+
+async def _discover_policy_candidates(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_filter: str,
+    time_range: str,
+    slice_days: int,
+    sample_limit: int,
+    timeout: int,
+    fields: tuple[str, ...],
+) -> tuple[dict[str, Counter[str]], dict[str, Any]]:
+    """Sample logs across time slices to discover candidate values."""
+    start, end = _parse_time_range_bounds(time_range)
+    requested_slices = _estimate_slice_count(start, end, slice_days)
+    slices = _build_time_slices(time_range, slice_days)
+    base_offsets = [0, sample_limit] if len(slices) == 1 else [0]
+    discovery_filters: list[DiscoveryQueryShape] = [
+        {"name": "base", "extra_filter": None, "offsets": base_offsets}
+    ]
+    if "port_pair" in fields or "dstport" in fields:
+        discovery_filters.extend(
+            [
+                {"name": "low-port", "extra_filter": "dstport<1024", "offsets": [0]},
+                {
+                    "name": "mid-port",
+                    "extra_filter": "dstport>=1024 and dstport<=10000",
+                    "offsets": [0],
+                },
+            ]
+        )
+
+    counters: dict[str, Counter[str]] = {field: Counter() for field in fields}
+    discovery: dict[str, Any] = {
+        "requested_slices": requested_slices,
+        "slices_scanned": 0,
+        "adaptive_sampling": len(slices) < requested_slices,
+        "queries_attempted": 0,
+        "sampled_logs": 0,
+        "errors": [],
+    }
+
+    for time_slice in slices:
+        discovery["slices_scanned"] += 1
+        for query_shape in discovery_filters:
+            filter_str = _combine_filters(policy_filter, query_shape["extra_filter"])
+            for offset in query_shape["offsets"]:
+                discovery["queries_attempted"] += 1
+                rows = await _run_log_sample(
+                    adom=adom,
+                    device_filter=device_filter,
+                    time_range=time_slice,
+                    filter_str=filter_str,
+                    limit=sample_limit,
+                    offset=offset,
+                    timeout=timeout,
+                )
+
+                if not rows:
+                    continue
+
+                discovery["sampled_logs"] += len(rows)
+                for row in rows:
+                    for field in counters:
+                        normalized = _normalize_sample_value(field, row.get(field), row)
+                        if normalized:
+                            counters[field][normalized] += 1
+
+    discovery["discovered_candidates"] = {
+        field: len(counter) for field, counter in counters.items()
+    }
+    return counters, discovery
+
+
+def _build_discovered_value_filter(field: str, value: str) -> str:
+    """Build a filter for a discovered candidate value."""
+    if field == "port_pair":
+        proto, port = value.split("/", maxsplit=1)
+        return _combine_filters(f"proto=={proto}", f"dstport=={port}") or ""
+    return f"{field}=={sanitize_filter_value(value)}"
+
+
+async def _count_discovered_values(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    base_filter: str,
+    field: str,
+    counter: Counter[str],
+    candidate_limit: int,
+    timeout: int,
+    result_key: str,
+    slice_day_candidates: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[CountError], int]:
+    """Count exact hits for the strongest discovered candidates."""
+    ranked: list[dict[str, Any]] = []
+    errors: list[CountError] = []
+
+    for value, _sample_hits in counter.most_common(candidate_limit):
+        field_filter = _build_discovered_value_filter(field, value)
+        try:
+            hits = await _run_log_count_exact(
+                adom=adom,
+                device_filter=device_filter,
+                time_range=time_range,
+                filter_str=_combine_filters(base_filter, field_filter),
+                timeout=timeout,
+                slice_day_candidates=slice_day_candidates,
+            )
+        except RETRYABLE_QUERY_EXCEPTIONS as exc:
+            errors.append({"field": field, "value": value, "message": str(exc)})
+            continue
+
+        if hits > 0:
+            ranked.append({result_key: value, "hits": hits})
+
+    ranked.sort(key=lambda item: (-int(item["hits"]), str(item[result_key])))
+    return ranked, errors, sum(int(item["hits"]) for item in ranked)
+
+
+def _build_empty_policy_profile_result(policy_id: int) -> dict[str, Any]:
+    """Build a successful empty sampled-profile result."""
+    return {
+        "policy_id": policy_id,
+        "total_hits": 0,
+        "top_ports": [],
+        "top_ports_residual": 0,
+        "top_services": [],
+        "top_services_residual": 0,
+        "top_applications": [],
+        "top_applications_residual": 0,
+    }
+
+
+def _build_empty_port_analysis_result(policy_id: int) -> dict[str, Any]:
+    """Build a successful empty exact-analysis result."""
+    return {
+        "policy_id": policy_id,
+        "total_hits": 0,
+        "is_exact": True,
+        "ports": [],
+        "protocols": [],
+        "portless_protocols": [],
+        "uncovered_port_hits": 0,
+        "icmp": [],
+    }
+
+
+def _protocol_sort_key(protocol: str) -> tuple[int, int, str]:
+    """Sort protocol identifiers numerically, with unknown values last."""
+    if protocol.isdigit():
+        return (0, int(protocol), protocol)
+    return (1, 0, protocol)
+
+
+def _port_pair_sort_key(port_pair: str) -> tuple[float, float, str]:
+    """Sort proto/port keys numerically when possible."""
+    try:
+        proto, port = port_pair.split("/", maxsplit=1)
+        return (int(proto), int(port), port_pair)
+    except ValueError:
+        return (math.inf, math.inf, port_pair)
+
+
+def _format_protocol_name(protocol: str) -> str:
+    """Map a protocol identifier to a display name."""
+    if protocol.isdigit():
+        proto_int = int(protocol)
+        return PROTOCOL_NAMES.get(proto_int, f"other({protocol})")
+    return f"other({protocol})"
+
+
+def _format_icmp_type_code(service: str) -> str:
+    """Map a FAZ ICMP service string to a stable summary key."""
+    if service.upper() == "PING":
+        return "type=8/code=0"
+    if service.startswith("icmp/"):
+        parts = service.split("/")
+        if len(parts) == 3:
+            return f"type={parts[1]}/code={parts[2]}"
+    return f"service={service}"
+
+
+def _collapse_count_errors(errors: list[CountError], policy_id: int) -> None:
+    """Raise a readable error for candidate recount failures."""
+    if not errors:
+        return
+    first = errors[0]
+    raise RuntimeError(
+        f"Policy {policy_id} recount failed for {first['field']}={first['value']}: "
+        f"{first['message']}"
+    )
+
+
+async def _enumerate_exact_ports(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    slice_day_candidates: list[int] | None,
+    base_filter: str,
+    low: int,
+    high: int,
+    known_hits: int,
+    timeout: int,
+    stats: dict[str, int] | None = None,
+    min_split_hours: int = DEFAULT_EXACT_MIN_SPLIT_HOURS,
+) -> list[PortHit]:
+    """Enumerate exact destination ports using recursive range counts."""
+    if known_hits <= 0:
+        return []
+
+    if low == high:
+        return [{"port": str(low), "hits": known_hits}]
+
+    mid = (low + high) // 2
+    if stats is not None:
+        stats["count_queries"] = stats.get("count_queries", 0) + 1
+    left_filter = _combine_filters(base_filter, _build_port_range_filter(low, mid))
+    left_hits = await _run_log_count_exact(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=time_range,
+        filter_str=left_filter,
+        timeout=timeout,
+        stats=stats,
+        slice_day_candidates=slice_day_candidates,
+        min_split_hours=min_split_hours,
+    )
+    right_hits = max(known_hits - left_hits, 0)
+
+    left_results = await _enumerate_exact_ports(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=time_range,
+        slice_day_candidates=slice_day_candidates,
+        base_filter=base_filter,
+        low=low,
+        high=mid,
+        known_hits=left_hits,
+        timeout=timeout,
+        stats=stats,
+        min_split_hours=min_split_hours,
+    )
+    right_results = await _enumerate_exact_ports(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=time_range,
+        slice_day_candidates=slice_day_candidates,
+        base_filter=base_filter,
+        low=mid + 1,
+        high=high,
+        known_hits=right_hits,
+        timeout=timeout,
+        stats=stats,
+        min_split_hours=min_split_hours,
+    )
+    return left_results + right_results
+
+
+async def _enumerate_exact_protocols(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    slice_day_candidates: list[int] | None,
+    base_filter: str,
+    low: int,
+    high: int,
+    known_hits: int,
+    timeout: int,
+    stats: dict[str, int] | None = None,
+    min_split_hours: int = DEFAULT_EXACT_MIN_SPLIT_HOURS,
+) -> list[ProtocolHit]:
+    """Enumerate exact IP protocols using recursive range counts."""
+    if known_hits <= 0:
+        return []
+
+    if low == high:
+        return [{"protocol": str(low), "hits": known_hits}]
+
+    mid = (low + high) // 2
+    if stats is not None:
+        stats["protocol_range_queries"] = stats.get("protocol_range_queries", 0) + 1
+    left_filter = _combine_filters(base_filter, _build_protocol_range_filter(low, mid))
+    left_hits = await _run_log_count_exact(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=time_range,
+        filter_str=left_filter,
+        timeout=timeout,
+        stats=stats,
+        slice_day_candidates=slice_day_candidates,
+        min_split_hours=min_split_hours,
+    )
+    right_hits = max(known_hits - left_hits, 0)
+
+    left_results = await _enumerate_exact_protocols(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=time_range,
+        slice_day_candidates=slice_day_candidates,
+        base_filter=base_filter,
+        low=low,
+        high=mid,
+        known_hits=left_hits,
+        timeout=timeout,
+        stats=stats,
+        min_split_hours=min_split_hours,
+    )
+    right_results = await _enumerate_exact_protocols(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=time_range,
+        slice_day_candidates=slice_day_candidates,
+        base_filter=base_filter,
+        low=mid + 1,
+        high=high,
+        known_hits=right_hits,
+        timeout=timeout,
+        stats=stats,
+        min_split_hours=min_split_hours,
+    )
+    return left_results + right_results
+
+
+async def _build_icmp_breakdown(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: str,
+    full_time_range: dict[str, str],
+    base_filter: str,
+    icmp_hits: int,
+    timeout: int,
+    slice_day_candidates: list[int],
+) -> list[ICMPTypeHit]:
+    """Build a FAZ-aware ICMP breakdown from service values."""
+    if icmp_hits <= 0:
+        return []
+
+    icmp_filter = _combine_filters(base_filter, "proto==1")
+    candidates, _discovery = await _discover_policy_candidates(
+        adom=adom,
+        device_filter=device_filter,
+        policy_filter=icmp_filter or "",
+        time_range=time_range,
+        slice_days=1,
+        sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
+        timeout=min(timeout, DEFAULT_SEARCH_TIMEOUT),
+        fields=("service",),
+    )
+
+    exact_items, errors, exact_total = await _count_discovered_values(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        base_filter=icmp_filter or "",
+        field="service",
+        counter=candidates["service"],
+        candidate_limit=DEFAULT_POLICY_CANDIDATE_LIMIT,
+        timeout=timeout,
+        result_key="service",
+        slice_day_candidates=slice_day_candidates,
+    )
+    if errors:
+        logger.warning("ICMP breakdown recount had %d errors; preserving totals with residual", len(errors))
+
+    breakdown: dict[str, int] = {}
+    for item in exact_items:
+        label = _format_icmp_type_code(str(item["service"]))
+        breakdown[label] = breakdown.get(label, 0) + int(item["hits"])
+
+    residual = max(icmp_hits - exact_total, 0)
+    if residual > 0:
+        breakdown["other"] = breakdown.get("other", 0) + residual
+
+    return sorted(
+        [{"type_code": label, "hits": hits} for label, hits in breakdown.items()],
+        key=lambda item: (-int(item["hits"]), str(item["type_code"])),
+    )
+
+
+async def _build_policy_traffic_profile_result(
+    *,
+    policy_id: int,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: str,
+    full_time_range: dict[str, str],
+    action: str | None,
+    top_n: int,
+    slice_day_candidates: list[int],
+    discovery_slice_days: int,
+) -> dict[str, Any]:
+    """Build the sampled traffic profile result for one policy."""
+    base_filter = _build_policy_filter(policy_id, action)
+    total_hits = await _run_log_count_exact(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        filter_str=base_filter,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        slice_day_candidates=slice_day_candidates,
+    )
+    if total_hits == 0:
+        return _build_empty_policy_profile_result(policy_id)
+
+    candidate_counters, _discovery = await _discover_policy_candidates(
+        adom=adom,
+        device_filter=device_filter,
+        policy_filter=base_filter,
+        time_range=time_range,
+        slice_days=discovery_slice_days,
+        sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
+        timeout=min(DEFAULT_POLICY_PROFILE_TIMEOUT, DEFAULT_SEARCH_TIMEOUT),
+        fields=("port_pair", "service", "app"),
+    )
+
+    candidate_limit = max(DEFAULT_POLICY_CANDIDATE_LIMIT, top_n)
+    ports, port_errors, ports_total = await _count_discovered_values(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        base_filter=base_filter,
+        field="port_pair",
+        counter=candidate_counters["port_pair"],
+        candidate_limit=candidate_limit,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        result_key="port",
+        slice_day_candidates=slice_day_candidates,
+    )
+    services, service_errors, services_total = await _count_discovered_values(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        base_filter=base_filter,
+        field="service",
+        counter=candidate_counters["service"],
+        candidate_limit=candidate_limit,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        result_key="service",
+        slice_day_candidates=slice_day_candidates,
+    )
+    applications, app_errors, applications_total = await _count_discovered_values(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        base_filter=base_filter,
+        field="app",
+        counter=candidate_counters["app"],
+        candidate_limit=candidate_limit,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        result_key="application",
+        slice_day_candidates=slice_day_candidates,
+    )
+
+    _collapse_count_errors(port_errors + service_errors + app_errors, policy_id)
+
+    return {
+        "policy_id": policy_id,
+        "total_hits": total_hits,
+        "top_ports": sorted(
+            ports[:top_n],
+            key=lambda item: (-int(item["hits"]), _port_pair_sort_key(str(item["port"]))),
+        ),
+        "top_ports_residual": max(total_hits - ports_total, 0),
+        "top_services": services[:top_n],
+        "top_services_residual": max(total_hits - services_total, 0),
+        "top_applications": applications[:top_n],
+        "top_applications_residual": max(total_hits - applications_total, 0),
+    }
+
+
+async def _build_policy_port_analysis_result(
+    *,
+    policy_id: int,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: str,
+    full_time_range: dict[str, str],
+    action: str | None,
+    slice_day_candidates: list[int],
+) -> dict[str, Any]:
+    """Build the exact port-analysis result for one policy."""
+    base_filter = _build_policy_filter(policy_id, action)
+    stats: dict[str, int] = {"count_queries": 0, "count_attempts": 0, "fallback_splits": 0}
+
+    total_hits = await _run_log_count_exact(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        filter_str=base_filter,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        stats=stats,
+        slice_day_candidates=slice_day_candidates,
+    )
+    if total_hits == 0:
+        return _build_empty_port_analysis_result(policy_id)
+
+    numeric_protocol_hits = await _run_log_count_exact(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        filter_str=_combine_filters(base_filter, _build_protocol_range_filter(0, 255)),
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        stats=stats,
+        slice_day_candidates=slice_day_candidates,
+    )
+    exact_protocols = await _enumerate_exact_protocols(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        slice_day_candidates=slice_day_candidates,
+        base_filter=base_filter,
+        low=0,
+        high=255,
+        known_hits=numeric_protocol_hits,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        stats=stats,
+    )
+
+    protocols: list[ProtocolHit] = [
+        {"protocol": str(item["protocol"]), "hits": int(item["hits"])}
+        for item in exact_protocols
+        if int(item["hits"]) > 0
+    ]
+    unknown_protocol_hits = max(total_hits - numeric_protocol_hits, 0)
+    if unknown_protocol_hits > 0:
+        protocols.append({"protocol": "unknown", "hits": unknown_protocol_hits})
+    protocols.sort(
+        key=lambda item: (-int(item["hits"]), _protocol_sort_key(str(item["protocol"])))
+    )
+
+    portless_protocols = sorted(
+        [
+            str(item["protocol"])
+            for item in exact_protocols
+            if str(item["protocol"]).isdigit()
+            and int(str(item["protocol"])) not in PORT_BEARING_PROTOCOLS
+            and int(item["hits"]) > 0
+        ],
+        key=_protocol_sort_key,
+    )
+
+    numeric_port_hits = await _run_log_count_exact(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        filter_str=_combine_filters(base_filter, _build_port_range_filter(1, 65535)),
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        stats=stats,
+        slice_day_candidates=slice_day_candidates,
+    )
+
+    candidates, _discovery = await _discover_policy_candidates(
+        adom=adom,
+        device_filter=device_filter,
+        policy_filter=base_filter,
+        time_range=time_range,
+        slice_days=1,
+        sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
+        timeout=min(DEFAULT_POLICY_PROFILE_TIMEOUT, DEFAULT_SEARCH_TIMEOUT),
+        fields=("dstport",),
+    )
+    seed_ports = [
+        value
+        for value, _hits in candidates["dstport"].most_common(DEFAULT_POLICY_CANDIDATE_LIMIT)
+    ]
+
+    exact_port_rows: list[PortHit] = []
+    for protocol in protocols:
+        protocol_value = str(protocol["protocol"])
+        if not protocol_value.isdigit():
+            continue
+
+        protocol_int = int(protocol_value)
+        protocol_filter = _combine_filters(base_filter, f"proto=={protocol_int}")
+        protocol_port_hits = await _run_log_count_exact(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=full_time_range,
+            filter_str=_combine_filters(protocol_filter, _build_port_range_filter(1, 65535)),
+            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+            stats=stats,
+            slice_day_candidates=slice_day_candidates,
+        )
+        if protocol_port_hits <= 0:
+            continue
+
+        protocol_seeded_ports: list[PortHit] = []
+        for port in seed_ports:
+            hits = await _run_log_count_exact(
+                adom=adom,
+                device_filter=device_filter,
+                time_range=full_time_range,
+                filter_str=_combine_filters(protocol_filter, f"dstport=={port}"),
+                timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+                stats=stats,
+                slice_day_candidates=slice_day_candidates,
+            )
+            if hits > 0:
+                protocol_seeded_ports.append({"port": port, "hits": hits})
+
+        residual_ranges = _build_residual_port_ranges(
+            [int(item["port"]) for item in protocol_seeded_ports]
+        )
+        residual_ports: list[PortHit] = []
+        for range_low, range_high in residual_ranges:
+            range_hits = await _run_log_count_exact(
+                adom=adom,
+                device_filter=device_filter,
+                time_range=full_time_range,
+                filter_str=_combine_filters(
+                    protocol_filter,
+                    _build_port_range_filter(range_low, range_high),
+                ),
+                timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+                stats=stats,
+                slice_day_candidates=slice_day_candidates,
+            )
+            if range_hits <= 0:
+                continue
+
+            residual_ports.extend(
+                await _enumerate_exact_ports(
+                    adom=adom,
+                    device_filter=device_filter,
+                    time_range=full_time_range,
+                    slice_day_candidates=slice_day_candidates,
+                    base_filter=protocol_filter or "",
+                    low=range_low,
+                    high=range_high,
+                    known_hits=range_hits,
+                    timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+                    stats=stats,
+                )
+            )
+
+        for item in protocol_seeded_ports + residual_ports:
+            exact_port_rows.append(
+                {"port": f"{protocol_int}/{item['port']}", "hits": int(item["hits"])}
+            )
+
+    merged_ports: dict[str, int] = {}
+    for item in exact_port_rows:
+        port = str(item["port"])
+        merged_ports[port] = merged_ports.get(port, 0) + int(item["hits"])
+
+    exact_ports: list[PortHit] = sorted(
+        [
+            {"port": port, "hits": hits}
+            for port, hits in merged_ports.items()
+            if hits > 0
+        ],
+        key=lambda item: (-int(item["hits"]), _port_pair_sort_key(str(item["port"]))),
+    )
+    covered_port_hits = sum(int(item["hits"]) for item in exact_ports)
+    uncovered_port_hits = max(numeric_port_hits - covered_port_hits, 0)
+
+    icmp_hits = next(
+        (int(item["hits"]) for item in protocols if str(item["protocol"]) == "1"),
+        0,
+    )
+    icmp = await _build_icmp_breakdown(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=time_range,
+        full_time_range=full_time_range,
+        base_filter=base_filter,
+        icmp_hits=icmp_hits,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        slice_day_candidates=slice_day_candidates,
+    )
+
+    return {
+        "policy_id": policy_id,
+        "total_hits": total_hits,
+        "is_exact": uncovered_port_hits == 0,
+        "ports": exact_ports,
+        "protocols": protocols,
+        "portless_protocols": portless_protocols,
+        "uncovered_port_hits": uncovered_port_hits,
+        "icmp": icmp,
+    }
+
+
+async def _build_policy_protocol_summary_result(
+    *,
+    policy_id: int,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    full_time_range: dict[str, str],
+    action: str | None,
+    slice_day_candidates: list[int],
+) -> dict[str, Any]:
+    """Build the lightweight protocol summary for one policy."""
+    base_filter = _build_policy_filter(policy_id, action)
+    total_hits = await _run_log_count_exact(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        filter_str=base_filter,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        slice_day_candidates=slice_day_candidates,
+    )
+    if total_hits == 0:
+        return {"policy_id": policy_id, "total_hits": 0, "protocols": []}
+
+    numeric_protocol_hits = await _run_log_count_exact(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        filter_str=_combine_filters(base_filter, _build_protocol_range_filter(0, 255)),
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        slice_day_candidates=slice_day_candidates,
+    )
+    exact_protocols = await _enumerate_exact_protocols(
+        adom=adom,
+        device_filter=device_filter,
+        time_range=full_time_range,
+        slice_day_candidates=slice_day_candidates,
+        base_filter=base_filter,
+        low=0,
+        high=255,
+        known_hits=numeric_protocol_hits,
+        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+    )
+
+    protocol_summary: list[ProtocolHit] = [
+        {
+            "protocol": _format_protocol_name(str(item["protocol"])),
+            "hits": int(item["hits"]),
+        }
+        for item in exact_protocols
+        if int(item["hits"]) > 0
+    ]
+
+    unknown_protocol_hits = max(total_hits - numeric_protocol_hits, 0)
+    if unknown_protocol_hits > 0:
+        protocol_summary.append({"protocol": "other(unknown)", "hits": unknown_protocol_hits})
+
+    protocol_summary.sort(
+        key=lambda item: (-int(item["hits"]), str(item["protocol"]))
+    )
+
+    return {
+        "policy_id": policy_id,
+        "total_hits": total_hits,
+        "protocols": protocol_summary,
+    }
+
+
+async def _gather_policy_results(
+    policy_ids: list[int],
+    builder: Callable[[int], Awaitable[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Run per-policy builders with bounded concurrency."""
+
+    async def run_policy(policy_id: int) -> dict[str, Any]:
+        async with _POLICY_QUERY_SEMAPHORE:
+            return await builder(policy_id)
+
+    results = await asyncio.gather(
+        *(run_policy(policy_id) for policy_id in policy_ids),
+        return_exceptions=True,
+    )
+
+    per_policy = []
+    for policy_id, result in zip(policy_ids, results, strict=True):
+        if isinstance(result, Exception):
+            per_policy.append({"policy_id": policy_id, "error": str(result)})
+        else:
+            per_policy.append(cast(dict[str, Any], result))
+
+    return per_policy
 
 
 def _aggregate_traffic_profile(logs: list[dict[str, Any]], top_n: int) -> dict[str, Any]:
-    """Aggregate log entries into a traffic profile.
-
-    Returns top ports, services, and applications with hit counts.
-    """
+    """Aggregate fetched log rows into a traffic profile."""
     port_counter: Counter[str] = Counter()
     service_counter: Counter[str] = Counter()
     app_counter: Counter[str] = Counter()
@@ -311,11 +1484,7 @@ def _aggregate_traffic_profile(logs: list[dict[str, Any]], top_n: int) -> dict[s
 
 
 def _aggregate_port_analysis(logs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate logs into exact port/protocol enumeration.
-
-    Returns complete port list, protocol breakdown, ICMP summary,
-    and is_exact indicator.
-    """
+    """Aggregate fetched log rows into a port/protocol summary."""
     port_counter: Counter[str] = Counter()
     protocol_counter: Counter[str] = Counter()
     portless_protocols: set[str] = set()
@@ -324,87 +1493,45 @@ def _aggregate_port_analysis(logs: list[dict[str, Any]]) -> dict[str, Any]:
     port_hits = 0
 
     for log in logs:
-        proto_num = log.get("proto", "")
-        proto_str = str(proto_num)
+        proto_str = str(log.get("proto", ""))
         protocol_counter[proto_str] += 1
 
         dstport = log.get("dstport")
         if dstport is not None and str(dstport) != "0":
-            port_key = f"{proto_str}/{dstport}"
-            port_counter[port_key] += 1
+            port_counter[f"{proto_str}/{dstport}"] += 1
             port_hits += 1
         else:
-            # Portless protocol (ICMP, GRE, ESP, etc.)
             portless_protocols.add(proto_str)
 
-        # Track ICMP types from service field
-        # FAZ logs encode ICMP info in service field, not icmptype/icmpcode:
-        #   "PING" = echo request (type=8/code=0)
-        #   "icmp/3/3" = type=3/code=3
         if proto_str == "1":
             service = str(log.get("service", ""))
-            if service.upper() == "PING":
-                icmp_types["type=8/code=0"] += 1
-            elif service.startswith("icmp/"):
-                parts = service.split("/")
-                if len(parts) == 3:
-                    icmp_types[f"type={parts[1]}/code={parts[2]}"] += 1
-                else:
-                    icmp_types[f"service={service}"] += 1
-            elif service:
-                icmp_types[f"service={service}"] += 1
-
-    uncovered = total - port_hits
+            if service:
+                icmp_types[_format_icmp_type_code(service)] += 1
 
     return {
         "total_hits": total,
         "is_exact": True,
         "ports": [{"port": p, "hits": c} for p, c in port_counter.most_common()],
         "protocols": [{"protocol": p, "hits": c} for p, c in protocol_counter.most_common()],
-        "portless_protocols": sorted(portless_protocols),
-        "uncovered_port_hits": uncovered,
-        "icmp": (
-            [{"type_code": tc, "hits": c} for tc, c in icmp_types.most_common()]
-            if icmp_types
-            else []
-        ),
+        "portless_protocols": sorted(portless_protocols, key=_protocol_sort_key),
+        "uncovered_port_hits": total - port_hits,
+        "icmp": [{"type_code": key, "hits": hits} for key, hits in icmp_types.most_common()],
     }
 
 
 def _aggregate_protocol_summary(logs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate logs into a lightweight protocol breakdown.
-
-    Maps protocol numbers to names for common protocols.
-    """
-    PROTO_NAMES = {
-        "6": "TCP",
-        "17": "UDP",
-        "1": "ICMP",
-        "58": "ICMPv6",
-        "47": "GRE",
-        "50": "ESP",
-        "51": "AH",
-        "89": "OSPF",
-        "132": "SCTP",
-    }
-
+    """Aggregate fetched log rows into a lightweight protocol summary."""
     protocol_counter: Counter[str] = Counter()
     total = len(logs)
 
     for log in logs:
         proto_num = str(log.get("proto", "unknown"))
-        proto_name = PROTO_NAMES.get(proto_num, f"other({proto_num})")
-        protocol_counter[proto_name] += 1
+        protocol_counter[_format_protocol_name(proto_num)] += 1
 
     return {
         "total_hits": total,
         "protocols": [{"protocol": p, "hits": c} for p, c in protocol_counter.most_common()],
     }
-
-
-# =============================================================================
-# MCP Tool Functions
-# =============================================================================
 
 
 @mcp.tool()
@@ -416,38 +1543,11 @@ async def get_policy_traffic_profile(
     action: str | None = None,
     top_n: int = DEFAULT_TOP_N,
 ) -> dict[str, Any]:
-    """Get sampled traffic summary per firewall policy.
+    """Get sampled traffic summaries for one or more firewall policies.
 
-    Queries traffic logs filtered by policy ID and aggregates top destination
-    ports, services, and applications. Useful for understanding what traffic
-    a policy is actually handling.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number like "FG100FTK19001333" or name).
-            Default: All FortiGate devices.
-        policy_ids: List of firewall policy IDs to analyze (1-25 IDs, each > 0).
-        time_range: Time range for log query. Options:
-            - "1-hour", "6-hour", "12-hour", "24-hour" (default)
-            - "7-day", "30-day"
-            - Custom: "start_time|end_time"
-        action: Filter by action (optional). Valid values:
-            "accept", "deny", "close", "drop", "ip-conn", "timeout"
-        top_n: Number of top items to return per category (default: 10)
-
-    Returns:
-        dict with keys:
-            - status: "success" or "error"
-            - results: Per-policy traffic profiles with top ports, services, apps
-            - query_time_seconds: Total query duration
-            - message: Error message if failed
-
-    Example:
-        >>> result = await get_policy_traffic_profile(
-        ...     policy_ids=[1, 5, 10],
-        ...     time_range="7-day",
-        ...     action="accept"
-        ... )
+    The results are built from multi-slice discovery plus exact recounts of the
+    strongest candidates, so this stays fast while still grounding the reported
+    hits in full-window counts.
     """
     try:
         adom = validate_adom(adom or get_default_adom())
@@ -455,43 +1555,45 @@ async def get_policy_traffic_profile(
             return {"status": "error", "message": "policy_ids is required"}
         policy_ids = validate_policy_ids(policy_ids)
         action = validate_action(action)
-
         if top_n < 1:
             top_n = DEFAULT_TOP_N
 
+        device_filter = _build_device_filter(device)
+        full_time_range = _parse_time_range(time_range)
+        slice_day_candidates = _build_exact_slice_day_candidates(DEFAULT_EXACT_SLICE_DAYS)
+        discovery_slice_days = _plan_batch_slice_days(
+            time_range=time_range,
+            slice_days=1,
+            policy_count=len(policy_ids),
+            fields=("port_pair", "service", "app"),
+        )
+
         start = time.monotonic()
-
-        # Query all policies concurrently
-        tasks = [_query_policy_logs(adom, device, pid, time_range, action) for pid in policy_ids]
-        results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-        per_policy = []
-        for pid, result in zip(policy_ids, results_list, strict=True):
-            if isinstance(result, Exception):
-                per_policy.append(
-                    {
-                        "policy_id": pid,
-                        "error": str(result),
-                    }
-                )
-            else:
-                profile = _aggregate_traffic_profile(result, top_n)
-                profile["policy_id"] = pid
-                per_policy.append(profile)
-
-        elapsed = time.monotonic() - start
+        results = await _gather_policy_results(
+            policy_ids,
+            lambda policy_id: _build_policy_traffic_profile_result(
+                policy_id=policy_id,
+                adom=adom,
+                device_filter=device_filter,
+                time_range=time_range,
+                full_time_range=full_time_range,
+                action=action,
+                top_n=top_n,
+                slice_day_candidates=slice_day_candidates,
+                discovery_slice_days=discovery_slice_days,
+            ),
+        )
 
         return {
             "status": "success",
-            "results": per_policy,
-            "query_time_seconds": round(elapsed, 2),
+            "results": results,
+            "query_time_seconds": round(time.monotonic() - start, 2),
         }
-
     except ValidationError as e:
         return {"status": "error", "message": f"Validation error: {e}"}
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
-    except (OSError, TimeoutError) as e:
+    except (OSError, TimeoutError, FazConnectionError, FazTimeoutError, APIError) as e:
         logger.error(f"Network error in get_policy_traffic_profile: {e}")
         return {"status": "error", "message": f"Network error: {e}"}
 
@@ -504,43 +1606,11 @@ async def get_policy_port_analysis(
     time_range: str = "24-hour",
     action: str | None = None,
 ) -> dict[str, Any]:
-    """Get exact port/protocol enumeration per firewall policy.
+    """Get exact port/protocol analysis for one or more firewall policies.
 
-    Enumerates all destination ports and protocols observed in traffic logs
-    for each policy. Returns complete lists (not sampled) with an is_exact
-    indicator. Useful for identifying exactly which ports are in use for
-    policy tightening.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number like "FG100FTK19001333" or name).
-            Default: All FortiGate devices.
-        policy_ids: List of firewall policy IDs to analyze (1-25 IDs, each > 0).
-        time_range: Time range for log query. Options:
-            - "1-hour", "6-hour", "12-hour", "24-hour" (default)
-            - "7-day", "30-day"
-            - Custom: "start_time|end_time"
-        action: Filter by action (optional). Valid values:
-            "accept", "deny", "close", "drop", "ip-conn", "timeout"
-
-    Returns:
-        dict with keys:
-            - status: "success" or "error"
-            - results: Per-policy port analysis with:
-                - is_exact: Whether the port list is complete
-                - ports: List of port/protocol pairs with hit counts
-                - protocols: Protocol breakdown
-                - portless_protocols: Protocols without ports (ICMP, GRE, etc.)
-                - uncovered_port_hits: Hits without a destination port
-                - icmp: ICMP type/code breakdown (if applicable)
-            - query_time_seconds: Total query duration
-            - message: Error message if failed
-
-    Example:
-        >>> result = await get_policy_port_analysis(
-        ...     policy_ids=[1],
-        ...     time_range="7-day"
-        ... )
+    `is_exact` reflects whether every numeric-port hit in the fixed time window
+    is covered by the returned `ports` list. Portless traffic is surfaced via
+    `protocols`, `portless_protocols`, and `icmp`.
     """
     try:
         adom = validate_adom(adom or get_default_adom())
@@ -549,38 +1619,34 @@ async def get_policy_port_analysis(
         policy_ids = validate_policy_ids(policy_ids)
         action = validate_action(action)
 
+        device_filter = _build_device_filter(device)
+        full_time_range = _parse_time_range(time_range)
+        slice_day_candidates = _build_exact_slice_day_candidates(DEFAULT_EXACT_SLICE_DAYS)
+
         start = time.monotonic()
-
-        tasks = [_query_policy_logs(adom, device, pid, time_range, action) for pid in policy_ids]
-        results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-        per_policy = []
-        for pid, result in zip(policy_ids, results_list, strict=True):
-            if isinstance(result, Exception):
-                per_policy.append(
-                    {
-                        "policy_id": pid,
-                        "error": str(result),
-                    }
-                )
-            else:
-                analysis = _aggregate_port_analysis(result)
-                analysis["policy_id"] = pid
-                per_policy.append(analysis)
-
-        elapsed = time.monotonic() - start
+        results = await _gather_policy_results(
+            policy_ids,
+            lambda policy_id: _build_policy_port_analysis_result(
+                policy_id=policy_id,
+                adom=adom,
+                device_filter=device_filter,
+                time_range=time_range,
+                full_time_range=full_time_range,
+                action=action,
+                slice_day_candidates=slice_day_candidates,
+            ),
+        )
 
         return {
             "status": "success",
-            "results": per_policy,
-            "query_time_seconds": round(elapsed, 2),
+            "results": results,
+            "query_time_seconds": round(time.monotonic() - start, 2),
         }
-
     except ValidationError as e:
         return {"status": "error", "message": f"Validation error: {e}"}
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
-    except (OSError, TimeoutError) as e:
+    except (OSError, TimeoutError, FazConnectionError, FazTimeoutError, APIError) as e:
         logger.error(f"Network error in get_policy_port_analysis: {e}")
         return {"status": "error", "message": f"Network error: {e}"}
 
@@ -593,37 +1659,7 @@ async def get_policy_protocol_summary(
     time_range: str = "24-hour",
     action: str | None = None,
 ) -> dict[str, Any]:
-    """Get lightweight protocol breakdown per firewall policy.
-
-    Returns TCP/UDP/ICMP/other hit counts per policy. This is a faster,
-    less detailed alternative to get_policy_port_analysis when only the
-    protocol distribution is needed.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number like "FG100FTK19001333" or name).
-            Default: All FortiGate devices.
-        policy_ids: List of firewall policy IDs to analyze (1-25 IDs, each > 0).
-        time_range: Time range for log query. Options:
-            - "1-hour", "6-hour", "12-hour", "24-hour" (default)
-            - "7-day", "30-day"
-            - Custom: "start_time|end_time"
-        action: Filter by action (optional). Valid values:
-            "accept", "deny", "close", "drop", "ip-conn", "timeout"
-
-    Returns:
-        dict with keys:
-            - status: "success" or "error"
-            - results: Per-policy protocol summaries with hit counts
-            - query_time_seconds: Total query duration
-            - message: Error message if failed
-
-    Example:
-        >>> result = await get_policy_protocol_summary(
-        ...     policy_ids=[1, 5],
-        ...     time_range="24-hour"
-        ... )
-    """
+    """Get lightweight protocol distribution summaries for firewall policies."""
     try:
         adom = validate_adom(adom or get_default_adom())
         if policy_ids is None:
@@ -631,37 +1667,32 @@ async def get_policy_protocol_summary(
         policy_ids = validate_policy_ids(policy_ids)
         action = validate_action(action)
 
+        device_filter = _build_device_filter(device)
+        full_time_range = _parse_time_range(time_range)
+        slice_day_candidates = _build_exact_slice_day_candidates(DEFAULT_EXACT_SLICE_DAYS)
+
         start = time.monotonic()
-
-        tasks = [_query_policy_logs(adom, device, pid, time_range, action) for pid in policy_ids]
-        results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-        per_policy = []
-        for pid, result in zip(policy_ids, results_list, strict=True):
-            if isinstance(result, Exception):
-                per_policy.append(
-                    {
-                        "policy_id": pid,
-                        "error": str(result),
-                    }
-                )
-            else:
-                summary = _aggregate_protocol_summary(result)
-                summary["policy_id"] = pid
-                per_policy.append(summary)
-
-        elapsed = time.monotonic() - start
+        results = await _gather_policy_results(
+            policy_ids,
+            lambda policy_id: _build_policy_protocol_summary_result(
+                policy_id=policy_id,
+                adom=adom,
+                device_filter=device_filter,
+                full_time_range=full_time_range,
+                action=action,
+                slice_day_candidates=slice_day_candidates,
+            ),
+        )
 
         return {
             "status": "success",
-            "results": per_policy,
-            "query_time_seconds": round(elapsed, 2),
+            "results": results,
+            "query_time_seconds": round(time.monotonic() - start, 2),
         }
-
     except ValidationError as e:
         return {"status": "error", "message": f"Validation error: {e}"}
     except RuntimeError as e:
         return {"status": "error", "message": str(e)}
-    except (OSError, TimeoutError) as e:
+    except (OSError, TimeoutError, FazConnectionError, FazTimeoutError, APIError) as e:
         logger.error(f"Network error in get_policy_protocol_summary: {e}")
         return {"status": "error", "message": f"Network error: {e}"}
