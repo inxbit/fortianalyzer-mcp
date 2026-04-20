@@ -1353,17 +1353,6 @@ async def _build_policy_port_analysis_result(
             slice_day_candidates=slice_day_candidates,
         )
     )
-    numeric_port_hits_task = asyncio.create_task(
-        _run_log_count_exact(
-            adom=adom,
-            device_filter=device_filter,
-            time_range=full_time_range,
-            filter_str=_combine_filters(base_filter, _build_port_range_filter(1, 65535)),
-            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
-            stats=stats,
-            slice_day_candidates=slice_day_candidates,
-        )
-    )
     protocol_samples_task = asyncio.create_task(
         _discover_protocol_candidates(
             adom=adom,
@@ -1387,14 +1376,32 @@ async def _build_policy_port_analysis_result(
         )
     )
 
-    total_hits, numeric_port_hits, sampled_protocols, (candidates, _discovery) = await asyncio.gather(
+    total_hits, sampled_protocols, (candidates, _discovery) = await asyncio.gather(
         total_hits_task,
-        numeric_port_hits_task,
         protocol_samples_task,
         port_candidates_task,
     )
     if total_hits == 0:
         return _build_empty_port_analysis_result(policy_id)
+
+    numeric_port_hits_is_approximate = False
+    try:
+        numeric_port_hits = await _run_log_count_exact(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=full_time_range,
+            filter_str=_combine_filters(base_filter, _build_port_range_filter(1, 65535)),
+            timeout=DEFAULT_PORT_ANALYSIS_COUNT_TIMEOUT,
+            stats=stats,
+            slice_day_candidates=slice_day_candidates,
+        )
+    except RETRYABLE_QUERY_EXCEPTIONS:
+        numeric_port_hits = total_hits
+        numeric_port_hits_is_approximate = True
+        logger.warning(
+            "Numeric port count timed out for policy %s; falling back to total hits",
+            policy_id,
+        )
 
     (
         (exact_protocol_hits, residual_protocol_hits),
@@ -1474,7 +1481,7 @@ async def _build_policy_port_analysis_result(
     return {
         "policy_id": policy_id,
         "total_hits": total_hits,
-        "is_exact": uncovered_port_hits == 0,
+        "is_exact": uncovered_port_hits == 0 and not numeric_port_hits_is_approximate and not port_errors,
         "ports": exact_ports,
         "protocols": protocols,
         "portless_protocols": portless_protocols,
