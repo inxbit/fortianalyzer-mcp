@@ -58,6 +58,7 @@ DEFAULT_EXACT_SLICE_DAYS = 15
 DEFAULT_PROTOCOL_COUNT_CONCURRENCY = 4
 DEFAULT_VALUE_RECOUNT_CONCURRENCY = 3
 DEFAULT_PORT_ANALYSIS_RECOUNT_CONCURRENCY = 4
+DEFAULT_PORT_ANALYSIS_COUNT_TIMEOUT = 8
 DEFAULT_DISCOVERED_PROTOCOL_LIMIT = 4
 
 PROTOCOL_NAMES = {
@@ -991,19 +992,47 @@ async def _collect_protocol_buckets(
             timeout=min(timeout, DEFAULT_SEARCH_TIMEOUT),
         )
 
-    exact_hits = await _count_filters_bounded(
-        adom=adom,
-        device_filter=device_filter,
-        time_range=time_range,
-        filters={
-            protocol: _combine_filters(base_filter, f"proto=={protocol}") or ""
-            for protocol in _select_protocols_to_count(sampled_protocols, base_protocols)
-        },
-        timeout=timeout,
-        slice_day_candidates=slice_day_candidates,
-        stats=stats,
-        concurrency=DEFAULT_PROTOCOL_COUNT_CONCURRENCY,
+    filters = {
+        protocol: _combine_filters(base_filter, f"proto=={protocol}") or ""
+        for protocol in _select_protocols_to_count(sampled_protocols, base_protocols)
+    }
+    semaphore = asyncio.Semaphore(DEFAULT_PROTOCOL_COUNT_CONCURRENCY)
+
+    async def count_one(protocol: str, filter_str: str) -> tuple[str, int | None, str | None]:
+        try:
+            async with semaphore:
+                hits = await _run_log_count_exact(
+                    adom=adom,
+                    device_filter=device_filter,
+                    time_range=time_range,
+                    filter_str=filter_str,
+                    timeout=timeout,
+                    stats=stats,
+                    slice_day_candidates=slice_day_candidates,
+                )
+        except RETRYABLE_QUERY_EXCEPTIONS as exc:
+            return protocol, None, str(exc)
+        return protocol, hits, None
+
+    results = await asyncio.gather(
+        *(count_one(protocol, filter_str) for protocol, filter_str in filters.items())
     )
+
+    exact_hits: dict[str, int] = {}
+    failed_protocols: list[str] = []
+    for protocol, hits, error in results:
+        if error is not None:
+            failed_protocols.append(protocol)
+            continue
+        if hits is not None:
+            exact_hits[protocol] = hits
+
+    if failed_protocols:
+        logger.warning(
+            "Protocol recount timed out for %d protocol buckets on filter %s",
+            len(failed_protocols),
+            base_filter,
+        )
 
     exact_total = sum(exact_hits.values())
     return exact_hits, max(total_hits - exact_total, 0)
@@ -1378,7 +1407,7 @@ async def _build_policy_port_analysis_result(
             base_filter=base_filter,
             base_protocols=PORT_ANALYSIS_BASE_PROTOCOLS,
             total_hits=total_hits,
-            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+            timeout=DEFAULT_PORT_ANALYSIS_COUNT_TIMEOUT,
             sampled_protocols=sampled_protocols,
             slice_day_candidates=slice_day_candidates,
             stats=stats,
@@ -1391,7 +1420,7 @@ async def _build_policy_port_analysis_result(
             field="port_pair",
             counter=candidates["port_pair"],
             candidate_limit=DEFAULT_PORT_ANALYSIS_CANDIDATE_LIMIT,
-            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+            timeout=DEFAULT_PORT_ANALYSIS_COUNT_TIMEOUT,
             result_key="port",
             slice_day_candidates=slice_day_candidates,
             concurrency=DEFAULT_PORT_ANALYSIS_RECOUNT_CONCURRENCY,
@@ -1418,7 +1447,12 @@ async def _build_policy_port_analysis_result(
         key=_protocol_sort_key,
     )
 
-    _collapse_count_errors(port_errors, policy_id)
+    if port_errors:
+        logger.warning(
+            "Port recount timed out for %d sampled port pairs on policy %s",
+            len(port_errors),
+            policy_id,
+        )
 
     exact_ports.sort(
         key=lambda item: (-int(item["hits"]), _port_pair_sort_key(str(item["port"]))),
