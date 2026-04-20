@@ -57,6 +57,7 @@ DEFAULT_EXACT_MIN_SPLIT_HOURS = 6
 DEFAULT_EXACT_SLICE_DAYS = 15
 DEFAULT_PROTOCOL_COUNT_CONCURRENCY = 4
 DEFAULT_VALUE_RECOUNT_CONCURRENCY = 3
+DEFAULT_DISCOVERED_PROTOCOL_LIMIT = 4
 
 PROTOCOL_NAMES = {
     1: "ICMP",
@@ -73,7 +74,8 @@ PROTOCOL_NAMES = {
 }
 
 PORT_BEARING_PROTOCOLS = {6, 17, 33, 132}
-TRACKED_PROTOCOLS = tuple(sorted(PROTOCOL_NAMES))
+SUMMARY_BASE_PROTOCOLS = (6, 17, 1)
+PORT_ANALYSIS_BASE_PROTOCOLS = (6, 17, 33, 132, 1, 47, 50)
 VALID_ACTIONS = frozenset(VALID_TRAFFIC_ACTIONS)
 
 RETRYABLE_QUERY_EXCEPTIONS = (
@@ -742,6 +744,39 @@ async def _discover_policy_candidates(
     return counters, discovery
 
 
+async def _discover_protocol_candidates(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_filter: str,
+    time_range: str,
+    sample_limit: int,
+    timeout: int,
+) -> Counter[str]:
+    """Sample logs across the time range to discover active IP protocols."""
+    slices = _build_time_slices(time_range, slice_days=1)
+    offsets = [0, sample_limit] if len(slices) == 1 else [0]
+    protocols: Counter[str] = Counter()
+
+    for time_slice in slices:
+        for offset in offsets:
+            rows = await _run_log_sample(
+                adom=adom,
+                device_filter=device_filter,
+                time_range=time_slice,
+                filter_str=policy_filter,
+                limit=sample_limit,
+                offset=offset,
+                timeout=timeout,
+            )
+            for row in rows:
+                proto = str(row.get("proto", "")).strip()
+                if proto.isdigit():
+                    protocols[str(int(proto))] += 1
+
+    return protocols
+
+
 def _build_discovered_value_filter(field: str, value: str) -> str:
     """Build a filter for a discovered candidate value."""
     if field == "port_pair":
@@ -855,9 +890,7 @@ def _format_protocol_name(protocol: str) -> str:
 def _format_protocol_summary_name(protocol: str) -> str:
     """Map protocol buckets to protocol-summary labels."""
     if protocol == "other":
-        return "other(numeric)"
-    if protocol == "unknown":
-        return "other(unknown)"
+        return "other"
     return _format_protocol_name(protocol)
 
 
@@ -924,30 +957,35 @@ async def _collect_protocol_buckets(
     adom: str,
     device_filter: list[dict[str, str]],
     time_range: dict[str, str],
+    sampled_time_range: str,
     base_filter: str,
+    base_protocols: tuple[int, ...],
     total_hits: int,
     timeout: int,
     slice_day_candidates: list[int] | None = None,
     stats: dict[str, int] | None = None,
-) -> tuple[dict[str, int], int, int]:
-    """Collect exact counts for tracked protocols plus numeric/unknown residuals."""
-    numeric_protocol_hits = await _run_log_count_exact(
+) -> tuple[dict[str, int], int]:
+    """Collect exact counts for sampled protocol buckets plus a residual `other` bucket."""
+    sampled_protocols = await _discover_protocol_candidates(
         adom=adom,
         device_filter=device_filter,
-        time_range=time_range,
-        filter_str=_combine_filters(base_filter, _build_protocol_range_filter(0, 255)),
-        timeout=timeout,
-        stats=stats,
-        slice_day_candidates=slice_day_candidates,
+        policy_filter=base_filter,
+        time_range=sampled_time_range,
+        sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
+        timeout=min(timeout, DEFAULT_SEARCH_TIMEOUT),
     )
 
-    tracked_hits = await _count_filters_bounded(
+    selected_protocols = {str(protocol) for protocol in base_protocols}
+    for protocol, _sample_hits in sampled_protocols.most_common(DEFAULT_DISCOVERED_PROTOCOL_LIMIT):
+        selected_protocols.add(protocol)
+
+    exact_hits = await _count_filters_bounded(
         adom=adom,
         device_filter=device_filter,
         time_range=time_range,
         filters={
-            str(protocol): _combine_filters(base_filter, f"proto=={protocol}") or ""
-            for protocol in TRACKED_PROTOCOLS
+            protocol: _combine_filters(base_filter, f"proto=={protocol}") or ""
+            for protocol in sorted(selected_protocols, key=_protocol_sort_key)
         },
         timeout=timeout,
         slice_day_candidates=slice_day_candidates,
@@ -955,10 +993,8 @@ async def _collect_protocol_buckets(
         concurrency=DEFAULT_PROTOCOL_COUNT_CONCURRENCY,
     )
 
-    tracked_total = sum(tracked_hits.values())
-    other_numeric_hits = max(numeric_protocol_hits - tracked_total, 0)
-    unknown_hits = max(total_hits - numeric_protocol_hits, 0)
-    return tracked_hits, other_numeric_hits, unknown_hits
+    exact_total = sum(exact_hits.values())
+    return exact_hits, max(total_hits - exact_total, 0)
 
 
 async def _enumerate_exact_ports(
@@ -1277,11 +1313,13 @@ async def _build_policy_port_analysis_result(
     if total_hits == 0:
         return _build_empty_port_analysis_result(policy_id)
 
-    tracked_protocol_hits, other_numeric_hits, unknown_protocol_hits = await _collect_protocol_buckets(
+    exact_protocol_hits, residual_protocol_hits = await _collect_protocol_buckets(
         adom=adom,
         device_filter=device_filter,
         time_range=full_time_range,
+        sampled_time_range=time_range,
         base_filter=base_filter,
+        base_protocols=PORT_ANALYSIS_BASE_PROTOCOLS,
         total_hits=total_hits,
         timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
         slice_day_candidates=slice_day_candidates,
@@ -1290,13 +1328,11 @@ async def _build_policy_port_analysis_result(
 
     protocols: list[ProtocolHit] = [
         {"protocol": protocol, "hits": hits}
-        for protocol, hits in tracked_protocol_hits.items()
+        for protocol, hits in exact_protocol_hits.items()
         if hits > 0
     ]
-    if other_numeric_hits > 0:
-        protocols.append({"protocol": "other", "hits": other_numeric_hits})
-    if unknown_protocol_hits > 0:
-        protocols.append({"protocol": "unknown", "hits": unknown_protocol_hits})
+    if residual_protocol_hits > 0:
+        protocols.append({"protocol": "other", "hits": residual_protocol_hits})
     protocols.sort(
         key=lambda item: (-int(item["hits"]), _protocol_sort_key(str(item["protocol"])))
     )
@@ -1304,7 +1340,7 @@ async def _build_policy_port_analysis_result(
     portless_protocols = sorted(
         [
             protocol
-            for protocol, hits in tracked_protocol_hits.items()
+            for protocol, hits in exact_protocol_hits.items()
             if protocol.isdigit() and int(protocol) not in PORT_BEARING_PROTOCOLS and hits > 0
         ],
         key=_protocol_sort_key,
@@ -1350,7 +1386,7 @@ async def _build_policy_port_analysis_result(
     )
     uncovered_port_hits = max(numeric_port_hits - covered_port_hits, 0)
 
-    icmp_hits = tracked_protocol_hits.get("1", 0)
+    icmp_hits = exact_protocol_hits.get("1", 0)
     icmp = await _build_icmp_breakdown(
         adom=adom,
         device_filter=device_filter,
@@ -1379,6 +1415,7 @@ async def _build_policy_protocol_summary_result(
     policy_id: int,
     adom: str,
     device_filter: list[dict[str, str]],
+    time_range: str,
     full_time_range: dict[str, str],
     action: str | None,
     slice_day_candidates: list[int],
@@ -1396,11 +1433,13 @@ async def _build_policy_protocol_summary_result(
     if total_hits == 0:
         return {"policy_id": policy_id, "total_hits": 0, "protocols": []}
 
-    tracked_protocol_hits, other_numeric_hits, unknown_protocol_hits = await _collect_protocol_buckets(
+    exact_protocol_hits, residual_protocol_hits = await _collect_protocol_buckets(
         adom=adom,
         device_filter=device_filter,
         time_range=full_time_range,
+        sampled_time_range=time_range,
         base_filter=base_filter,
+        base_protocols=SUMMARY_BASE_PROTOCOLS,
         total_hits=total_hits,
         timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
         slice_day_candidates=slice_day_candidates,
@@ -1411,13 +1450,11 @@ async def _build_policy_protocol_summary_result(
             "protocol": _format_protocol_summary_name(protocol),
             "hits": hits,
         }
-        for protocol, hits in tracked_protocol_hits.items()
+        for protocol, hits in exact_protocol_hits.items()
         if hits > 0
     ]
-    if other_numeric_hits > 0:
-        protocol_summary.append({"protocol": "other(numeric)", "hits": other_numeric_hits})
-    if unknown_protocol_hits > 0:
-        protocol_summary.append({"protocol": "other(unknown)", "hits": unknown_protocol_hits})
+    if residual_protocol_hits > 0:
+        protocol_summary.append({"protocol": "other", "hits": residual_protocol_hits})
 
     protocol_summary.sort(
         key=lambda item: (-int(item["hits"]), str(item["protocol"]))
@@ -1622,7 +1659,8 @@ async def get_policy_port_analysis(
 
     `is_exact` reflects whether every numeric-port hit in the fixed time window
     is covered by the returned `ports` list. Portless traffic is surfaced via
-    `protocols`, `portless_protocols`, and `icmp`.
+    `protocols`, `portless_protocols`, and `icmp`, with any unclassified
+    protocol traffic retained in an `other` bucket instead of timing out.
     """
     try:
         adom = validate_adom(adom or get_default_adom())
@@ -1671,7 +1709,7 @@ async def get_policy_protocol_summary(
     time_range: str = "24-hour",
     action: str | None = None,
 ) -> dict[str, Any]:
-    """Get lightweight protocol distribution summaries for firewall policies."""
+    """Get lightweight protocol summaries with exact bucket counts plus residual `other`."""
     try:
         adom = validate_adom(adom or get_default_adom())
         if policy_ids is None:
@@ -1690,6 +1728,7 @@ async def get_policy_protocol_summary(
                 policy_id=policy_id,
                 adom=adom,
                 device_filter=device_filter,
+                time_range=time_range,
                 full_time_range=full_time_range,
                 action=action,
                 slice_day_candidates=slice_day_candidates,

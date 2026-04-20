@@ -531,8 +531,6 @@ class TestPolicyPortAnalysisTool:
             filter_str = kwargs.get("filter_str") or ""
             if filter_str == "policyid==42":
                 return 13
-            if filter_str == "policyid==42 and proto>=0 and proto<=255":
-                return 13
             if filter_str == "policyid==42 and dstport>=1 and dstport<=65535":
                 return 10
             if filter_str == "policyid==42 and proto==6 and dstport==443":
@@ -556,11 +554,20 @@ class TestPolicyPortAnalysisTool:
                 return {"service": Counter({"PING": 2, "icmp/3/3": 1})}, {"errors": []}
             raise AssertionError(f"Unexpected policy_filter: {policy_filter}")
 
+        async def fake_discover_protocol_candidates(**kwargs):
+            assert kwargs["policy_filter"] == "policyid==42"
+            return Counter({"6": 10, "1": 3})
+
         monkeypatch.setattr(traffic_tools, "_run_log_count_exact", fake_run_log_count_exact)
         monkeypatch.setattr(
             traffic_tools,
             "_discover_policy_candidates",
             fake_discover_policy_candidates,
+        )
+        monkeypatch.setattr(
+            traffic_tools,
+            "_discover_protocol_candidates",
+            fake_discover_protocol_candidates,
         )
 
         result = await traffic_tools.get_policy_port_analysis(
@@ -597,8 +604,6 @@ class TestPolicyPortAnalysisTool:
             filter_str = kwargs.get("filter_str") or ""
             if filter_str == "policyid==42":
                 return 13
-            if filter_str == "policyid==42 and proto>=0 and proto<=255":
-                return 13
             if filter_str == "policyid==42 and dstport>=1 and dstport<=65535":
                 return 12
             if filter_str == "policyid==42 and proto==6 and dstport==443":
@@ -618,11 +623,20 @@ class TestPolicyPortAnalysisTool:
                 return {"service": Counter({"PING": 1})}, {"errors": []}
             raise AssertionError(f"Unexpected policy_filter: {policy_filter}")
 
+        async def fake_discover_protocol_candidates(**kwargs):
+            assert kwargs["policy_filter"] == "policyid==42"
+            return Counter({"6": 12, "1": 1})
+
         monkeypatch.setattr(traffic_tools, "_run_log_count_exact", fake_run_log_count_exact)
         monkeypatch.setattr(
             traffic_tools,
             "_discover_policy_candidates",
             fake_discover_policy_candidates,
+        )
+        monkeypatch.setattr(
+            traffic_tools,
+            "_discover_protocol_candidates",
+            fake_discover_protocol_candidates,
         )
 
         result = await traffic_tools.get_policy_port_analysis(
@@ -647,14 +661,21 @@ class TestPolicyProtocolSummaryTool:
             filter_str = kwargs.get("filter_str") or ""
             if filter_str == "policyid==42":
                 return 5
-            if filter_str == "policyid==42 and proto>=0 and proto<=255":
-                return 5
             if filter_str.startswith("policyid==42 and proto==") and filter_str.count(" and ") == 1:
                 protocol = filter_str.rsplit("==", maxsplit=1)[1]
                 return {"6": 2, "17": 1, "1": 1}.get(protocol, 0)
             raise AssertionError(f"Unexpected filter in test: {filter_str}")
 
+        async def fake_discover_protocol_candidates(**kwargs):
+            assert kwargs["policy_filter"] == "policyid==42"
+            return Counter({"6": 5, "17": 3, "1": 2, "200": 1})
+
         monkeypatch.setattr(traffic_tools, "_run_log_count_exact", fake_run_log_count_exact)
+        monkeypatch.setattr(
+            traffic_tools,
+            "_discover_protocol_candidates",
+            fake_discover_protocol_candidates,
+        )
 
         result = await traffic_tools.get_policy_protocol_summary(
             policy_ids=[42],
@@ -670,6 +691,6 @@ class TestPolicyProtocolSummaryTool:
                 {"protocol": "TCP", "hits": 2},
                 {"protocol": "ICMP", "hits": 1},
                 {"protocol": "UDP", "hits": 1},
-                {"protocol": "other(numeric)", "hits": 1},
+                {"protocol": "other", "hits": 1},
             ],
         }
