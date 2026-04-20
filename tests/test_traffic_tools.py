@@ -525,59 +525,42 @@ class TestPolicyPortAnalysisTool:
     """Tests for exact policy port analysis."""
 
     async def test_exact_analysis_closes_numeric_port_coverage(self, monkeypatch) -> None:
-        """Exact analysis should mark the result exact when all numeric ports close."""
+        """Exact analysis should mark the result exact when discovered port pairs close."""
 
         async def fake_run_log_count_exact(**kwargs):
             filter_str = kwargs.get("filter_str") or ""
-            mapping = {
-                "policyid==42": 13,
-                "policyid==42 and proto>=0 and proto<=255": 13,
-                "policyid==42 and dstport>=1 and dstport<=65535": 10,
-                "policyid==42 and proto==6 and dstport>=1 and dstport<=65535": 10,
-                "policyid==42 and proto==1 and dstport>=1 and dstport<=65535": 0,
-                "policyid==42 and proto==6 and dstport==443": 6,
-                "policyid==42 and proto==6 and dstport>=1 and dstport<=442": 0,
-                "policyid==42 and proto==6 and dstport>=444 and dstport<=65535": 4,
-                "policyid==42 and proto==1 and service==PING": 2,
-                'policyid==42 and proto==1 and service=="icmp/3/3"': 1,
-            }
-            if filter_str not in mapping:
-                raise AssertionError(f"Unexpected filter in test: {filter_str}")
-            return mapping[filter_str]
+            if filter_str == "policyid==42":
+                return 13
+            if filter_str == "policyid==42 and proto>=0 and proto<=255":
+                return 13
+            if filter_str == "policyid==42 and dstport>=1 and dstport<=65535":
+                return 10
+            if filter_str == "policyid==42 and proto==6 and dstport==443":
+                return 6
+            if filter_str == "policyid==42 and proto==6 and dstport==8443":
+                return 4
+            if filter_str == "policyid==42 and proto==1 and service==PING":
+                return 2
+            if filter_str == 'policyid==42 and proto==1 and service=="icmp/3/3"':
+                return 1
+            if filter_str.startswith("policyid==42 and proto==") and filter_str.count(" and ") == 1:
+                protocol = filter_str.rsplit("==", maxsplit=1)[1]
+                return {"6": 10, "1": 3}.get(protocol, 0)
+            raise AssertionError(f"Unexpected filter in test: {filter_str}")
 
         async def fake_discover_policy_candidates(**kwargs):
             policy_filter = kwargs["policy_filter"]
             if policy_filter == "policyid==42":
-                return {"dstport": Counter({"443": 10})}, {"errors": []}
+                return {"port_pair": Counter({"6/443": 10, "6/8443": 4})}, {"errors": []}
             if policy_filter == "policyid==42 and proto==1":
                 return {"service": Counter({"PING": 2, "icmp/3/3": 1})}, {"errors": []}
             raise AssertionError(f"Unexpected policy_filter: {policy_filter}")
-
-        async def fake_enumerate_exact_protocols(**kwargs):
-            return [{"protocol": "6", "hits": 10}, {"protocol": "1", "hits": 3}]
-
-        async def fake_enumerate_exact_ports(**kwargs):
-            assert kwargs["base_filter"] == "policyid==42 and proto==6"
-            assert kwargs["low"] == 444
-            assert kwargs["high"] == 65535
-            assert kwargs["known_hits"] == 4
-            return [{"port": "8443", "hits": 4}]
 
         monkeypatch.setattr(traffic_tools, "_run_log_count_exact", fake_run_log_count_exact)
         monkeypatch.setattr(
             traffic_tools,
             "_discover_policy_candidates",
             fake_discover_policy_candidates,
-        )
-        monkeypatch.setattr(
-            traffic_tools,
-            "_enumerate_exact_protocols",
-            fake_enumerate_exact_protocols,
-        )
-        monkeypatch.setattr(
-            traffic_tools,
-            "_enumerate_exact_ports",
-            fake_enumerate_exact_ports,
         )
 
         result = await traffic_tools.get_policy_port_analysis(
@@ -608,54 +591,38 @@ class TestPolicyPortAnalysisTool:
         self,
         monkeypatch,
     ) -> None:
-        """`uncovered_port_hits` should only represent missing numeric port coverage."""
+        """`uncovered_port_hits` should only represent missing discovered numeric coverage."""
 
         async def fake_run_log_count_exact(**kwargs):
             filter_str = kwargs.get("filter_str") or ""
-            mapping = {
-                "policyid==42": 13,
-                "policyid==42 and proto>=0 and proto<=255": 13,
-                "policyid==42 and dstport>=1 and dstport<=65535": 12,
-                "policyid==42 and proto==6 and dstport>=1 and dstport<=65535": 12,
-                "policyid==42 and proto==1 and dstport>=1 and dstport<=65535": 0,
-                "policyid==42 and proto==6 and dstport==443": 6,
-                "policyid==42 and proto==6 and dstport>=1 and dstport<=442": 0,
-                "policyid==42 and proto==6 and dstport>=444 and dstport<=65535": 6,
-                "policyid==42 and proto==1 and service==PING": 1,
-            }
-            if filter_str not in mapping:
-                raise AssertionError(f"Unexpected filter in test: {filter_str}")
-            return mapping[filter_str]
+            if filter_str == "policyid==42":
+                return 13
+            if filter_str == "policyid==42 and proto>=0 and proto<=255":
+                return 13
+            if filter_str == "policyid==42 and dstport>=1 and dstport<=65535":
+                return 12
+            if filter_str == "policyid==42 and proto==6 and dstport==443":
+                return 6
+            if filter_str == "policyid==42 and proto==1 and service==PING":
+                return 1
+            if filter_str.startswith("policyid==42 and proto==") and filter_str.count(" and ") == 1:
+                protocol = filter_str.rsplit("==", maxsplit=1)[1]
+                return {"6": 12, "1": 1}.get(protocol, 0)
+            raise AssertionError(f"Unexpected filter in test: {filter_str}")
 
         async def fake_discover_policy_candidates(**kwargs):
             policy_filter = kwargs["policy_filter"]
             if policy_filter == "policyid==42":
-                return {"dstport": Counter({"443": 10})}, {"errors": []}
+                return {"port_pair": Counter({"6/443": 10})}, {"errors": []}
             if policy_filter == "policyid==42 and proto==1":
                 return {"service": Counter({"PING": 1})}, {"errors": []}
             raise AssertionError(f"Unexpected policy_filter: {policy_filter}")
-
-        async def fake_enumerate_exact_protocols(**kwargs):
-            return [{"protocol": "6", "hits": 12}, {"protocol": "1", "hits": 1}]
-
-        async def fake_enumerate_exact_ports(**kwargs):
-            return [{"port": "8443", "hits": 4}]
 
         monkeypatch.setattr(traffic_tools, "_run_log_count_exact", fake_run_log_count_exact)
         monkeypatch.setattr(
             traffic_tools,
             "_discover_policy_candidates",
             fake_discover_policy_candidates,
-        )
-        monkeypatch.setattr(
-            traffic_tools,
-            "_enumerate_exact_protocols",
-            fake_enumerate_exact_protocols,
-        )
-        monkeypatch.setattr(
-            traffic_tools,
-            "_enumerate_exact_ports",
-            fake_enumerate_exact_ports,
         )
 
         result = await traffic_tools.get_policy_port_analysis(
@@ -666,7 +633,7 @@ class TestPolicyPortAnalysisTool:
 
         policy = result["results"][0]
         assert policy["is_exact"] is False
-        assert policy["uncovered_port_hits"] == 2
+        assert policy["uncovered_port_hits"] == 6
         assert policy["icmp"] == [{"type_code": "type=8/code=0", "hits": 1}]
 
 
@@ -674,31 +641,20 @@ class TestPolicyProtocolSummaryTool:
     """Tests for protocol summary behavior."""
 
     async def test_protocol_summary_uses_exact_protocol_counts(self, monkeypatch) -> None:
-        """Protocol summaries should be built from exact protocol counts."""
+        """Protocol summaries should use tracked exact buckets plus residual numeric hits."""
 
         async def fake_run_log_count_exact(**kwargs):
             filter_str = kwargs.get("filter_str") or ""
-            mapping = {
-                "policyid==42": 4,
-                "policyid==42 and proto>=0 and proto<=255": 4,
-            }
-            if filter_str not in mapping:
-                raise AssertionError(f"Unexpected filter in test: {filter_str}")
-            return mapping[filter_str]
-
-        async def fake_enumerate_exact_protocols(**kwargs):
-            return [
-                {"protocol": "6", "hits": 2},
-                {"protocol": "17", "hits": 1},
-                {"protocol": "1", "hits": 1},
-            ]
+            if filter_str == "policyid==42":
+                return 5
+            if filter_str == "policyid==42 and proto>=0 and proto<=255":
+                return 5
+            if filter_str.startswith("policyid==42 and proto==") and filter_str.count(" and ") == 1:
+                protocol = filter_str.rsplit("==", maxsplit=1)[1]
+                return {"6": 2, "17": 1, "1": 1}.get(protocol, 0)
+            raise AssertionError(f"Unexpected filter in test: {filter_str}")
 
         monkeypatch.setattr(traffic_tools, "_run_log_count_exact", fake_run_log_count_exact)
-        monkeypatch.setattr(
-            traffic_tools,
-            "_enumerate_exact_protocols",
-            fake_enumerate_exact_protocols,
-        )
 
         result = await traffic_tools.get_policy_protocol_summary(
             policy_ids=[42],
@@ -709,10 +665,11 @@ class TestPolicyProtocolSummaryTool:
         assert result["status"] == "success"
         assert result["results"][0] == {
             "policy_id": 42,
-            "total_hits": 4,
+            "total_hits": 5,
             "protocols": [
                 {"protocol": "TCP", "hits": 2},
                 {"protocol": "ICMP", "hits": 1},
                 {"protocol": "UDP", "hits": 1},
+                {"protocol": "other(numeric)", "hits": 1},
             ],
         }
