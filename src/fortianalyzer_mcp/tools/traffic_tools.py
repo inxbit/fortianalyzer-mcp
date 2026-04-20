@@ -952,32 +952,43 @@ async def _count_filters_bounded(
     return dict(pairs)
 
 
+def _select_protocols_to_count(
+    sampled_protocols: Counter[str],
+    base_protocols: tuple[int, ...],
+) -> list[str]:
+    """Select a bounded set of protocols to exact-count for one policy."""
+    selected_protocols = {str(protocol) for protocol in base_protocols}
+    for protocol, _sample_hits in sampled_protocols.most_common(DEFAULT_DISCOVERED_PROTOCOL_LIMIT):
+        selected_protocols.add(protocol)
+    return sorted(selected_protocols, key=_protocol_sort_key)
+
+
 async def _collect_protocol_buckets(
     *,
     adom: str,
     device_filter: list[dict[str, str]],
     time_range: dict[str, str],
-    sampled_time_range: str,
     base_filter: str,
     base_protocols: tuple[int, ...],
     total_hits: int,
     timeout: int,
+    sampled_protocols: Counter[str] | None = None,
+    sampled_time_range: str | None = None,
     slice_day_candidates: list[int] | None = None,
     stats: dict[str, int] | None = None,
 ) -> tuple[dict[str, int], int]:
     """Collect exact counts for sampled protocol buckets plus a residual `other` bucket."""
-    sampled_protocols = await _discover_protocol_candidates(
-        adom=adom,
-        device_filter=device_filter,
-        policy_filter=base_filter,
-        time_range=sampled_time_range,
-        sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
-        timeout=min(timeout, DEFAULT_SEARCH_TIMEOUT),
-    )
-
-    selected_protocols = {str(protocol) for protocol in base_protocols}
-    for protocol, _sample_hits in sampled_protocols.most_common(DEFAULT_DISCOVERED_PROTOCOL_LIMIT):
-        selected_protocols.add(protocol)
+    if sampled_protocols is None:
+        if sampled_time_range is None:
+            raise RuntimeError("sampled_time_range is required when sampled_protocols is not provided")
+        sampled_protocols = await _discover_protocol_candidates(
+            adom=adom,
+            device_filter=device_filter,
+            policy_filter=base_filter,
+            time_range=sampled_time_range,
+            sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
+            timeout=min(timeout, DEFAULT_SEARCH_TIMEOUT),
+        )
 
     exact_hits = await _count_filters_bounded(
         adom=adom,
@@ -985,7 +996,7 @@ async def _collect_protocol_buckets(
         time_range=time_range,
         filters={
             protocol: _combine_filters(base_filter, f"proto=={protocol}") or ""
-            for protocol in sorted(selected_protocols, key=_protocol_sort_key)
+            for protocol in _select_protocols_to_count(sampled_protocols, base_protocols)
         },
         timeout=timeout,
         slice_day_candidates=slice_day_candidates,
@@ -1301,29 +1312,89 @@ async def _build_policy_port_analysis_result(
     base_filter = _build_policy_filter(policy_id, action)
     stats: dict[str, int] = {"count_queries": 0, "count_attempts": 0, "fallback_splits": 0}
 
-    total_hits = await _run_log_count_exact(
-        adom=adom,
-        device_filter=device_filter,
-        time_range=full_time_range,
-        filter_str=base_filter,
-        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
-        stats=stats,
-        slice_day_candidates=slice_day_candidates,
+    total_hits_task = asyncio.create_task(
+        _run_log_count_exact(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=full_time_range,
+            filter_str=base_filter,
+            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+            stats=stats,
+            slice_day_candidates=slice_day_candidates,
+        )
+    )
+    numeric_port_hits_task = asyncio.create_task(
+        _run_log_count_exact(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=full_time_range,
+            filter_str=_combine_filters(base_filter, _build_port_range_filter(1, 65535)),
+            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+            stats=stats,
+            slice_day_candidates=slice_day_candidates,
+        )
+    )
+    protocol_samples_task = asyncio.create_task(
+        _discover_protocol_candidates(
+            adom=adom,
+            device_filter=device_filter,
+            policy_filter=base_filter,
+            time_range=time_range,
+            sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
+            timeout=min(DEFAULT_POLICY_PROFILE_TIMEOUT, DEFAULT_SEARCH_TIMEOUT),
+        )
+    )
+    port_candidates_task = asyncio.create_task(
+        _discover_policy_candidates(
+            adom=adom,
+            device_filter=device_filter,
+            policy_filter=base_filter,
+            time_range=time_range,
+            slice_days=1,
+            sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
+            timeout=min(DEFAULT_POLICY_PROFILE_TIMEOUT, DEFAULT_SEARCH_TIMEOUT),
+            fields=("port_pair",),
+        )
+    )
+
+    total_hits, numeric_port_hits, sampled_protocols, (candidates, _discovery) = await asyncio.gather(
+        total_hits_task,
+        numeric_port_hits_task,
+        protocol_samples_task,
+        port_candidates_task,
     )
     if total_hits == 0:
         return _build_empty_port_analysis_result(policy_id)
 
-    exact_protocol_hits, residual_protocol_hits = await _collect_protocol_buckets(
-        adom=adom,
-        device_filter=device_filter,
-        time_range=full_time_range,
-        sampled_time_range=time_range,
-        base_filter=base_filter,
-        base_protocols=PORT_ANALYSIS_BASE_PROTOCOLS,
-        total_hits=total_hits,
-        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
-        slice_day_candidates=slice_day_candidates,
-        stats=stats,
+    (
+        (exact_protocol_hits, residual_protocol_hits),
+        (exact_ports, port_errors, covered_port_hits),
+    ) = await asyncio.gather(
+        _collect_protocol_buckets(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=full_time_range,
+            base_filter=base_filter,
+            base_protocols=PORT_ANALYSIS_BASE_PROTOCOLS,
+            total_hits=total_hits,
+            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+            sampled_protocols=sampled_protocols,
+            slice_day_candidates=slice_day_candidates,
+            stats=stats,
+        ),
+        _count_discovered_values(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=full_time_range,
+            base_filter=base_filter,
+            field="port_pair",
+            counter=candidates["port_pair"],
+            candidate_limit=DEFAULT_PORT_ANALYSIS_CANDIDATE_LIMIT,
+            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+            result_key="port",
+            slice_day_candidates=slice_day_candidates,
+            concurrency=DEFAULT_VALUE_RECOUNT_CONCURRENCY,
+        ),
     )
 
     protocols: list[ProtocolHit] = [
@@ -1346,39 +1417,6 @@ async def _build_policy_port_analysis_result(
         key=_protocol_sort_key,
     )
 
-    numeric_port_hits = await _run_log_count_exact(
-        adom=adom,
-        device_filter=device_filter,
-        time_range=full_time_range,
-        filter_str=_combine_filters(base_filter, _build_port_range_filter(1, 65535)),
-        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
-        stats=stats,
-        slice_day_candidates=slice_day_candidates,
-    )
-
-    candidates, _discovery = await _discover_policy_candidates(
-        adom=adom,
-        device_filter=device_filter,
-        policy_filter=base_filter,
-        time_range=time_range,
-        slice_days=1,
-        sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
-        timeout=min(DEFAULT_POLICY_PROFILE_TIMEOUT, DEFAULT_SEARCH_TIMEOUT),
-        fields=("port_pair",),
-    )
-    exact_ports, port_errors, covered_port_hits = await _count_discovered_values(
-        adom=adom,
-        device_filter=device_filter,
-        time_range=full_time_range,
-        base_filter=base_filter,
-        field="port_pair",
-        counter=candidates["port_pair"],
-        candidate_limit=DEFAULT_PORT_ANALYSIS_CANDIDATE_LIMIT,
-        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
-        result_key="port",
-        slice_day_candidates=slice_day_candidates,
-        concurrency=DEFAULT_VALUE_RECOUNT_CONCURRENCY,
-    )
     _collapse_count_errors(port_errors, policy_id)
 
     exact_ports.sort(
@@ -1422,13 +1460,23 @@ async def _build_policy_protocol_summary_result(
 ) -> dict[str, Any]:
     """Build the lightweight protocol summary for one policy."""
     base_filter = _build_policy_filter(policy_id, action)
-    total_hits = await _run_log_count_exact(
-        adom=adom,
-        device_filter=device_filter,
-        time_range=full_time_range,
-        filter_str=base_filter,
-        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
-        slice_day_candidates=slice_day_candidates,
+    total_hits, sampled_protocols = await asyncio.gather(
+        _run_log_count_exact(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=full_time_range,
+            filter_str=base_filter,
+            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+            slice_day_candidates=slice_day_candidates,
+        ),
+        _discover_protocol_candidates(
+            adom=adom,
+            device_filter=device_filter,
+            policy_filter=base_filter,
+            time_range=time_range,
+            sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
+            timeout=min(DEFAULT_POLICY_PROFILE_TIMEOUT, DEFAULT_SEARCH_TIMEOUT),
+        ),
     )
     if total_hits == 0:
         return {"policy_id": policy_id, "total_hits": 0, "protocols": []}
@@ -1437,11 +1485,11 @@ async def _build_policy_protocol_summary_result(
         adom=adom,
         device_filter=device_filter,
         time_range=full_time_range,
-        sampled_time_range=time_range,
         base_filter=base_filter,
         base_protocols=SUMMARY_BASE_PROTOCOLS,
         total_hits=total_hits,
         timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        sampled_protocols=sampled_protocols,
         slice_day_candidates=slice_day_candidates,
     )
 
