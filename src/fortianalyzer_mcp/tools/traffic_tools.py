@@ -48,6 +48,8 @@ POLL_INTERVAL = 0.25
 MAX_POLICY_IDS = 25
 DEFAULT_TOP_N = 10
 DEFAULT_POLICY_PROFILE_TIMEOUT = 20
+DEFAULT_PORT_ANALYSIS_FETCH_TIMEOUT = 120
+DEFAULT_EXACT_FETCH_PAGE_SIZE = 500
 DEFAULT_POLICY_SAMPLE_LIMIT = 25
 DEFAULT_POLICY_CANDIDATE_LIMIT = 12
 DEFAULT_PORT_ANALYSIS_CANDIDATE_LIMIT = 4
@@ -671,6 +673,205 @@ async def _run_log_sample(
 
     logger.warning(f"Sample query failed for filter {filter_str}: {last_error}")
     return []
+
+
+def _normalize_logsearch_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize one logsearch fetch payload into a list of log rows."""
+    rows = result.get("data", [])
+    if not isinstance(rows, list):
+        rows = [rows] if rows else []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+async def _run_log_fetch_all(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    filter_str: str | None,
+    timeout: int,
+    page_size: int = DEFAULT_EXACT_FETCH_PAGE_SIZE,
+    retries: int = 2,
+) -> list[dict[str, Any]]:
+    """Run one full log search and fetch every matching row exactly."""
+    last_error: Exception | None = None
+    page_size = max(1, min(page_size, DEFAULT_EXACT_FETCH_PAGE_SIZE))
+
+    for attempt in range(retries):
+        tid: int | None = None
+        client = None
+        try:
+            client = await _get_connected_client()
+            start_result = await client.logsearch_start(
+                adom=adom,
+                logtype="traffic",
+                device=device_filter,
+                time_range=time_range,
+                filter=filter_str,
+                limit=page_size,
+                offset=0,
+            )
+            tid = start_result.get("tid")
+            if not tid:
+                raise RuntimeError(f"No TID returned for exact fetch query: {start_result}")
+
+            started = time.monotonic()
+            while True:
+                if time.monotonic() - started > timeout:
+                    raise TimeoutError(
+                        f"Exact fetch timed out after {timeout}s for filter {filter_str}"
+                    )
+
+                first_page = await client.logsearch_fetch(
+                    adom=adom,
+                    tid=tid,
+                    limit=page_size,
+                    offset=0,
+                )
+                if first_page.get("percentage", 0) >= 100:
+                    rows = _normalize_logsearch_rows(first_page)
+                    total_count_raw = first_page.get("total-count")
+                    expected_total = (
+                        int(total_count_raw) if total_count_raw is not None else None
+                    )
+
+                    offset = len(rows)
+                    while True:
+                        if expected_total is not None and offset >= expected_total:
+                            break
+                        if time.monotonic() - started > timeout:
+                            raise TimeoutError(
+                                f"Exact fetch paging timed out after {timeout}s for filter {filter_str}"
+                            )
+
+                        page = await client.logsearch_fetch(
+                            adom=adom,
+                            tid=tid,
+                            limit=page_size,
+                            offset=offset,
+                        )
+                        if page.get("percentage", 0) < 100:
+                            await asyncio.sleep(POLL_INTERVAL)
+                            continue
+
+                        page_rows = _normalize_logsearch_rows(page)
+                        if not page_rows:
+                            break
+
+                        rows.extend(page_rows)
+                        offset += len(page_rows)
+                        if expected_total is None and len(page_rows) < page_size:
+                            break
+
+                    if expected_total is not None and len(rows) < expected_total:
+                        raise RuntimeError(
+                            f"Incomplete exact fetch for filter {filter_str}: "
+                            f"expected {expected_total} rows, got {len(rows)}"
+                        )
+                    return rows[:expected_total] if expected_total is not None else rows
+
+                await asyncio.sleep(POLL_INTERVAL)
+        except RETRYABLE_QUERY_EXCEPTIONS as exc:
+            last_error = exc
+            if attempt + 1 < retries:
+                await asyncio.sleep(POLL_INTERVAL)
+        finally:
+            if tid and client is not None:
+                try:
+                    await client.logsearch_cancel(adom, tid)
+                except RETRYABLE_QUERY_EXCEPTIONS:
+                    pass
+
+    raise RuntimeError(f"Exact fetch failed for filter {filter_str}: {last_error}")
+
+
+async def _run_log_fetch_resilient(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    filter_str: str | None,
+    timeout: int,
+    min_split_hours: int = 1,
+) -> list[dict[str, Any]]:
+    """Run a full exact fetch, splitting the time range when one query is too slow."""
+    try:
+        return await _run_log_fetch_all(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=time_range,
+            filter_str=filter_str,
+            timeout=timeout,
+        )
+    except RETRYABLE_QUERY_EXCEPTIONS:
+        start, end = _parse_time_range_dict(time_range)
+        span = end - start
+        if span <= timedelta(hours=max(min_split_hours, 1)):
+            raise
+
+        split_ranges = _split_time_range_non_overlapping(time_range)
+        if not split_ranges:
+            raise
+        left_range, right_range = split_ranges
+        left_rows = await _run_log_fetch_resilient(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=left_range,
+            filter_str=filter_str,
+            timeout=timeout,
+            min_split_hours=min_split_hours,
+        )
+        right_rows = await _run_log_fetch_resilient(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=right_range,
+            filter_str=filter_str,
+            timeout=timeout,
+            min_split_hours=min_split_hours,
+        )
+        return left_rows + right_rows
+
+
+async def _run_log_fetch_exact(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    filter_str: str | None,
+    timeout: int,
+    slice_day_candidates: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch every matching log row exactly, using fixed slices before recursive splits."""
+    candidates = slice_day_candidates or [1]
+    last_error: Exception | None = None
+
+    for slice_days in candidates:
+        try:
+            rows: list[dict[str, Any]] = []
+            for time_slice in _build_exact_time_slices(time_range, slice_days):
+                rows.extend(
+                    await _run_log_fetch_all(
+                        adom=adom,
+                        device_filter=device_filter,
+                        time_range=time_slice,
+                        filter_str=filter_str,
+                        timeout=timeout,
+                    )
+                )
+            return rows
+        except RETRYABLE_QUERY_EXCEPTIONS as exc:
+            last_error = exc
+
+    if last_error is not None:
+        return await _run_log_fetch_resilient(
+            adom=adom,
+            device_filter=device_filter,
+            time_range=time_range,
+            filter_str=filter_str,
+            timeout=timeout,
+        )
+
+    raise RuntimeError(f"Exact fetch failed for filter {filter_str}")
 
 
 async def _discover_policy_candidates(
@@ -1333,161 +1534,24 @@ async def _build_policy_port_analysis_result(
     policy_id: int,
     adom: str,
     device_filter: list[dict[str, str]],
-    time_range: str,
     full_time_range: dict[str, str],
     action: str | None,
     slice_day_candidates: list[int],
 ) -> dict[str, Any]:
     """Build the exact port-analysis result for one policy."""
     base_filter = _build_policy_filter(policy_id, action)
-    stats: dict[str, int] = {"count_queries": 0, "count_attempts": 0, "fallback_splits": 0}
-
-    total_hits_task = asyncio.create_task(
-        _run_log_count_exact(
-            adom=adom,
-            device_filter=device_filter,
-            time_range=full_time_range,
-            filter_str=base_filter,
-            timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
-            stats=stats,
-            slice_day_candidates=slice_day_candidates,
-        )
-    )
-    protocol_samples_task = asyncio.create_task(
-        _discover_protocol_candidates(
-            adom=adom,
-            device_filter=device_filter,
-            policy_filter=base_filter,
-            time_range=time_range,
-            sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
-            timeout=min(DEFAULT_POLICY_PROFILE_TIMEOUT, DEFAULT_SEARCH_TIMEOUT),
-        )
-    )
-    port_candidates_task = asyncio.create_task(
-        _discover_policy_candidates(
-            adom=adom,
-            device_filter=device_filter,
-            policy_filter=base_filter,
-            time_range=time_range,
-            slice_days=1,
-            sample_limit=DEFAULT_POLICY_SAMPLE_LIMIT,
-            timeout=min(DEFAULT_POLICY_PROFILE_TIMEOUT, DEFAULT_SEARCH_TIMEOUT),
-            fields=("port_pair",),
-        )
-    )
-
-    total_hits, sampled_protocols, (candidates, _discovery) = await asyncio.gather(
-        total_hits_task,
-        protocol_samples_task,
-        port_candidates_task,
-    )
-    if total_hits == 0:
-        return _build_empty_port_analysis_result(policy_id)
-
-    numeric_port_hits_is_approximate = False
-    try:
-        numeric_port_hits = await _run_log_count_exact(
-            adom=adom,
-            device_filter=device_filter,
-            time_range=full_time_range,
-            filter_str=_combine_filters(base_filter, _build_port_range_filter(1, 65535)),
-            timeout=DEFAULT_PORT_ANALYSIS_COUNT_TIMEOUT,
-            stats=stats,
-            slice_day_candidates=slice_day_candidates,
-        )
-    except RETRYABLE_QUERY_EXCEPTIONS:
-        numeric_port_hits = total_hits
-        numeric_port_hits_is_approximate = True
-        logger.warning(
-            "Numeric port count timed out for policy %s; falling back to total hits",
-            policy_id,
-        )
-
-    (
-        (exact_protocol_hits, residual_protocol_hits),
-        (exact_ports, port_errors, covered_port_hits),
-    ) = await asyncio.gather(
-        _collect_protocol_buckets(
-            adom=adom,
-            device_filter=device_filter,
-            time_range=full_time_range,
-            base_filter=base_filter,
-            base_protocols=PORT_ANALYSIS_BASE_PROTOCOLS,
-            total_hits=total_hits,
-            timeout=DEFAULT_PORT_ANALYSIS_COUNT_TIMEOUT,
-            sampled_protocols=sampled_protocols,
-            slice_day_candidates=slice_day_candidates,
-            stats=stats,
-        ),
-        _count_discovered_values(
-            adom=adom,
-            device_filter=device_filter,
-            time_range=full_time_range,
-            base_filter=base_filter,
-            field="port_pair",
-            counter=candidates["port_pair"],
-            candidate_limit=DEFAULT_PORT_ANALYSIS_CANDIDATE_LIMIT,
-            timeout=DEFAULT_PORT_ANALYSIS_COUNT_TIMEOUT,
-            result_key="port",
-            slice_day_candidates=slice_day_candidates,
-            concurrency=DEFAULT_PORT_ANALYSIS_RECOUNT_CONCURRENCY,
-        ),
-    )
-
-    protocols: list[ProtocolHit] = [
-        {"protocol": protocol, "hits": hits}
-        for protocol, hits in exact_protocol_hits.items()
-        if hits > 0
-    ]
-    if residual_protocol_hits > 0:
-        protocols.append({"protocol": "other", "hits": residual_protocol_hits})
-    protocols.sort(
-        key=lambda item: (-int(item["hits"]), _protocol_sort_key(str(item["protocol"])))
-    )
-
-    portless_protocols = sorted(
-        [
-            protocol
-            for protocol, hits in exact_protocol_hits.items()
-            if protocol.isdigit() and int(protocol) not in PORT_BEARING_PROTOCOLS and hits > 0
-        ],
-        key=_protocol_sort_key,
-    )
-
-    if port_errors:
-        logger.warning(
-            "Port recount timed out for %d sampled port pairs on policy %s",
-            len(port_errors),
-            policy_id,
-        )
-
-    exact_ports.sort(
-        key=lambda item: (-int(item["hits"]), _port_pair_sort_key(str(item["port"]))),
-    )
-    uncovered_port_hits = max(numeric_port_hits - covered_port_hits, 0)
-
-    icmp_hits = exact_protocol_hits.get("1", 0)
-    icmp = await _build_icmp_breakdown(
+    logs = await _run_log_fetch_exact(
         adom=adom,
         device_filter=device_filter,
-        time_range=time_range,
-        full_time_range=full_time_range,
-        base_filter=base_filter,
-        icmp_hits=icmp_hits,
-        timeout=DEFAULT_POLICY_PROFILE_TIMEOUT,
+        time_range=full_time_range,
+        filter_str=base_filter,
+        timeout=DEFAULT_PORT_ANALYSIS_FETCH_TIMEOUT,
         slice_day_candidates=slice_day_candidates,
     )
+    if not logs:
+        return _build_empty_port_analysis_result(policy_id)
 
-    return {
-        "policy_id": policy_id,
-        "total_hits": total_hits,
-        "is_exact": uncovered_port_hits == 0 and not numeric_port_hits_is_approximate and not port_errors,
-        "ports": exact_ports,
-        "protocols": protocols,
-        "portless_protocols": portless_protocols,
-        "uncovered_port_hits": uncovered_port_hits,
-        "icmp": icmp,
-    }
+    return {"policy_id": policy_id, **_aggregate_port_analysis(logs)}
 
 
 async def _build_policy_protocol_summary_result(
@@ -1623,22 +1687,20 @@ def _aggregate_traffic_profile(logs: list[dict[str, Any]], top_n: int) -> dict[s
 
 
 def _aggregate_port_analysis(logs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate fetched log rows into a port/protocol summary."""
+    """Aggregate a complete fetched log set into an exact port/protocol summary."""
     port_counter: Counter[str] = Counter()
     protocol_counter: Counter[str] = Counter()
     portless_protocols: set[str] = set()
     icmp_types: Counter[str] = Counter()
     total = len(logs)
-    port_hits = 0
 
     for log in logs:
-        proto_str = str(log.get("proto", ""))
+        proto_str = str(log.get("proto", "unknown")).strip() or "unknown"
         protocol_counter[proto_str] += 1
 
         dstport = log.get("dstport")
-        if dstport is not None and str(dstport) != "0":
+        if dstport is not None and str(dstport).isdigit() and str(dstport) != "0":
             port_counter[f"{proto_str}/{dstport}"] += 1
-            port_hits += 1
         else:
             portless_protocols.add(proto_str)
 
@@ -1650,11 +1712,20 @@ def _aggregate_port_analysis(logs: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "total_hits": total,
         "is_exact": True,
-        "ports": [{"port": p, "hits": c} for p, c in port_counter.most_common()],
-        "protocols": [{"protocol": p, "hits": c} for p, c in protocol_counter.most_common()],
+        "ports": sorted(
+            [{"port": p, "hits": c} for p, c in port_counter.items()],
+            key=lambda item: (-int(item["hits"]), _port_pair_sort_key(str(item["port"]))),
+        ),
+        "protocols": sorted(
+            [{"protocol": p, "hits": c} for p, c in protocol_counter.items()],
+            key=lambda item: (-int(item["hits"]), _protocol_sort_key(str(item["protocol"]))),
+        ),
         "portless_protocols": sorted(portless_protocols, key=_protocol_sort_key),
-        "uncovered_port_hits": total - port_hits,
-        "icmp": [{"type_code": key, "hits": hits} for key, hits in icmp_types.most_common()],
+        "uncovered_port_hits": 0,
+        "icmp": sorted(
+            [{"type_code": key, "hits": hits} for key, hits in icmp_types.items()],
+            key=lambda item: (-int(item["hits"]), str(item["type_code"])),
+        ),
     }
 
 
@@ -1747,10 +1818,9 @@ async def get_policy_port_analysis(
 ) -> dict[str, Any]:
     """Get exact port/protocol analysis for one or more firewall policies.
 
-    `is_exact` reflects whether every numeric-port hit in the fixed time window
-    is covered by the returned `ports` list. Portless traffic is surfaced via
-    `protocols`, `portless_protocols`, and `icmp`, with any unclassified
-    protocol traffic retained in an `other` bucket instead of timing out.
+    This uses a full exact traffic-log fetch for each policy/time window and
+    aggregates locally, so the returned ports, protocols, and ICMP breakdown
+    are 1:1 with the fetched logs whenever the query completes successfully.
     """
     try:
         adom = validate_adom(adom or get_default_adom())
@@ -1770,7 +1840,6 @@ async def get_policy_port_analysis(
                 policy_id=policy_id,
                 adom=adom,
                 device_filter=device_filter,
-                time_range=time_range,
                 full_time_range=full_time_range,
                 action=action,
                 slice_day_candidates=slice_day_candidates,
