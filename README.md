@@ -35,6 +35,15 @@ This MCP server provides a comprehensive interface to FortiAnalyzer's capabiliti
 | **Device Management** | List/add/delete devices, manage device groups and VDOMs |
 | **System** | System status, HA status, ADOM management, task monitoring |
 
+### Policy Traffic Analysis
+
+The traffic-analysis tools are read-only helpers for policy review. The synchronous
+`get_policy_port_analysis` tool keeps exact 1:1 semantics for requests that can complete
+within one MCP call, reuses a local on-disk exact slice cache when available, and fails
+closed when the planned synchronous workload is too large. This fork also includes
+background exact-analysis job helpers for longer policy windows that should run outside
+the normal synchronous request budget.
+
 ## Requirements
 
 - **Python**: 3.12 or higher
@@ -471,6 +480,7 @@ networks:
 | `get_policy_protocol_summary` | Summarize exact protocol distribution per policy for review and tightening workflows |
 
 These tools are read-only traffic analysis helpers for policy-review workflows. They do not modify firewall policy directly; they surface observed usage so policy changes can be planned safely.
+Large exact `get_policy_port_analysis` requests are now planned before execution: the server automatically performs bounded exact slicing when the plan fits the synchronous budget, and fails closed with split guidance only when the planned exact run is still too large.
 
 ### PCAP Tools (5 tools)
 

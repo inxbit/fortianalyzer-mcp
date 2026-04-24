@@ -44,10 +44,17 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     global faz_client
 
     logger.info("Starting FortiAnalyzer MCP server")
+    created_client = False
 
-    # Initialize and connect FortiAnalyzer client
-    faz_client = FortiAnalyzerClient.from_settings(settings)
-    await faz_client.connect()
+    # In HTTP mode, the outer Starlette app already owns the shared client.
+    # Reuse it for per-session MCP lifespan instead of reconnecting/disconnecting
+    # the global client on every request.
+    if faz_client is None:
+        faz_client = FortiAnalyzerClient.from_settings(settings)
+        created_client = True
+
+    if not faz_client.is_connected:
+        await faz_client.connect()
 
     logger.info("FortiAnalyzer MCP server started successfully")
 
@@ -56,8 +63,9 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     finally:
         # Cleanup on shutdown
         logger.info("Shutting down FortiAnalyzer MCP server")
-        if faz_client:
+        if created_client and faz_client:
             await faz_client.disconnect()
+            faz_client = None
         logger.info("FortiAnalyzer MCP server shut down")
 
 
@@ -168,7 +176,7 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
                 ("get_policy_hits", "Get policy hit statistics"),
             ],
             "reports": [
-                ("list_report_templates", "List report templates"),
+                ("list_report_layouts", "List report layouts"),
                 ("run_report", "Run a report"),
                 ("fetch_report", "Fetch report status"),
                 ("get_report_data", "Download report data"),
@@ -303,7 +311,7 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
             "get_top_cloud_applications": fortiview_tools.get_top_cloud_applications,
             "get_policy_hits": fortiview_tools.get_policy_hits,
             # Report tools
-            "list_report_templates": report_tools.list_report_templates,
+            "list_report_layouts": report_tools.list_report_layouts,
             "run_report": report_tools.run_report,
             "fetch_report": report_tools.fetch_report,
             "get_report_data": report_tools.get_report_data,
@@ -464,10 +472,16 @@ def run_stdio() -> None:
     async def stdio_main() -> None:
         """Main coroutine for stdio mode."""
         global faz_client
+        from fortianalyzer_mcp.tools import traffic_tools
 
         # Initialize FortiAnalyzer connection
         logger.info("Initializing FortiAnalyzer connection")
         faz_client = FortiAnalyzerClient.from_settings(settings)
+        stale_jobs = traffic_tools.mark_stale_port_analysis_jobs_interrupted(
+            "MCP server restarted before background exact-analysis job completed."
+        )
+        if stale_jobs:
+            logger.warning("Marked %d stale background exact-analysis jobs interrupted", stale_jobs)
 
         try:
             await faz_client.connect()
@@ -481,8 +495,17 @@ def run_stdio() -> None:
         finally:
             # Cleanup
             logger.info("Closing FortiAnalyzer connection")
+            active_jobs = await traffic_tools.shutdown_port_analysis_jobs(
+                "MCP server shut down before background exact-analysis job completed."
+            )
+            if active_jobs:
+                logger.warning(
+                    "Interrupted %d in-process background exact-analysis jobs on shutdown",
+                    active_jobs,
+                )
             if faz_client:
                 await faz_client.disconnect()
+                faz_client = None
 
     # Run the async main
     asyncio.run(stdio_main())
@@ -561,10 +584,20 @@ def run_http() -> None:
     @asynccontextmanager
     async def app_lifespan(app: Starlette) -> AsyncIterator[None]:
         """Ensure MCP session manager and FortiAnalyzer client start."""
+        from fortianalyzer_mcp.tools import traffic_tools
+
         # Start MCP session manager
         async with mcp.session_manager.run():
             # Initialize FortiAnalyzer connection
             global faz_client
+            stale_jobs = traffic_tools.mark_stale_port_analysis_jobs_interrupted(
+                "MCP server restarted before background exact-analysis job completed."
+            )
+            if stale_jobs:
+                logger.warning(
+                    "Marked %d stale background exact-analysis jobs interrupted",
+                    stale_jobs,
+                )
             logger.info("Initializing FortiAnalyzer connection")
             faz_client = FortiAnalyzerClient.from_settings(settings)
             try:
@@ -576,8 +609,17 @@ def run_http() -> None:
                 yield
             finally:
                 logger.info("Closing FortiAnalyzer connection")
+                active_jobs = await traffic_tools.shutdown_port_analysis_jobs(
+                    "MCP server shut down before background exact-analysis job completed."
+                )
+                if active_jobs:
+                    logger.warning(
+                        "Interrupted %d in-process background exact-analysis jobs on shutdown",
+                        active_jobs,
+                    )
                 if faz_client:
                     await faz_client.disconnect()
+                    faz_client = None
 
     # Build middleware stack
     middleware = [Middleware(AuthMiddleware)]

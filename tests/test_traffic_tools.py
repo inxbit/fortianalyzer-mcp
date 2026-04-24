@@ -325,6 +325,15 @@ class TestAggregatePortAnalysis:
         result = _aggregate_port_analysis(logs)
         assert result["uncovered_port_hits"] == 0
 
+    def test_partial_aggregation_can_mark_inexact(self) -> None:
+        """Incomplete streaming results should be able to mark exactness false."""
+        accumulator = traffic_tools.PortAnalysisAccumulator()
+        logs = [{"dstport": 443, "proto": "6"}, {"proto": "1", "service": "PING"}]
+        accumulator.consume_rows(logs)
+        result = accumulator.build_result(is_exact=False)
+        assert result["is_exact"] is False
+        assert result["uncovered_port_hits"] == len(logs)
+
 
 # =============================================================================
 # Aggregation: protocol summary
@@ -436,16 +445,655 @@ class TestExactLogFetch:
             fake_get_connected_client,
         )
 
-        rows = await traffic_tools._run_log_fetch_all(
+        collected: list[dict[str, str | int]] = []
+        total = await traffic_tools._run_log_fetch_all(
             adom="root",
             device_filter=[{"devid": "All_FortiGate"}],
             time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 01:00:00"},
             filter_str="policyid==42",
             timeout=10,
+            consumer=collected.extend,
         )
 
-        assert len(rows) == 3
+        assert total == 3
+        assert len(collected) == 3
         assert fake_client.fetch_calls == [0, 2]
+
+    async def test_fetch_retry_discards_partial_attempt_rows(self, monkeypatch) -> None:
+        """A failed attempt must not leak partial rows into the successful retry."""
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.start_calls = 0
+
+            async def logsearch_start(self, **kwargs):
+                self.start_calls += 1
+                return {"tid": self.start_calls}
+
+            async def logsearch_fetch(self, adom, tid, limit, offset):
+                if tid == 1:
+                    if offset == 0:
+                        return {
+                            "percentage": 100,
+                            "total-count": 3,
+                            "return-lines": 2,
+                            "data": [
+                                {"proto": "6", "dstport": 443},
+                                {"proto": "17", "dstport": 53},
+                            ],
+                        }
+                    if offset == 2:
+                        raise OSError("temporary fetch failure")
+                if tid == 2:
+                    if offset == 0:
+                        return {
+                            "percentage": 100,
+                            "total-count": 3,
+                            "return-lines": 2,
+                            "data": [
+                                {"proto": "6", "dstport": 443},
+                                {"proto": "17", "dstport": 53},
+                            ],
+                        }
+                    if offset == 2:
+                        return {
+                            "percentage": 100,
+                            "total-count": 3,
+                            "return-lines": 1,
+                            "data": [{"proto": "1", "service": "PING", "dstport": 0}],
+                        }
+                raise AssertionError(f"Unexpected tid/offset: {tid}/{offset}")
+
+            async def logsearch_cancel(self, adom, tid):
+                return {}
+
+        fake_client = FakeClient()
+
+        async def fake_get_connected_client():
+            return fake_client
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_get_connected_client",
+            fake_get_connected_client,
+        )
+
+        collected: list[dict[str, str | int]] = []
+        total = await traffic_tools._run_log_fetch_all(
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 01:00:00"},
+            filter_str="policyid==42",
+            timeout=10,
+            consumer=collected.extend,
+        )
+
+        assert total == 3
+        assert fake_client.start_calls == 2
+        assert len(collected) == 3
+        assert collected == [
+            {"proto": "6", "dstport": 443},
+            {"proto": "17", "dstport": 53},
+            {"proto": "1", "service": "PING", "dstport": 0},
+        ]
+
+    async def test_resilient_fetch_splits_failed_hour_below_one_hour(self, monkeypatch) -> None:
+        """A failed 60-minute slice should recurse to smaller exact ranges."""
+
+        attempted_ranges: list[tuple[str, str]] = []
+
+        async def fake_run_log_fetch_all(**kwargs):
+            time_range = kwargs["time_range"]
+            attempted_ranges.append((time_range["start"], time_range["end"]))
+            if time_range == {
+                "start": "2026-04-20 00:00:00",
+                "end": "2026-04-20 00:59:59",
+            }:
+                raise RuntimeError(
+                    "Exact fetch failed for filter policyid==42: "
+                    "Server error: Invalid tid 123 for fetching result.",
+                )
+            kwargs["consumer"]([{"proto": "6", "dstport": 443}])
+            return 1
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_run_log_fetch_all",
+            fake_run_log_fetch_all,
+        )
+
+        collected: list[dict[str, str | int]] = []
+        total = await traffic_tools._run_log_fetch_resilient(
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+            filter_str="policyid==42",
+            timeout=10,
+            consumer=collected.extend,
+        )
+
+        assert total == 2
+        assert len(collected) == 2
+        assert attempted_ranges == [
+            ("2026-04-20 00:00:00", "2026-04-20 00:59:59"),
+            ("2026-04-20 00:00:00", "2026-04-20 00:29:59"),
+            ("2026-04-20 00:30:00", "2026-04-20 00:59:59"),
+        ]
+
+    async def test_exact_fetch_uses_bounded_slice_concurrency(self, monkeypatch) -> None:
+        """Exact fetch should parallelize top-level slices without exceeding the bound."""
+
+        state = {"current": 0, "max": 0}
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_build_exact_time_slices_minutes",
+            lambda *_args, **_kwargs: [
+                {"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+                {"start": "2026-04-20 01:00:00", "end": "2026-04-20 01:59:59"},
+                {"start": "2026-04-20 02:00:00", "end": "2026-04-20 02:59:59"},
+                {"start": "2026-04-20 03:00:00", "end": "2026-04-20 03:59:59"},
+            ],
+        )
+
+        async def fake_run_log_fetch_resilient(**kwargs):
+            state["current"] += 1
+            state["max"] = max(state["max"], state["current"])
+            await asyncio.sleep(0.01)
+            kwargs["consumer"]([{"proto": "6", "dstport": 443}])
+            state["current"] -= 1
+            return 1
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_run_log_fetch_resilient",
+            fake_run_log_fetch_resilient,
+        )
+
+        collected: list[dict[str, str | int]] = []
+        total = await traffic_tools._run_log_fetch_exact(
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 03:59:59"},
+            filter_str="policyid==42",
+            timeout=10,
+            slice_minutes=60,
+            consumer=collected.extend,
+        )
+
+        assert total == 4
+        assert len(collected) == 4
+        assert state["max"] <= traffic_tools.DEFAULT_PORT_ANALYSIS_SLICE_CONCURRENCY
+        assert state["max"] > 1
+
+
+class TestPortAnalysisCache:
+    """Tests for persisted exact slice caching."""
+
+    async def test_cached_slice_reuse_skips_second_fetch(self, monkeypatch, tmp_path) -> None:
+        """A completed exact slice should load from disk on the next identical request."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+        fetch_calls = {"count": 0}
+
+        async def fake_run_log_fetch_all(**kwargs):
+            fetch_calls["count"] += 1
+            kwargs["consumer"](
+                [
+                    {"proto": "6", "dstport": 443},
+                    {"proto": "1", "service": "PING", "dstport": 0},
+                ]
+            )
+            return 2
+
+        monkeypatch.setattr(traffic_tools, "_run_log_fetch_all", fake_run_log_fetch_all)
+
+        first = await traffic_tools._collect_port_analysis_slice_accumulator(
+            policy_id=42,
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+            action=None,
+            filter_str="policyid==42",
+            timeout=10,
+        )
+        second = await traffic_tools._collect_port_analysis_slice_accumulator(
+            policy_id=42,
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+            action=None,
+            filter_str="policyid==42",
+            timeout=10,
+        )
+
+        assert fetch_calls["count"] == 1
+        assert first.total_hits == 2
+        assert second.total_hits == 2
+        assert second.port_counter == Counter({"6/443": 1})
+
+    async def test_parent_range_is_cached_after_split_merge(self, monkeypatch, tmp_path) -> None:
+        """A split exact run should persist the merged parent result for direct reuse."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+        attempted_ranges: list[tuple[str, str]] = []
+
+        async def fake_run_log_fetch_all(**kwargs):
+            time_range = kwargs["time_range"]
+            attempted_ranges.append((time_range["start"], time_range["end"]))
+            if time_range == {
+                "start": "2026-04-20 00:00:00",
+                "end": "2026-04-20 00:59:59",
+            }:
+                raise RuntimeError(
+                    "Exact fetch failed for filter policyid==42: "
+                    "Server error: Invalid tid 123 for fetching result.",
+                )
+            kwargs["consumer"]([{"proto": "6", "dstport": 443}])
+            return 1
+
+        monkeypatch.setattr(traffic_tools, "_run_log_fetch_all", fake_run_log_fetch_all)
+
+        first = await traffic_tools._run_cached_port_analysis_exact(
+            policy_id=42,
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+            action=None,
+            filter_str="policyid==42",
+            timeout=10,
+            slice_minutes=60,
+        )
+
+        async def fail_if_called(**kwargs):
+            raise AssertionError("merged parent result should come from cache")
+
+        monkeypatch.setattr(traffic_tools, "_run_log_fetch_all", fail_if_called)
+
+        second = await traffic_tools._run_cached_port_analysis_exact(
+            policy_id=42,
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+            action=None,
+            filter_str="policyid==42",
+            timeout=10,
+            slice_minutes=60,
+        )
+
+        assert first.total_hits == 2
+        assert second.total_hits == 2
+        assert attempted_ranges == [
+            ("2026-04-20 00:00:00", "2026-04-20 00:59:59"),
+            ("2026-04-20 00:00:00", "2026-04-20 00:29:59"),
+            ("2026-04-20 00:30:00", "2026-04-20 00:59:59"),
+        ]
+
+    def test_minute_slices_align_to_stable_boundaries(self) -> None:
+        """Interior exact slices should align to stable buckets for cache reuse."""
+        slices = traffic_tools._build_exact_time_slices_minutes(
+            {"start": "2026-04-20 00:15:00", "end": "2026-04-20 03:14:59"},
+            60,
+        )
+
+        assert slices == [
+            {"start": "2026-04-20 00:15:00", "end": "2026-04-20 00:59:59"},
+            {"start": "2026-04-20 01:00:00", "end": "2026-04-20 01:59:59"},
+            {"start": "2026-04-20 02:00:00", "end": "2026-04-20 02:59:59"},
+            {"start": "2026-04-20 03:00:00", "end": "2026-04-20 03:14:59"},
+        ]
+
+    async def test_shifted_relative_windows_reuse_aligned_slice_cache(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Shifted windows should reuse overlapping aligned slices instead of refetching all."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+        fetched_ranges: list[tuple[str, str]] = []
+
+        async def fake_run_log_fetch_all(**kwargs):
+            time_range = kwargs["time_range"]
+            fetched_ranges.append((time_range["start"], time_range["end"]))
+            kwargs["consumer"]([{"proto": "6", "dstport": 443}])
+            return 1
+
+        monkeypatch.setattr(traffic_tools, "_run_log_fetch_all", fake_run_log_fetch_all)
+
+        first = await traffic_tools._run_cached_port_analysis_exact(
+            policy_id=42,
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:15:00", "end": "2026-04-20 03:14:59"},
+            action=None,
+            filter_str="policyid==42",
+            timeout=10,
+            slice_minutes=60,
+        )
+        second = await traffic_tools._run_cached_port_analysis_exact(
+            policy_id=42,
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 01:20:00", "end": "2026-04-20 04:19:59"},
+            action=None,
+            filter_str="policyid==42",
+            timeout=10,
+            slice_minutes=60,
+        )
+
+        assert first.total_hits == 4
+        assert second.total_hits == 4
+        assert fetched_ranges == [
+            ("2026-04-20 00:15:00", "2026-04-20 00:59:59"),
+            ("2026-04-20 01:00:00", "2026-04-20 01:59:59"),
+            ("2026-04-20 02:00:00", "2026-04-20 02:59:59"),
+            ("2026-04-20 03:00:00", "2026-04-20 03:14:59"),
+            ("2026-04-20 01:20:00", "2026-04-20 01:59:59"),
+            ("2026-04-20 03:00:00", "2026-04-20 03:59:59"),
+            ("2026-04-20 04:00:00", "2026-04-20 04:19:59"),
+        ]
+
+    async def test_parent_slice_reuses_cached_descendants_before_refetch(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A rerun should rebuild a missing parent slice from cached children immediately."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+
+        left = traffic_tools.PortAnalysisAccumulator()
+        left.consume_rows([{"proto": "6", "dstport": 443}])
+        right = traffic_tools.PortAnalysisAccumulator()
+        right.consume_rows([{"proto": "17", "dstport": 53}])
+
+        traffic_tools._store_cached_port_analysis_accumulator(
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_id=42,
+            action=None,
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:29:59"},
+            accumulator=left,
+        )
+        traffic_tools._store_cached_port_analysis_accumulator(
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_id=42,
+            action=None,
+            time_range={"start": "2026-04-20 00:30:00", "end": "2026-04-20 00:59:59"},
+            accumulator=right,
+        )
+
+        async def fail_if_called(**kwargs):
+            raise AssertionError("parent slice should be rebuilt from cached descendants")
+
+        monkeypatch.setattr(traffic_tools, "_run_log_fetch_all", fail_if_called)
+
+        rebuilt = await traffic_tools._collect_port_analysis_slice_accumulator(
+            policy_id=42,
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+            action=None,
+            filter_str="policyid==42",
+            timeout=10,
+            min_split_minutes=5,
+        )
+
+        assert rebuilt.total_hits == 2
+        assert rebuilt.port_counter == Counter({"6/443": 1, "17/53": 1})
+        assert traffic_tools._has_cached_port_analysis_accumulator(
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_id=42,
+            action=None,
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+        )
+
+    async def test_wrapped_timeout_runtime_error_still_splits(self, monkeypatch, tmp_path) -> None:
+        """A wrapped timeout message should still trigger recursive exact splitting."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+        attempted_ranges: list[tuple[str, str]] = []
+
+        async def fake_run_log_fetch_all(**kwargs):
+            time_range = kwargs["time_range"]
+            attempted_ranges.append((time_range["start"], time_range["end"]))
+            if time_range == {
+                "start": "2026-04-20 00:00:00",
+                "end": "2026-04-20 00:59:59",
+            }:
+                raise RuntimeError(
+                    "Exact fetch failed for filter policyid==42: "
+                    "Exact fetch paging timed out after 120s for filter policyid==42",
+                )
+            kwargs["consumer"]([{"proto": "6", "dstport": 443}])
+            return 1
+
+        monkeypatch.setattr(traffic_tools, "_run_log_fetch_all", fake_run_log_fetch_all)
+
+        accumulator = await traffic_tools._collect_port_analysis_slice_accumulator(
+            policy_id=42,
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 00:59:59"},
+            action=None,
+            filter_str="policyid==42",
+            timeout=10,
+        )
+
+        assert accumulator.total_hits == 2
+        assert attempted_ranges == [
+            ("2026-04-20 00:00:00", "2026-04-20 00:59:59"),
+            ("2026-04-20 00:00:00", "2026-04-20 00:29:59"),
+            ("2026-04-20 00:30:00", "2026-04-20 00:59:59"),
+        ]
+
+
+class TestPortAnalysisEstimate:
+    """Tests for policy-hit estimates used by the exact guard."""
+
+    async def test_estimate_pages_until_requested_policy_is_found(self, monkeypatch) -> None:
+        """The estimator should page until it finds all requested policies."""
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.offsets: list[int] = []
+                self.current_offset = 0
+
+            async def fortiview_run(self, **kwargs):
+                self.current_offset = int(kwargs["offset"])
+                self.offsets.append(self.current_offset)
+                return {"tid": self.current_offset + 1}
+
+            async def fortiview_fetch(self, **kwargs):
+                if self.current_offset == 0:
+                    return {
+                        "percentage": 100,
+                        "data": [
+                            {"agg_policyid": "42", "policytype": "local-in-policy", "counts": "900"},
+                            *[
+                                {
+                                    "agg_policyid": str(policy_id),
+                                    "policytype": "policy",
+                                    "counts": "5",
+                                }
+                                for policy_id in range(1000, 1099)
+                            ],
+                        ],
+                    }
+                if self.current_offset == 100:
+                    return {
+                        "percentage": 100,
+                        "data": [
+                            {"agg_policyid": "42", "policytype": "policy", "counts": "7"},
+                        ],
+                    }
+                raise AssertionError(f"Unexpected offset: {self.current_offset}")
+
+        fake_client = FakeClient()
+
+        async def fake_get_connected_client():
+            return fake_client
+
+        monkeypatch.setattr(traffic_tools, "_get_connected_client", fake_get_connected_client)
+
+        estimate = await traffic_tools._estimate_port_analysis_hits(
+            adom="root",
+            device_filter=[{"devname": "MTLHQIF001"}],
+            full_time_range={"start": "2026-04-01 00:00:00", "end": "2026-04-08 00:00:00"},
+            policy_ids=[42],
+            action=None,
+        )
+
+        assert estimate.complete is True
+        assert estimate.hits_by_policy == {42: 7}
+        assert fake_client.offsets == [0, 100]
+
+    async def test_estimate_marks_missing_policy_incomplete(self, monkeypatch) -> None:
+        """Missing requested policies should keep the estimate incomplete."""
+
+        class FakeClient:
+            async def fortiview_run(self, **kwargs):
+                return {"tid": 1}
+
+            async def fortiview_fetch(self, **kwargs):
+                return {
+                    "percentage": 100,
+                    "data": [{"agg_policyid": "7", "policytype": "policy", "counts": "5"}],
+                }
+
+        async def fake_get_connected_client():
+            return FakeClient()
+
+        monkeypatch.setattr(traffic_tools, "_get_connected_client", fake_get_connected_client)
+
+        estimate = await traffic_tools._estimate_port_analysis_hits(
+            adom="root",
+            device_filter=[{"devname": "MTLHQIF001"}],
+            full_time_range={"start": "2026-04-01 00:00:00", "end": "2026-04-08 00:00:00"},
+            policy_ids=[42],
+            action=None,
+        )
+
+        assert estimate.complete is False
+        assert estimate.hits_by_policy == {}
+
+
+class TestPortAnalysisPlanning:
+    """Tests for the planned exact-execution model."""
+
+    def test_plan_allows_small_complete_estimate(self) -> None:
+        """Small complete estimates should produce an executable plan."""
+        estimate = traffic_tools.PortAnalysisEstimate(hits_by_policy={42: 1200}, complete=True)
+        plan = traffic_tools._plan_port_analysis_run(
+            policy_ids=[42],
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 12:00:00"},
+            estimate=estimate,
+        )
+        error = traffic_tools._port_analysis_guard_error(
+            policy_ids=[42],
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 12:00:00"},
+            plan=plan,
+        )
+        assert plan.should_execute is True
+        assert plan.policy_slice_minutes[42] >= 60
+        assert error is None
+
+    def test_plan_allows_medium_request_above_old_hit_cutoff(self) -> None:
+        """A medium request should execute when the slice/page plan still fits."""
+        estimate = traffic_tools.PortAnalysisEstimate(hits_by_policy={42: 8000}, complete=True)
+        plan = traffic_tools._plan_port_analysis_run(
+            policy_ids=[42],
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-21 00:00:00"},
+            estimate=estimate,
+        )
+        assert plan.should_execute is True
+        assert plan.policy_slice_minutes[42] == 180
+        assert plan.estimated_total_slices == 9
+        assert plan.estimated_total_pages == 18
+
+    def test_plan_allows_dense_single_policy_day_window(self) -> None:
+        """A dense one-day request for one policy should stay eligible for exact execution."""
+        estimate = traffic_tools.PortAnalysisEstimate(hits_by_policy={2: 43993}, complete=True)
+        plan = traffic_tools._plan_port_analysis_run(
+            policy_ids=[2],
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-21 00:00:00"},
+            estimate=estimate,
+        )
+
+        assert plan.should_execute is True
+        assert plan.policy_slice_minutes[2] == 60
+        assert plan.estimated_total_slices == 25
+        assert plan.estimated_total_pages == 100
+
+    def test_plan_allows_live_sized_single_policy_day_window(self) -> None:
+        """The measured one-day live policy shape should stay within the middle-ground plan."""
+        estimate = traffic_tools.PortAnalysisEstimate(hits_by_policy={2: 53808}, complete=True)
+        plan = traffic_tools._plan_port_analysis_run(
+            policy_ids=[2],
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-21 00:00:00"},
+            estimate=estimate,
+        )
+
+        assert plan.should_execute is True
+        assert plan.policy_slice_minutes[2] == 60
+        assert plan.estimated_total_slices == 25
+        assert plan.estimated_total_pages == 125
+
+    def test_plan_rejects_large_complete_estimate(self) -> None:
+        """Large complete estimates should fail when the planned work is too large."""
+        estimate = traffic_tools.PortAnalysisEstimate(
+            hits_by_policy={2: 120000, 7: 40000},
+            complete=True,
+        )
+        plan = traffic_tools._plan_port_analysis_run(
+            policy_ids=[2, 7],
+            full_time_range={"start": "2026-04-01 00:00:00", "end": "2026-04-30 23:59:59"},
+            estimate=estimate,
+        )
+        error = traffic_tools._port_analysis_guard_error(
+            policy_ids=[2, 7],
+            full_time_range={"start": "2026-04-01 00:00:00", "end": "2026-04-30 23:59:59"},
+            plan=plan,
+        )
+        assert plan.should_execute is False
+        assert error is not None
+        assert "planned" in error
+        assert "Split policies into separate calls" in error
+
+    def test_plan_rejects_incomplete_large_window(self) -> None:
+        """Incomplete estimates should fail closed when the heuristic plan is too large."""
+        estimate = traffic_tools.PortAnalysisEstimate(hits_by_policy={2: 400}, complete=False)
+        plan = traffic_tools._plan_port_analysis_run(
+            policy_ids=[2, 7, 8],
+            full_time_range={"start": "2026-04-01 00:00:00", "end": "2026-04-30 23:59:59"},
+            estimate=estimate,
+        )
+        error = traffic_tools._port_analysis_guard_error(
+            policy_ids=[2, 7, 8],
+            full_time_range={"start": "2026-04-01 00:00:00", "end": "2026-04-30 23:59:59"},
+            plan=plan,
+        )
+        assert plan.should_execute is False
+        assert "missing estimate for policies 7, 8" in error
+        assert "planned" in error
+
+    def test_high_risk_shape_skips_estimate(self) -> None:
+        """Clearly oversized request shapes should skip the FortiView estimator."""
+        assert (
+            traffic_tools._should_skip_port_analysis_estimate(
+                policy_ids=[2, 7, 8],
+                full_time_range={"start": "2026-04-01 00:00:00", "end": "2026-04-30 23:59:59"},
+            )
+            is True
+        )
+        assert (
+            traffic_tools._should_skip_port_analysis_estimate(
+                policy_ids=[2, 7],
+                full_time_range={"start": "2026-04-01 00:00:00", "end": "2026-04-08 00:00:00"},
+            )
+            is False
+        )
+        assert (
+            traffic_tools._should_skip_port_analysis_estimate(
+                policy_ids=[42],
+                full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-20 12:00:00"},
+            )
+            is False
+        )
 
 
 # =============================================================================
@@ -589,8 +1237,13 @@ class TestPolicyTrafficProfileTool:
 class TestPolicyPortAnalysisTool:
     """Tests for exact policy port analysis."""
 
-    async def test_exact_analysis_closes_numeric_port_coverage(self, monkeypatch) -> None:
+    async def test_exact_analysis_closes_numeric_port_coverage(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
         """Exact analysis should mark the result exact after a full log fetch."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
 
         logs = (
             [{"proto": "6", "dstport": 443}] * 6
@@ -599,11 +1252,25 @@ class TestPolicyPortAnalysisTool:
             + [{"proto": "1", "dstport": 0, "service": "icmp/3/3"}]
         )
 
-        async def fake_run_log_fetch_exact(**kwargs):
+        async def fake_run_cached_port_analysis_exact(**kwargs):
             assert kwargs["filter_str"] == "policyid==42"
-            return logs
+            accumulator = traffic_tools.PortAnalysisAccumulator()
+            accumulator.consume_rows(logs)
+            return accumulator
 
-        monkeypatch.setattr(traffic_tools, "_run_log_fetch_exact", fake_run_log_fetch_exact)
+        async def fake_estimate_port_analysis_hits(**kwargs):
+            return traffic_tools.PortAnalysisEstimate(hits_by_policy={42: len(logs)}, complete=True)
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_run_cached_port_analysis_exact",
+            fake_run_cached_port_analysis_exact,
+        )
+        monkeypatch.setattr(
+            traffic_tools,
+            "_estimate_port_analysis_hits",
+            fake_estimate_port_analysis_hits,
+        )
 
         result = await traffic_tools.get_policy_port_analysis(
             policy_ids=[42],
@@ -632,8 +1299,10 @@ class TestPolicyPortAnalysisTool:
     async def test_uncovered_hits_track_numeric_port_gap_not_portless_traffic(
         self,
         monkeypatch,
+        tmp_path,
     ) -> None:
         """Portless traffic should not make a complete exact fetch report a numeric gap."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
 
         logs = (
             [{"proto": "6", "dstport": 443}] * 6
@@ -641,11 +1310,25 @@ class TestPolicyPortAnalysisTool:
             + [{"proto": "1", "dstport": 0, "service": "PING"}]
         )
 
-        async def fake_run_log_fetch_exact(**kwargs):
+        async def fake_run_cached_port_analysis_exact(**kwargs):
             assert kwargs["filter_str"] == "policyid==42"
-            return logs
+            accumulator = traffic_tools.PortAnalysisAccumulator()
+            accumulator.consume_rows(logs)
+            return accumulator
 
-        monkeypatch.setattr(traffic_tools, "_run_log_fetch_exact", fake_run_log_fetch_exact)
+        async def fake_estimate_port_analysis_hits(**kwargs):
+            return traffic_tools.PortAnalysisEstimate(hits_by_policy={42: len(logs)}, complete=True)
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_run_cached_port_analysis_exact",
+            fake_run_cached_port_analysis_exact,
+        )
+        monkeypatch.setattr(
+            traffic_tools,
+            "_estimate_port_analysis_hits",
+            fake_estimate_port_analysis_hits,
+        )
 
         result = await traffic_tools.get_policy_port_analysis(
             policy_ids=[42],
@@ -657,6 +1340,294 @@ class TestPolicyPortAnalysisTool:
         assert policy["is_exact"] is True
         assert policy["uncovered_port_hits"] == 0
         assert policy["icmp"] == [{"type_code": "type=8/code=0", "hits": 1}]
+
+    async def test_tool_fails_closed_before_exact_fetch(self, monkeypatch, tmp_path) -> None:
+        """Oversized requests should return a guard error before exact execution starts."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+
+        async def fake_estimate_port_analysis_hits(**kwargs):
+            return traffic_tools.PortAnalysisEstimate(
+                hits_by_policy={2: 120000, 7: 40000},
+                complete=True,
+            )
+
+        async def fail_if_called(**kwargs):
+            raise AssertionError("exact fetch should not run when the guard fails")
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_estimate_port_analysis_hits",
+            fake_estimate_port_analysis_hits,
+        )
+        monkeypatch.setattr(traffic_tools, "_run_cached_port_analysis_exact", fail_if_called)
+
+        result = await traffic_tools.get_policy_port_analysis(
+            policy_ids=[2, 7],
+            adom="root",
+            time_range="30-day",
+        )
+
+        assert result["status"] == "error"
+        assert "Split policies into separate calls" in result["message"]
+
+    async def test_medium_planned_request_executes_with_auto_slicing(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        """A medium planned request should execute instead of failing on raw hit count."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+
+        expected_slice_minutes = 180
+
+        async def fake_estimate_port_analysis_hits(**kwargs):
+            return traffic_tools.PortAnalysisEstimate(hits_by_policy={42: 8000}, complete=True)
+
+        async def fake_run_cached_port_analysis_exact(**kwargs):
+            assert kwargs["slice_minutes"] == expected_slice_minutes
+            accumulator = traffic_tools.PortAnalysisAccumulator()
+            accumulator.consume_rows([{"proto": "6", "dstport": 443}] * 3)
+            return accumulator
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_estimate_port_analysis_hits",
+            fake_estimate_port_analysis_hits,
+        )
+        monkeypatch.setattr(
+            traffic_tools,
+            "_run_cached_port_analysis_exact",
+            fake_run_cached_port_analysis_exact,
+        )
+
+        result = await traffic_tools.get_policy_port_analysis(
+            policy_ids=[42],
+            adom="root",
+            time_range="1-day",
+        )
+
+        assert result["status"] == "success"
+        policy = result["results"][0]
+        assert policy["total_hits"] == 3
+
+    async def test_high_risk_request_fails_before_estimation(self, monkeypatch, tmp_path) -> None:
+        """Large multi-policy windows should fail before running the estimator."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+
+        async def fail_if_called(**kwargs):
+            raise AssertionError("estimator should be skipped for high-risk request shapes")
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_estimate_port_analysis_hits",
+            fail_if_called,
+        )
+
+        result = await traffic_tools.get_policy_port_analysis(
+            policy_ids=[2, 7, 8],
+            adom="root",
+            time_range="30-day",
+        )
+
+        assert result["status"] == "error"
+        assert "FortiView estimate unavailable" in result["message"]
+
+    async def test_cached_full_window_bypasses_sync_guard(self, monkeypatch, tmp_path) -> None:
+        """A previously cached exact window should stay usable even if the planner would reject it."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+
+        accumulator = traffic_tools.PortAnalysisAccumulator()
+        accumulator.consume_rows([{"proto": "6", "dstport": 443}] * 2)
+        full_time_range = {"start": "2026-04-01 00:00:00", "end": "2026-04-30 23:59:59"}
+        traffic_tools._store_cached_port_analysis_accumulator(
+            adom="root",
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_id=42,
+            action=None,
+            time_range=full_time_range,
+            accumulator=accumulator,
+        )
+
+        async def fail_if_called(**kwargs):
+            raise AssertionError("planner should not estimate or refetch when cache is complete")
+
+        monkeypatch.setattr(traffic_tools, "_estimate_port_analysis_hits", fail_if_called)
+        monkeypatch.setattr(traffic_tools, "_run_log_fetch_all", fail_if_called)
+        monkeypatch.setattr(
+            traffic_tools,
+            "_parse_time_range",
+            lambda _time_range: full_time_range,
+        )
+
+        result = await traffic_tools.get_policy_port_analysis(
+            policy_ids=[42],
+            adom="root",
+            time_range="30-day",
+        )
+
+        assert result["status"] == "success"
+        assert result["results"][0]["total_hits"] == 2
+        assert result["results"][0]["is_exact"] is True
+
+
+class TestPolicyPortAnalysisJobs:
+    """Tests for fork-only background exact-analysis jobs."""
+
+    async def test_background_job_start_and_poll(self, monkeypatch, tmp_path) -> None:
+        """A started background job should persist and expose its completed result."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+
+        async def fake_estimate_port_analysis_hits(**kwargs):
+            policy_id = kwargs["policy_ids"][0]
+            return traffic_tools.PortAnalysisEstimate(hits_by_policy={policy_id: 2}, complete=True)
+
+        async def fake_build_policy_port_analysis_result(**kwargs):
+            return {
+                "policy_id": kwargs["policy_id"],
+                "total_hits": 2,
+                "is_exact": True,
+                "ports": [{"port": "6/443", "hits": 2}],
+                "protocols": [{"protocol": "6", "hits": 2}],
+                "portless_protocols": [],
+                "uncovered_port_hits": 0,
+                "icmp": [],
+            }
+
+        monkeypatch.setattr(
+            traffic_tools,
+            "_estimate_port_analysis_hits",
+            fake_estimate_port_analysis_hits,
+        )
+        monkeypatch.setattr(
+            traffic_tools,
+            "_build_policy_port_analysis_result",
+            fake_build_policy_port_analysis_result,
+        )
+
+        started = await traffic_tools.start_policy_port_analysis_job(
+            policy_ids=[42],
+            adom="root",
+            time_range="1-day",
+        )
+
+        assert started["status"] == "success"
+        job_id = started["job_id"]
+        task = traffic_tools._PORT_ANALYSIS_JOB_TASKS[job_id]
+        await task
+
+        polled = await traffic_tools.get_policy_port_analysis_job(job_id)
+        assert polled["status"] == "success"
+        job = polled["job"]
+        assert job["status"] == "completed"
+        assert job["estimate"] == {"hits_by_policy": {"42": 2}, "complete": True}
+        assert job["result"]["status"] == "success"
+        assert job["result"]["results"][0]["policy_id"] == 42
+
+    async def test_stale_running_job_is_marked_interrupted(self, monkeypatch, tmp_path) -> None:
+        """Polling a persisted running job with no active task should mark it interrupted."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+        job_state = traffic_tools._build_port_analysis_job_state(
+            job_id="job-123",
+            adom="root",
+            device=None,
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_ids=[42],
+            time_range="1-day",
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-21 00:00:00"},
+            action=None,
+            estimate=traffic_tools.PortAnalysisEstimate(),
+        )
+        job_state["status"] = "running"
+        traffic_tools._store_port_analysis_job_state(job_state)
+        traffic_tools._PORT_ANALYSIS_JOB_TASKS.pop("job-123", None)
+
+        result = await traffic_tools.get_policy_port_analysis_job("job-123")
+
+        assert result["status"] == "success"
+        assert result["job"]["status"] == "interrupted"
+        assert "no longer active" in result["job"]["error"].lower()
+
+    def test_mark_stale_jobs_interrupted(self, monkeypatch, tmp_path) -> None:
+        """Persisted queued/running jobs should be marked interrupted on restart."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+        queued = traffic_tools._build_port_analysis_job_state(
+            job_id="queued-job",
+            adom="root",
+            device=None,
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_ids=[42],
+            time_range="1-day",
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-21 00:00:00"},
+            action=None,
+            estimate=traffic_tools.PortAnalysisEstimate(),
+        )
+        running = traffic_tools._build_port_analysis_job_state(
+            job_id="running-job",
+            adom="root",
+            device=None,
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_ids=[43],
+            time_range="1-day",
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-21 00:00:00"},
+            action=None,
+            estimate=traffic_tools.PortAnalysisEstimate(),
+        )
+        running["status"] = "running"
+        completed = traffic_tools._build_port_analysis_job_state(
+            job_id="completed-job",
+            adom="root",
+            device=None,
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_ids=[44],
+            time_range="1-day",
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-21 00:00:00"},
+            action=None,
+            estimate=traffic_tools.PortAnalysisEstimate(),
+        )
+        completed["status"] = "completed"
+
+        traffic_tools._store_port_analysis_job_state(queued)
+        traffic_tools._store_port_analysis_job_state(running)
+        traffic_tools._store_port_analysis_job_state(completed)
+
+        interrupted = traffic_tools.mark_stale_port_analysis_jobs_interrupted("server restarted")
+
+        assert interrupted == 2
+        assert traffic_tools._load_port_analysis_job_state("queued-job")["status"] == "interrupted"
+        assert traffic_tools._load_port_analysis_job_state("running-job")["status"] == "interrupted"
+        assert traffic_tools._load_port_analysis_job_state("completed-job")["status"] == "completed"
+
+    async def test_shutdown_jobs_cancels_tasks(self, monkeypatch, tmp_path) -> None:
+        """In-process background jobs should be cancelled and persisted as interrupted."""
+        monkeypatch.setenv("FAZ_TRAFFIC_CACHE_DIR", str(tmp_path))
+        job_state = traffic_tools._build_port_analysis_job_state(
+            job_id="live-job",
+            adom="root",
+            device=None,
+            device_filter=[{"devid": "All_FortiGate"}],
+            policy_ids=[42],
+            time_range="1-day",
+            full_time_range={"start": "2026-04-20 00:00:00", "end": "2026-04-21 00:00:00"},
+            action=None,
+            estimate=traffic_tools.PortAnalysisEstimate(),
+        )
+        job_state["status"] = "running"
+        traffic_tools._store_port_analysis_job_state(job_state)
+
+        async def sleeper() -> None:
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(sleeper())
+        traffic_tools._PORT_ANALYSIS_JOB_TASKS["live-job"] = task
+
+        interrupted = await traffic_tools.shutdown_port_analysis_jobs("server stopped")
+
+        assert interrupted == 1
+        assert traffic_tools._PORT_ANALYSIS_JOB_TASKS == {}
+        assert task.cancelled() or task.done()
+        persisted = traffic_tools._load_port_analysis_job_state("live-job")
+        assert persisted["status"] == "interrupted"
+        assert persisted["error"] == "server stopped"
 
 
 class TestPolicyProtocolSummaryTool:

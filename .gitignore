@@ -76,6 +76,7 @@ dmypy.json
 # Package Managers
 # =============================================================================
 .uv/
+.cache/traffic_tools/
 uv.lock
 pip-log.txt
 pip-delete-this-directory.txt

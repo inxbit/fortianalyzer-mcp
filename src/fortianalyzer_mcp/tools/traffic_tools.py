@@ -9,12 +9,18 @@ These tools support policy-review and policy-tightening preparation workflows.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import math
+import os
 import time
+import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, TypedDict, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
@@ -39,6 +45,8 @@ from fortianalyzer_mcp.utils.validation import (
 
 logger = logging.getLogger(__name__)
 
+_SLICE_ALIGNMENT_EPOCH = datetime(1970, 1, 1)
+
 # Concurrency limit for per-policy work.
 _POLICY_QUERY_SEMAPHORE = asyncio.Semaphore(5)
 
@@ -48,8 +56,24 @@ POLL_INTERVAL = 0.25
 MAX_POLICY_IDS = 25
 DEFAULT_TOP_N = 10
 DEFAULT_POLICY_PROFILE_TIMEOUT = 20
-DEFAULT_PORT_ANALYSIS_FETCH_TIMEOUT = 120
+DEFAULT_PORT_ANALYSIS_FETCH_TIMEOUT = 30
+DEFAULT_PORT_ANALYSIS_BACKGROUND_FETCH_TIMEOUT = 120
+DEFAULT_PORT_ANALYSIS_BACKGROUND_MIN_SPLIT_MINUTES = 1
+DEFAULT_PORT_ANALYSIS_SYNC_BUDGET_SECONDS = 90
+DEFAULT_PORT_ANALYSIS_TARGET_HITS_PER_SLICE = 1000
+DEFAULT_PORT_ANALYSIS_MIN_SLICE_MINUTES = 60
+DEFAULT_PORT_ANALYSIS_MIN_RETRY_SPLIT_MINUTES = 5
+DEFAULT_PORT_ANALYSIS_MAX_FORTIVIEW_ROWS = 1000
+DEFAULT_PORT_ANALYSIS_MAX_PLAN_SLICES = 48
+DEFAULT_PORT_ANALYSIS_MAX_PLAN_TOTAL_PAGES = 150
+DEFAULT_PORT_ANALYSIS_MAX_PAGES_PER_SLICE = 10
+DEFAULT_PORT_ANALYSIS_SLICE_CONCURRENCY = 3
+DEFAULT_PORT_ANALYSIS_BACKGROUND_JOB_CONCURRENCY = 1
+DEFAULT_PORT_ANALYSIS_ESTIMATED_SECONDS_PER_SLICE = 1.0
+DEFAULT_PORT_ANALYSIS_ESTIMATED_SECONDS_PER_PAGE = 0.5
 DEFAULT_EXACT_FETCH_PAGE_SIZE = 500
+PORT_ANALYSIS_CACHE_VERSION = 1
+PORT_ANALYSIS_JOB_SCHEMA_VERSION = 1
 DEFAULT_POLICY_SAMPLE_LIMIT = 25
 DEFAULT_POLICY_CANDIDATE_LIMIT = 12
 DEFAULT_PORT_ANALYSIS_CANDIDATE_LIMIT = 4
@@ -91,6 +115,136 @@ RETRYABLE_QUERY_EXCEPTIONS = (
     APIError,
 )
 
+_PORT_ANALYSIS_JOB_TASKS: dict[str, asyncio.Task[None]] = {}
+_PORT_ANALYSIS_JOB_SEMAPHORE = asyncio.Semaphore(
+    DEFAULT_PORT_ANALYSIS_BACKGROUND_JOB_CONCURRENCY
+)
+PortAnalysisProgressCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
+
+
+def _get_repo_root() -> Path:
+    """Return the repository root for local cache storage."""
+    return Path(__file__).resolve().parents[3]
+
+
+def _get_port_analysis_cache_root() -> Path:
+    """Return the root directory for cached exact-analysis state."""
+    override = os.getenv("FAZ_TRAFFIC_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
+    return _get_repo_root() / ".cache" / "traffic_tools"
+
+
+def _get_port_analysis_slice_cache_dir() -> Path:
+    """Return the directory for persisted exact slice accumulators."""
+    return _get_port_analysis_cache_root() / "slices"
+
+
+def _get_port_analysis_jobs_dir() -> Path:
+    """Return the directory for persisted background-job state."""
+    return _get_port_analysis_cache_root() / "jobs"
+
+
+def _utc_timestamp() -> str:
+    """Render a stable local timestamp for cache/job metadata."""
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _ensure_parent_dir(path: Path) -> None:
+    """Create parent directories for a cache/job file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON atomically so cache/job files are never partially replaced."""
+    _ensure_parent_dir(path)
+    temp_path = path.with_suffix(f"{path.suffix}.tmp-{uuid.uuid4().hex}")
+    temp_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    """Read one JSON cache/job file if it exists and parses cleanly."""
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to read cached traffic-analysis file %s: %s", path, exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _normalize_device_filter_for_cache(
+    device_filter: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Normalize device filters into a stable cache-key representation."""
+    normalized = [dict(sorted(item.items())) for item in device_filter]
+    normalized.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    return normalized
+
+
+def _build_port_analysis_cache_key_payload(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_id: int,
+    action: str | None,
+    time_range: dict[str, str],
+) -> dict[str, Any]:
+    """Build the canonical cache-key payload for one exact policy/time slice."""
+    return {
+        "version": PORT_ANALYSIS_CACHE_VERSION,
+        "adom": adom,
+        "device_filter": _normalize_device_filter_for_cache(device_filter),
+        "policy_id": policy_id,
+        "action": action,
+        "time_range": time_range,
+    }
+
+
+def _build_port_analysis_cache_path(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_id: int,
+    action: str | None,
+    time_range: dict[str, str],
+) -> Path:
+    """Return the on-disk cache path for one exact policy/time slice."""
+    payload = _build_port_analysis_cache_key_payload(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=time_range,
+    )
+    cache_key = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return _get_port_analysis_slice_cache_dir() / f"{cache_key}.json"
+
+
+def _build_port_analysis_job_path(job_id: str) -> Path:
+    """Return the on-disk path for one background job state file."""
+    return _get_port_analysis_jobs_dir() / f"{job_id}.json"
+
+
+async def _emit_port_analysis_progress(
+    callback: PortAnalysisProgressCallback | None,
+    event: str,
+    payload: dict[str, Any],
+) -> None:
+    """Deliver one optional progress event to a caller."""
+    if callback is None:
+        return
+    maybe_result = callback(event, payload)
+    if asyncio.iscoroutine(maybe_result):
+        await maybe_result
+
 
 class DiscoveryQueryShape(TypedDict):
     """Configuration for one discovery-sampling query shape."""
@@ -127,6 +281,326 @@ class ICMPTypeHit(TypedDict):
 
     type_code: str
     hits: int
+
+
+@dataclass(slots=True)
+class PortAnalysisEstimate:
+    """Cost estimate metadata for one exact port-analysis request."""
+
+    hits_by_policy: dict[int, int] = field(default_factory=dict)
+    complete: bool = False
+
+    @property
+    def total_hits(self) -> int:
+        """Total estimated hits across all discovered policies."""
+        return sum(self.hits_by_policy.values())
+
+
+@dataclass(slots=True)
+class PortAnalysisRunPlan:
+    """Execution plan for one synchronous exact port-analysis request."""
+
+    estimate: PortAnalysisEstimate
+    policy_slice_minutes: dict[int, int] = field(default_factory=dict)
+    policy_estimated_slices: dict[int, int] = field(default_factory=dict)
+    policy_estimated_pages: dict[int, int] = field(default_factory=dict)
+    max_pages_per_slice: int = 0
+    estimated_total_slices: int = 0
+    estimated_total_pages: int = 0
+    estimated_wall_seconds: float = 0.0
+    should_execute: bool = True
+    reason: str | None = None
+
+
+@dataclass(slots=True)
+class PortAnalysisAccumulator:
+    """Incrementally aggregate exact port-analysis results."""
+
+    total_hits: int = 0
+    port_counter: Counter[str] = field(default_factory=Counter)
+    protocol_counter: Counter[str] = field(default_factory=Counter)
+    portless_protocols: set[str] = field(default_factory=set)
+    icmp_types: Counter[str] = field(default_factory=Counter)
+
+    def consume_rows(self, rows: list[dict[str, Any]]) -> None:
+        """Consume one fetched log page."""
+        for log in rows:
+            proto_str = str(log.get("proto", "unknown")).strip() or "unknown"
+            self.protocol_counter[proto_str] += 1
+            self.total_hits += 1
+
+            dstport = log.get("dstport")
+            if dstport is not None and str(dstport).isdigit() and str(dstport) != "0":
+                self.port_counter[f"{proto_str}/{dstport}"] += 1
+            else:
+                self.portless_protocols.add(proto_str)
+
+            if proto_str == "1":
+                service = str(log.get("service", ""))
+                if service:
+                    self.icmp_types[_format_icmp_type_code(service)] += 1
+
+    def merge(self, other: "PortAnalysisAccumulator") -> None:
+        """Merge another exact-analysis accumulator into this one."""
+        self.total_hits += other.total_hits
+        self.port_counter.update(other.port_counter)
+        self.protocol_counter.update(other.protocol_counter)
+        self.portless_protocols.update(other.portless_protocols)
+        self.icmp_types.update(other.icmp_types)
+
+    def to_cache_dict(self) -> dict[str, Any]:
+        """Serialize this accumulator to a cache-friendly JSON structure."""
+        return {
+            "total_hits": self.total_hits,
+            "port_counter": dict(self.port_counter),
+            "protocol_counter": dict(self.protocol_counter),
+            "portless_protocols": sorted(self.portless_protocols, key=_protocol_sort_key),
+            "icmp_types": dict(self.icmp_types),
+        }
+
+    @classmethod
+    def from_cache_dict(cls, payload: dict[str, Any]) -> "PortAnalysisAccumulator":
+        """Rebuild an accumulator from cached JSON data."""
+        accumulator = cls()
+        accumulator.total_hits = int(payload.get("total_hits", 0) or 0)
+        accumulator.port_counter = Counter(
+            {
+                str(port): int(hits)
+                for port, hits in dict(payload.get("port_counter", {})).items()
+            }
+        )
+        accumulator.protocol_counter = Counter(
+            {
+                str(protocol): int(hits)
+                for protocol, hits in dict(payload.get("protocol_counter", {})).items()
+            }
+        )
+        accumulator.portless_protocols = {
+            str(protocol)
+            for protocol in list(payload.get("portless_protocols", []))
+            if str(protocol)
+        }
+        accumulator.icmp_types = Counter(
+            {
+                str(type_code): int(hits)
+                for type_code, hits in dict(payload.get("icmp_types", {})).items()
+            }
+        )
+        return accumulator
+
+    def build_result(self, *, is_exact: bool = True) -> dict[str, Any]:
+        """Render the final exact-analysis structure."""
+        return {
+            "total_hits": self.total_hits,
+            "is_exact": is_exact,
+            "ports": sorted(
+                [{"port": port, "hits": hits} for port, hits in self.port_counter.items()],
+                key=lambda item: (
+                    -int(item["hits"]),
+                    _port_pair_sort_key(str(item["port"])),
+                ),
+            ),
+            "protocols": sorted(
+                [
+                    {"protocol": protocol, "hits": hits}
+                    for protocol, hits in self.protocol_counter.items()
+                ],
+                key=lambda item: (
+                    -int(item["hits"]),
+                    _protocol_sort_key(str(item["protocol"])),
+                ),
+            ),
+            "portless_protocols": sorted(self.portless_protocols, key=_protocol_sort_key),
+            "uncovered_port_hits": 0 if is_exact else self.total_hits,
+            "icmp": sorted(
+                [
+                    {"type_code": type_code, "hits": hits}
+                    for type_code, hits in self.icmp_types.items()
+                ],
+                key=lambda item: (-int(item["hits"]), str(item["type_code"])),
+            ),
+        }
+
+
+def _load_cached_port_analysis_accumulator(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_id: int,
+    action: str | None,
+    time_range: dict[str, str],
+) -> PortAnalysisAccumulator | None:
+    """Load a cached exact-analysis accumulator for one policy/time slice."""
+    cache_path = _build_port_analysis_cache_path(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=time_range,
+    )
+    payload = _read_json_file(cache_path)
+    if not payload or payload.get("version") != PORT_ANALYSIS_CACHE_VERSION:
+        return None
+    accumulator_payload = payload.get("accumulator")
+    if not isinstance(accumulator_payload, dict):
+        return None
+    return PortAnalysisAccumulator.from_cache_dict(accumulator_payload)
+
+
+def _store_cached_port_analysis_accumulator(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_id: int,
+    action: str | None,
+    time_range: dict[str, str],
+    accumulator: PortAnalysisAccumulator,
+) -> None:
+    """Persist an exact-analysis accumulator for one policy/time slice."""
+    cache_path = _build_port_analysis_cache_path(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=time_range,
+    )
+    payload = {
+        "version": PORT_ANALYSIS_CACHE_VERSION,
+        "cached_at": _utc_timestamp(),
+        "request": _build_port_analysis_cache_key_payload(
+            adom=adom,
+            device_filter=device_filter,
+            policy_id=policy_id,
+            action=action,
+            time_range=time_range,
+        ),
+        "accumulator": accumulator.to_cache_dict(),
+    }
+    _write_json_atomic(cache_path, payload)
+
+
+def _has_cached_port_analysis_accumulator(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_id: int,
+    action: str | None,
+    time_range: dict[str, str],
+) -> bool:
+    """Return True when a full exact accumulator is already cached."""
+    return (
+        _load_cached_port_analysis_accumulator(
+            adom=adom,
+            device_filter=device_filter,
+            policy_id=policy_id,
+            action=action,
+            time_range=time_range,
+        )
+        is not None
+    )
+
+
+def _load_cached_port_analysis_accumulator_recursive(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_id: int,
+    action: str | None,
+    time_range: dict[str, str],
+    min_split_minutes: int,
+) -> PortAnalysisAccumulator | None:
+    """Load one cached slice or reconstruct it from cached descendants."""
+    cached = _load_cached_port_analysis_accumulator(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=time_range,
+    )
+    if cached is not None:
+        return cached
+
+    start, end = _parse_time_range_dict(time_range)
+    if end - start <= timedelta(minutes=max(min_split_minutes, 1)):
+        return None
+
+    split_ranges = _split_time_range_non_overlapping(time_range)
+    if not split_ranges:
+        return None
+
+    left_range, right_range = split_ranges
+    left_cached = _load_cached_port_analysis_accumulator_recursive(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=left_range,
+        min_split_minutes=min_split_minutes,
+    )
+    if left_cached is None:
+        return None
+
+    right_cached = _load_cached_port_analysis_accumulator_recursive(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=right_range,
+        min_split_minutes=min_split_minutes,
+    )
+    if right_cached is None:
+        return None
+
+    merged = PortAnalysisAccumulator()
+    merged.merge(left_cached)
+    merged.merge(right_cached)
+    _store_cached_port_analysis_accumulator(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=time_range,
+        accumulator=merged,
+    )
+    return merged
+
+
+def _load_port_analysis_job_state(job_id: str) -> dict[str, Any] | None:
+    """Load one persisted background exact-analysis job state."""
+    job_path = _build_port_analysis_job_path(job_id)
+    payload = _read_json_file(job_path)
+    if not payload or payload.get("version") != PORT_ANALYSIS_JOB_SCHEMA_VERSION:
+        return None
+    return payload
+
+
+def _store_port_analysis_job_state(job_state: dict[str, Any]) -> None:
+    """Persist one background exact-analysis job state."""
+    job_path = _build_port_analysis_job_path(str(job_state["job_id"]))
+    _write_json_atomic(job_path, job_state)
+
+
+def _serialize_port_analysis_estimate(estimate: "PortAnalysisEstimate") -> dict[str, Any]:
+    """Serialize one policy-hit estimate into persisted job state."""
+    return {
+        "hits_by_policy": estimate.hits_by_policy,
+        "complete": estimate.complete,
+    }
+
+
+def _deserialize_port_analysis_estimate(payload: dict[str, Any] | None) -> "PortAnalysisEstimate":
+    """Rebuild one policy-hit estimate from persisted job state."""
+    if not isinstance(payload, dict):
+        return PortAnalysisEstimate()
+    raw_hits = payload.get("hits_by_policy", {})
+    hits_by_policy = {
+        int(policy_id): int(hits)
+        for policy_id, hits in dict(raw_hits).items()
+    }
+    return PortAnalysisEstimate(
+        hits_by_policy=hits_by_policy,
+        complete=bool(payload.get("complete", False)),
+    )
 
 
 def validate_action(action: str | None) -> str | None:
@@ -286,6 +760,38 @@ def _build_exact_slice_day_candidates(preferred_slice_days: int) -> list[int]:
     return list(dict.fromkeys(candidates))
 
 
+def _build_exact_time_slices_minutes(
+    time_range: dict[str, str],
+    slice_minutes: int,
+) -> list[dict[str, str]]:
+    """Build non-overlapping exact slices using stable minute-level boundaries.
+
+    The first and last slices may be partial, but interior slices align to a
+    deterministic wall-clock grid so overlapping reruns can reuse cached exact
+    slice results instead of starting from a shifted relative-window origin.
+    """
+    step_minutes = max(slice_minutes, DEFAULT_PORT_ANALYSIS_MIN_SLICE_MINUTES)
+    start, end = _parse_time_range_dict(time_range)
+    if end <= start:
+        return [time_range]
+
+    step_seconds = max(int(timedelta(minutes=step_minutes).total_seconds()), 1)
+    slices = []
+    cursor = start
+    start_offset = int((start - _SLICE_ALIGNMENT_EPOCH).total_seconds()) % step_seconds
+
+    if start_offset:
+        first_end = min(end, start + timedelta(seconds=step_seconds - start_offset - 1))
+        slices.append(_format_time_range(start, first_end))
+        cursor = first_end + timedelta(seconds=1)
+
+    while cursor <= end:
+        slice_end = min(cursor + timedelta(seconds=step_seconds - 1), end)
+        slices.append(_format_time_range(cursor, slice_end))
+        cursor = slice_end + timedelta(seconds=1)
+    return slices
+
+
 def _estimate_slice_count(start: datetime, end: datetime, slice_days: int) -> int:
     """Estimate how many slices a time range would produce."""
     if end <= start:
@@ -354,6 +860,320 @@ def _plan_batch_slice_days(
 
     span_days = max((end - start).total_seconds() / 86400, 0)
     return max(requested_slice_days, math.ceil(span_days / max_slices_per_policy))
+
+
+def _format_span_label(span: timedelta) -> str:
+    """Render a compact span label for error messages."""
+    total_seconds = max(int(span.total_seconds()), 0)
+    if total_seconds % 86400 == 0 and total_seconds >= 86400:
+        return f"{total_seconds // 86400}-day"
+    if total_seconds % 3600 == 0 and total_seconds >= 3600:
+        return f"{total_seconds // 3600}-hour"
+    return f"{total_seconds}s"
+
+
+def _normalize_fortiview_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize one FortiView fetch payload into a list of row dicts."""
+    rows = result.get("data", [])
+    if not isinstance(rows, list):
+        rows = [rows] if rows else []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _parse_fortiview_hit_count(row: dict[str, Any], action: str | None) -> int | None:
+    """Extract a conservative per-policy hit estimate from one FortiView row."""
+    key = "counts"
+    if action == "accept":
+        key = "count_pass"
+    elif action == "deny":
+        key = "count_block"
+
+    raw = row.get(key)
+    if raw is None and key != "counts":
+        raw = row.get("counts")
+    if raw is None:
+        return None
+
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _run_fortiview_page(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    offset: int,
+    limit: int,
+    timeout: int,
+) -> list[dict[str, Any]]:
+    """Fetch one page of FortiView policy-hit rows."""
+    client = await _get_connected_client()
+    run_result = await client.fortiview_run(
+        adom=adom,
+        view_name="policy-hits",
+        device=device_filter,
+        time_range=time_range,
+        limit=limit,
+        offset=offset,
+        sort_by=[{"field": "counts", "order": "desc"}],
+    )
+    tid = run_result.get("tid")
+    if not tid:
+        raise RuntimeError(f"No TID returned for FortiView policy-hits query: {run_result}")
+
+    started = time.monotonic()
+    while True:
+        if time.monotonic() - started > timeout:
+            raise TimeoutError(
+                f"FortiView policy-hits query timed out after {timeout}s at offset {offset}"
+            )
+
+        result = await client.fortiview_fetch(
+            adom=adom,
+            view_name="policy-hits",
+            tid=tid,
+        )
+        if result.get("percentage", 100) >= 100:
+            return _normalize_fortiview_rows(result)
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+async def _estimate_port_analysis_hits(
+    *,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    full_time_range: dict[str, str],
+    policy_ids: list[int],
+    action: str | None,
+) -> PortAnalysisEstimate:
+    """Estimate exact port-analysis cost from FortiView policy hits."""
+    page_size = min(100, DEFAULT_PORT_ANALYSIS_MAX_FORTIVIEW_ROWS)
+    max_rows = max(page_size, DEFAULT_PORT_ANALYSIS_MAX_FORTIVIEW_ROWS)
+    remaining = set(policy_ids)
+    hits_by_policy: dict[int, int] = {}
+
+    try:
+        for offset in range(0, max_rows, page_size):
+            rows = await _run_fortiview_page(
+                adom=adom,
+                device_filter=device_filter,
+                time_range=full_time_range,
+                offset=offset,
+                limit=min(page_size, max_rows - offset),
+                timeout=DEFAULT_PORT_ANALYSIS_SYNC_BUDGET_SECONDS,
+            )
+
+            for row in rows:
+                if row.get("policytype") != "policy":
+                    continue
+
+                policy_id_raw = row.get("agg_policyid")
+                if policy_id_raw is None or not str(policy_id_raw).isdigit():
+                    continue
+
+                policy_id = int(policy_id_raw)
+                if policy_id not in remaining:
+                    continue
+
+                hits = _parse_fortiview_hit_count(row, action)
+                if hits is None:
+                    continue
+
+                hits_by_policy[policy_id] = hits
+                remaining.discard(policy_id)
+
+            if not rows or len(rows) < page_size or not remaining:
+                break
+    except RETRYABLE_QUERY_EXCEPTIONS as exc:
+        logger.warning(f"Policy-hits estimate failed, falling back to heuristics: {exc}")
+        return PortAnalysisEstimate(hits_by_policy=hits_by_policy, complete=False)
+
+    return PortAnalysisEstimate(
+        hits_by_policy=hits_by_policy,
+        complete=not remaining and len(hits_by_policy) == len(policy_ids),
+    )
+
+
+def _plan_port_analysis_slice_minutes(
+    *,
+    full_time_range: dict[str, str],
+    estimated_hits: int | None,
+) -> int:
+    """Plan initial exact-fetch slice size for one policy."""
+    start, end = _parse_time_range_dict(full_time_range)
+    span = max(end - start, timedelta(seconds=1))
+
+    if estimated_hits is not None and estimated_hits > 0:
+        slice_count = max(
+            1,
+            math.ceil(estimated_hits / DEFAULT_PORT_ANALYSIS_TARGET_HITS_PER_SLICE),
+        )
+        raw_minutes = math.ceil(span.total_seconds() / 60 / slice_count)
+        return max(DEFAULT_PORT_ANALYSIS_MIN_SLICE_MINUTES, min(raw_minutes, 24 * 60))
+
+    if span <= timedelta(days=1):
+        return 60
+    if span <= timedelta(days=7):
+        return 6 * 60
+    if span <= timedelta(days=30):
+        return 12 * 60
+    return 24 * 60
+
+
+def _estimate_port_analysis_pages(
+    *,
+    estimated_hits: int | None,
+    estimated_slices: int,
+) -> tuple[int, int]:
+    """Estimate per-slice and total page fan-out for exact fetch planning."""
+    if estimated_hits is None or estimated_hits <= 0:
+        return 1, max(estimated_slices, 1)
+
+    slices = max(estimated_slices, 1)
+    hits_per_slice = max(1, math.ceil(estimated_hits / slices))
+    pages_per_slice = max(1, math.ceil(hits_per_slice / DEFAULT_EXACT_FETCH_PAGE_SIZE))
+    return pages_per_slice, slices * pages_per_slice
+
+
+def _plan_port_analysis_run(
+    *,
+    policy_ids: list[int],
+    full_time_range: dict[str, str],
+    estimate: PortAnalysisEstimate,
+) -> PortAnalysisRunPlan:
+    """Plan whether a synchronous exact port-analysis request is feasible."""
+    start, end = _parse_time_range_dict(full_time_range)
+    span = max(end - start, timedelta(seconds=1))
+    plan = PortAnalysisRunPlan(estimate=estimate)
+
+    for policy_id in policy_ids:
+        estimated_hits = estimate.hits_by_policy.get(policy_id)
+        slice_minutes = _plan_port_analysis_slice_minutes(
+            full_time_range=full_time_range,
+            estimated_hits=estimated_hits,
+        )
+        estimated_slices = max(
+            1,
+            len(_build_exact_time_slices_minutes(full_time_range, slice_minutes)),
+        )
+        pages_per_slice, estimated_pages = _estimate_port_analysis_pages(
+            estimated_hits=estimated_hits,
+            estimated_slices=estimated_slices,
+        )
+
+        plan.policy_slice_minutes[policy_id] = slice_minutes
+        plan.policy_estimated_slices[policy_id] = estimated_slices
+        plan.policy_estimated_pages[policy_id] = estimated_pages
+        plan.max_pages_per_slice = max(plan.max_pages_per_slice, pages_per_slice)
+        plan.estimated_total_slices += estimated_slices
+        plan.estimated_total_pages += estimated_pages
+
+    plan.estimated_wall_seconds = round(
+        plan.estimated_total_slices * DEFAULT_PORT_ANALYSIS_ESTIMATED_SECONDS_PER_SLICE
+        + plan.estimated_total_pages * DEFAULT_PORT_ANALYSIS_ESTIMATED_SECONDS_PER_PAGE,
+        2,
+    )
+
+    if span > timedelta(days=30):
+        plan.should_execute = False
+        plan.reason = "requested window exceeds 30 days"
+        return plan
+
+    if not estimate.complete and len(policy_ids) > 2 and span > timedelta(days=7):
+        plan.should_execute = False
+        plan.reason = "estimate unavailable for a high-fanout multi-policy window"
+        return plan
+
+    if plan.estimated_total_slices > DEFAULT_PORT_ANALYSIS_MAX_PLAN_SLICES:
+        plan.should_execute = False
+        plan.reason = "planned slice count exceeds synchronous budget"
+        return plan
+
+    if plan.estimated_total_pages > DEFAULT_PORT_ANALYSIS_MAX_PLAN_TOTAL_PAGES:
+        plan.should_execute = False
+        plan.reason = "planned page count exceeds synchronous budget"
+        return plan
+
+    if plan.max_pages_per_slice > DEFAULT_PORT_ANALYSIS_MAX_PAGES_PER_SLICE:
+        plan.should_execute = False
+        plan.reason = "one or more planned slices are too dense for synchronous execution"
+        return plan
+
+    if plan.estimated_wall_seconds > DEFAULT_PORT_ANALYSIS_SYNC_BUDGET_SECONDS:
+        plan.should_execute = False
+        plan.reason = "planned exact run exceeds the synchronous runtime budget"
+        return plan
+
+    return plan
+
+
+def _build_port_analysis_guard_message(
+    *,
+    policy_ids: list[int],
+    full_time_range: dict[str, str],
+    plan: PortAnalysisRunPlan,
+) -> str:
+    """Build a fail-closed message for oversized exact port-analysis requests."""
+    start, end = _parse_time_range_dict(full_time_range)
+    span = end - start
+    span_label = _format_span_label(span)
+    missing = [
+        str(policy_id)
+        for policy_id in policy_ids
+        if policy_id not in plan.estimate.hits_by_policy
+    ]
+    estimate_text = (
+        f"estimated {plan.estimate.total_hits} hits"
+        if plan.estimate.hits_by_policy
+        else "FortiView estimate unavailable"
+    )
+    missing_text = (
+        f"; missing estimate for policies {', '.join(missing)}"
+        if missing
+        else ""
+    )
+    return (
+        "Exact policy port analysis plan exceeds the synchronous execution budget "
+        f"({estimate_text} over {span_label}/{len(policy_ids)} policy request{missing_text}; "
+        f"planned {plan.estimated_total_slices} slices / {plan.estimated_total_pages} pages; "
+        f"estimated ~{plan.estimated_wall_seconds}s vs budget ~{DEFAULT_PORT_ANALYSIS_SYNC_BUDGET_SECONDS}s; "
+        f"reason: {plan.reason or 'planned work too large'}). "
+        "Split policies into separate calls, narrow the time_range, or add "
+        "action='accept' or action='deny'."
+    )
+
+
+def _should_skip_port_analysis_estimate(
+    *,
+    policy_ids: list[int],
+    full_time_range: dict[str, str],
+) -> bool:
+    """Skip FortiView estimation for request shapes already known to exceed budget."""
+    start, end = _parse_time_range_dict(full_time_range)
+    span = end - start
+    if span > timedelta(days=30):
+        return True
+    return len(policy_ids) > 2 and span > timedelta(days=7)
+
+
+def _port_analysis_guard_error(
+    *,
+    policy_ids: list[int],
+    full_time_range: dict[str, str],
+    plan: PortAnalysisRunPlan,
+) -> str | None:
+    """Return a fail-closed message when an exact request exceeds the sync budget."""
+    if plan.should_execute:
+        return None
+    return _build_port_analysis_guard_message(
+        policy_ids=policy_ids,
+        full_time_range=full_time_range,
+        plan=plan,
+    )
 
 
 def _normalize_sample_value(field: str, value: Any, row: dict[str, Any] | None = None) -> str | None:
@@ -683,6 +1503,22 @@ def _normalize_logsearch_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)]
 
 
+def _is_invalid_tid_error(exc: Exception) -> bool:
+    """Return True when a logsearch failure indicates the server discarded the task."""
+    return "invalid tid" in str(exc).lower()
+
+
+def _should_split_exact_fetch_error(exc: Exception) -> bool:
+    """Return True when an exact-fetch failure should move to a smaller time slice."""
+    message = str(exc).lower()
+    return (
+        _is_invalid_tid_error(exc)
+        or isinstance(exc, (TimeoutError, FazTimeoutError))
+        or "timed out" in message
+        or "timeout" in message
+    )
+
+
 async def _run_log_fetch_all(
     *,
     adom: str,
@@ -690,10 +1526,11 @@ async def _run_log_fetch_all(
     time_range: dict[str, str],
     filter_str: str | None,
     timeout: int,
+    consumer: Callable[[list[dict[str, Any]]], None],
     page_size: int = DEFAULT_EXACT_FETCH_PAGE_SIZE,
     retries: int = 2,
-) -> list[dict[str, Any]]:
-    """Run one full log search and fetch every matching row exactly."""
+) -> int:
+    """Run one full log search and stream every matching row exactly."""
     last_error: Exception | None = None
     page_size = max(1, min(page_size, DEFAULT_EXACT_FETCH_PAGE_SIZE))
 
@@ -701,6 +1538,7 @@ async def _run_log_fetch_all(
         tid: int | None = None
         client = None
         try:
+            staged_pages: list[list[dict[str, Any]]] = []
             client = await _get_connected_client()
             start_result = await client.logsearch_start(
                 adom=adom,
@@ -734,6 +1572,11 @@ async def _run_log_fetch_all(
                     expected_total = (
                         int(total_count_raw) if total_count_raw is not None else None
                     )
+                    processed_rows = 0
+
+                    if rows:
+                        staged_pages.append(rows)
+                        processed_rows += len(rows)
 
                     offset = len(rows)
                     while True:
@@ -758,21 +1601,26 @@ async def _run_log_fetch_all(
                         if not page_rows:
                             break
 
-                        rows.extend(page_rows)
+                        staged_pages.append(page_rows)
+                        processed_rows += len(page_rows)
                         offset += len(page_rows)
                         if expected_total is None and len(page_rows) < page_size:
                             break
 
-                    if expected_total is not None and len(rows) < expected_total:
+                    if expected_total is not None and processed_rows < expected_total:
                         raise RuntimeError(
                             f"Incomplete exact fetch for filter {filter_str}: "
-                            f"expected {expected_total} rows, got {len(rows)}"
+                            f"expected {expected_total} rows, got {processed_rows}"
                         )
-                    return rows[:expected_total] if expected_total is not None else rows
+                    for page_rows in staged_pages:
+                        consumer(page_rows)
+                    return expected_total if expected_total is not None else processed_rows
 
                 await asyncio.sleep(POLL_INTERVAL)
         except RETRYABLE_QUERY_EXCEPTIONS as exc:
             last_error = exc
+            if _should_split_exact_fetch_error(exc):
+                break
             if attempt + 1 < retries:
                 await asyncio.sleep(POLL_INTERVAL)
         finally:
@@ -792,8 +1640,9 @@ async def _run_log_fetch_resilient(
     time_range: dict[str, str],
     filter_str: str | None,
     timeout: int,
-    min_split_hours: int = 1,
-) -> list[dict[str, Any]]:
+    consumer: Callable[[list[dict[str, Any]]], None],
+    min_split_minutes: int = DEFAULT_PORT_ANALYSIS_MIN_RETRY_SPLIT_MINUTES,
+) -> int:
     """Run a full exact fetch, splitting the time range when one query is too slow."""
     try:
         return await _run_log_fetch_all(
@@ -802,11 +1651,18 @@ async def _run_log_fetch_resilient(
             time_range=time_range,
             filter_str=filter_str,
             timeout=timeout,
+            consumer=consumer,
         )
     except RETRYABLE_QUERY_EXCEPTIONS:
         start, end = _parse_time_range_dict(time_range)
         span = end - start
-        if span <= timedelta(hours=max(min_split_hours, 1)):
+        logger.info(
+            "Exact fetch for %s over %s failed; splitting below %d minutes",
+            filter_str or "<none>",
+            _format_span_label(span),
+            max(min_split_minutes, 1),
+        )
+        if span <= timedelta(minutes=max(min_split_minutes, 1)):
             raise
 
         split_ranges = _split_time_range_non_overlapping(time_range)
@@ -819,7 +1675,8 @@ async def _run_log_fetch_resilient(
             time_range=left_range,
             filter_str=filter_str,
             timeout=timeout,
-            min_split_hours=min_split_hours,
+            consumer=consumer,
+            min_split_minutes=min_split_minutes,
         )
         right_rows = await _run_log_fetch_resilient(
             adom=adom,
@@ -827,7 +1684,8 @@ async def _run_log_fetch_resilient(
             time_range=right_range,
             filter_str=filter_str,
             timeout=timeout,
-            min_split_hours=min_split_hours,
+            consumer=consumer,
+            min_split_minutes=min_split_minutes,
         )
         return left_rows + right_rows
 
@@ -839,39 +1697,218 @@ async def _run_log_fetch_exact(
     time_range: dict[str, str],
     filter_str: str | None,
     timeout: int,
-    slice_day_candidates: list[int] | None = None,
-) -> list[dict[str, Any]]:
-    """Fetch every matching log row exactly, using fixed slices before recursive splits."""
-    candidates = slice_day_candidates or [1]
-    last_error: Exception | None = None
+    slice_minutes: int,
+    consumer: Callable[[list[dict[str, Any]]], None],
+) -> int:
+    """Fetch every matching log row exactly, streaming rows into a consumer."""
+    time_slices = _build_exact_time_slices_minutes(time_range, slice_minutes)
+    semaphore = asyncio.Semaphore(max(DEFAULT_PORT_ANALYSIS_SLICE_CONCURRENCY, 1))
 
-    for slice_days in candidates:
-        try:
-            rows: list[dict[str, Any]] = []
-            for time_slice in _build_exact_time_slices(time_range, slice_days):
-                rows.extend(
-                    await _run_log_fetch_all(
-                        adom=adom,
-                        device_filter=device_filter,
-                        time_range=time_slice,
-                        filter_str=filter_str,
-                        timeout=timeout,
-                    )
-                )
-            return rows
-        except RETRYABLE_QUERY_EXCEPTIONS as exc:
-            last_error = exc
+    async def fetch_time_slice(time_slice: dict[str, str]) -> int:
+        async with semaphore:
+            return await _run_log_fetch_resilient(
+                adom=adom,
+                device_filter=device_filter,
+                time_range=time_slice,
+                filter_str=filter_str,
+                timeout=timeout,
+                consumer=consumer,
+                min_split_minutes=DEFAULT_PORT_ANALYSIS_MIN_RETRY_SPLIT_MINUTES,
+            )
 
-    if last_error is not None:
-        return await _run_log_fetch_resilient(
+    slice_totals = await asyncio.gather(*(fetch_time_slice(time_slice) for time_slice in time_slices))
+    return sum(slice_totals)
+
+
+async def _collect_port_analysis_slice_accumulator(
+    *,
+    policy_id: int,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    action: str | None,
+    filter_str: str,
+    timeout: int,
+    progress_callback: PortAnalysisProgressCallback | None = None,
+    min_split_minutes: int = DEFAULT_PORT_ANALYSIS_MIN_RETRY_SPLIT_MINUTES,
+) -> PortAnalysisAccumulator:
+    """Collect one exact policy/time slice, reusing or populating persistent cache."""
+    cached = _load_cached_port_analysis_accumulator_recursive(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=time_range,
+        min_split_minutes=min_split_minutes,
+    )
+    if cached is not None:
+        await _emit_port_analysis_progress(
+            progress_callback,
+            "slice_cached",
+            {
+                "policy_id": policy_id,
+                "time_range": time_range,
+                "hits": cached.total_hits,
+            },
+        )
+        return cached
+
+    accumulator = PortAnalysisAccumulator()
+    try:
+        await _run_log_fetch_all(
             adom=adom,
             device_filter=device_filter,
             time_range=time_range,
             filter_str=filter_str,
             timeout=timeout,
+            consumer=accumulator.consume_rows,
+        )
+    except RETRYABLE_QUERY_EXCEPTIONS as exc:
+        if not _should_split_exact_fetch_error(exc):
+            raise
+
+        start, end = _parse_time_range_dict(time_range)
+        span = end - start
+        if span <= timedelta(minutes=max(min_split_minutes, 1)):
+            raise
+
+        split_ranges = _split_time_range_non_overlapping(time_range)
+        if not split_ranges:
+            raise
+        left_range, right_range = split_ranges
+
+        await _emit_port_analysis_progress(
+            progress_callback,
+            "slice_split",
+            {
+                "policy_id": policy_id,
+                "time_range": time_range,
+                "reason": str(exc),
+            },
         )
 
-    raise RuntimeError(f"Exact fetch failed for filter {filter_str}")
+        left_accumulator = await _collect_port_analysis_slice_accumulator(
+            policy_id=policy_id,
+            adom=adom,
+            device_filter=device_filter,
+            time_range=left_range,
+            action=action,
+            filter_str=filter_str,
+            timeout=timeout,
+            progress_callback=progress_callback,
+            min_split_minutes=min_split_minutes,
+        )
+        right_accumulator = await _collect_port_analysis_slice_accumulator(
+            policy_id=policy_id,
+            adom=adom,
+            device_filter=device_filter,
+            time_range=right_range,
+            action=action,
+            filter_str=filter_str,
+            timeout=timeout,
+            progress_callback=progress_callback,
+            min_split_minutes=min_split_minutes,
+        )
+        accumulator.merge(left_accumulator)
+        accumulator.merge(right_accumulator)
+    _store_cached_port_analysis_accumulator(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=time_range,
+        accumulator=accumulator,
+    )
+    await _emit_port_analysis_progress(
+        progress_callback,
+        "slice_computed",
+        {
+            "policy_id": policy_id,
+            "time_range": time_range,
+            "hits": accumulator.total_hits,
+        },
+    )
+    return accumulator
+
+
+async def _run_cached_port_analysis_exact(
+    *,
+    policy_id: int,
+    adom: str,
+    device_filter: list[dict[str, str]],
+    time_range: dict[str, str],
+    action: str | None,
+    filter_str: str,
+    timeout: int,
+    slice_minutes: int,
+    progress_callback: PortAnalysisProgressCallback | None = None,
+    min_split_minutes: int = DEFAULT_PORT_ANALYSIS_MIN_RETRY_SPLIT_MINUTES,
+) -> PortAnalysisAccumulator:
+    """Execute exact port analysis with persistent slice cache and exact merging."""
+    cached = _load_cached_port_analysis_accumulator(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        action=action,
+        time_range=time_range,
+    )
+    if cached is not None:
+        await _emit_port_analysis_progress(
+            progress_callback,
+            "slice_cached",
+            {
+                "policy_id": policy_id,
+                "time_range": time_range,
+                "hits": cached.total_hits,
+            },
+        )
+        return cached
+
+    time_slices = _build_exact_time_slices_minutes(time_range, slice_minutes)
+    await _emit_port_analysis_progress(
+        progress_callback,
+        "slices_planned",
+        {
+            "policy_id": policy_id,
+            "count": len(time_slices),
+            "time_range": time_range,
+        },
+    )
+    semaphore = asyncio.Semaphore(max(DEFAULT_PORT_ANALYSIS_SLICE_CONCURRENCY, 1))
+
+    async def fetch_time_slice(time_slice: dict[str, str]) -> PortAnalysisAccumulator:
+        async with semaphore:
+            return await _collect_port_analysis_slice_accumulator(
+                policy_id=policy_id,
+                adom=adom,
+                device_filter=device_filter,
+                time_range=time_slice,
+                action=action,
+                filter_str=filter_str,
+                timeout=timeout,
+                progress_callback=progress_callback,
+                min_split_minutes=min_split_minutes,
+            )
+
+    slice_accumulators = await asyncio.gather(
+        *(fetch_time_slice(time_slice) for time_slice in time_slices)
+    )
+
+    accumulator = PortAnalysisAccumulator()
+    for slice_accumulator in slice_accumulators:
+        accumulator.merge(slice_accumulator)
+
+    if len(time_slices) > 1:
+        _store_cached_port_analysis_accumulator(
+            adom=adom,
+            device_filter=device_filter,
+            policy_id=policy_id,
+            action=action,
+            time_range=time_range,
+            accumulator=accumulator,
+        )
+
+    return accumulator
 
 
 async def _discover_policy_candidates(
@@ -936,10 +1973,14 @@ async def _discover_policy_candidates(
 
                 discovery["sampled_logs"] += len(rows)
                 for row in rows:
-                    for field in counters:
-                        normalized = _normalize_sample_value(field, row.get(field), row)
+                    for counter_field in counters:
+                        normalized = _normalize_sample_value(
+                            counter_field,
+                            row.get(counter_field),
+                            row,
+                        )
                         if normalized:
-                            counters[field][normalized] += 1
+                            counters[counter_field][normalized] += 1
 
     discovery["discovered_candidates"] = {
         field: len(counter) for field, counter in counters.items()
@@ -1536,22 +2577,29 @@ async def _build_policy_port_analysis_result(
     device_filter: list[dict[str, str]],
     full_time_range: dict[str, str],
     action: str | None,
-    slice_day_candidates: list[int],
+    slice_minutes: int,
+    fetch_timeout: int = DEFAULT_PORT_ANALYSIS_FETCH_TIMEOUT,
+    progress_callback: PortAnalysisProgressCallback | None = None,
+    min_split_minutes: int = DEFAULT_PORT_ANALYSIS_MIN_RETRY_SPLIT_MINUTES,
 ) -> dict[str, Any]:
     """Build the exact port-analysis result for one policy."""
     base_filter = _build_policy_filter(policy_id, action)
-    logs = await _run_log_fetch_exact(
+    accumulator = await _run_cached_port_analysis_exact(
+        policy_id=policy_id,
         adom=adom,
         device_filter=device_filter,
         time_range=full_time_range,
+        action=action,
         filter_str=base_filter,
-        timeout=DEFAULT_PORT_ANALYSIS_FETCH_TIMEOUT,
-        slice_day_candidates=slice_day_candidates,
+        timeout=fetch_timeout,
+        slice_minutes=slice_minutes,
+        progress_callback=progress_callback,
+        min_split_minutes=min_split_minutes,
     )
-    if not logs:
+    if accumulator.total_hits == 0:
         return _build_empty_port_analysis_result(policy_id)
 
-    return {"policy_id": policy_id, **_aggregate_port_analysis(logs)}
+    return {"policy_id": policy_id, **accumulator.build_result()}
 
 
 async def _build_policy_protocol_summary_result(
@@ -1646,6 +2694,195 @@ async def _gather_policy_results(
     return per_policy
 
 
+def _build_port_analysis_job_state(
+    *,
+    job_id: str,
+    adom: str,
+    device: str | None,
+    device_filter: list[dict[str, str]],
+    policy_ids: list[int],
+    time_range: str,
+    full_time_range: dict[str, str],
+    action: str | None,
+    estimate: PortAnalysisEstimate,
+) -> dict[str, Any]:
+    """Build the initial persisted state for one background exact-analysis job."""
+    now = _utc_timestamp()
+    return {
+        "version": PORT_ANALYSIS_JOB_SCHEMA_VERSION,
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "request": {
+            "adom": adom,
+            "device": device,
+            "device_filter": device_filter,
+            "policy_ids": policy_ids,
+            "time_range": time_range,
+            "full_time_range": full_time_range,
+            "action": action,
+        },
+        "estimate": _serialize_port_analysis_estimate(estimate),
+        "progress": {
+            "total_policies": len(policy_ids),
+            "completed_policies": 0,
+            "current_policy_id": None,
+            "total_slices": 0,
+            "completed_slices": 0,
+            "cached_slices": 0,
+            "computed_slices": 0,
+            "split_slices": 0,
+        },
+        "result": None,
+        "error": None,
+    }
+
+
+def _mark_port_analysis_job_interrupted(
+    job_state: dict[str, Any],
+    *,
+    error: str | None = None,
+) -> dict[str, Any]:
+    """Mark a previously running job as interrupted in persisted state."""
+    if job_state.get("status") in {"completed", "failed", "interrupted"}:
+        return job_state
+    job_state["status"] = "interrupted"
+    job_state["updated_at"] = _utc_timestamp()
+    if error:
+        job_state["error"] = error
+    elif not job_state.get("error"):
+        job_state["error"] = "Background exact-analysis job is no longer active."
+    return job_state
+
+
+def mark_stale_port_analysis_jobs_interrupted(reason: str) -> int:
+    """Mark persisted queued/running jobs as interrupted after a process restart."""
+    jobs_dir = _get_port_analysis_jobs_dir()
+    if not jobs_dir.exists():
+        return 0
+
+    interrupted = 0
+    for job_path in jobs_dir.glob("*.json"):
+        payload = _read_json_file(job_path)
+        if not payload or payload.get("version") != PORT_ANALYSIS_JOB_SCHEMA_VERSION:
+            continue
+        if payload.get("status") not in {"queued", "running"}:
+            continue
+        _mark_port_analysis_job_interrupted(payload, error=reason)
+        _write_json_atomic(job_path, payload)
+        interrupted += 1
+    return interrupted
+
+
+async def shutdown_port_analysis_jobs(reason: str) -> int:
+    """Cancel in-process background jobs and persist them as interrupted."""
+    active_tasks = list(_PORT_ANALYSIS_JOB_TASKS.items())
+    for job_id, task in active_tasks:
+        job_state = _load_port_analysis_job_state(job_id)
+        if job_state is not None:
+            _mark_port_analysis_job_interrupted(job_state, error=reason)
+            _store_port_analysis_job_state(job_state)
+        task.cancel()
+
+    if active_tasks:
+        await asyncio.gather(
+            *(task for _job_id, task in active_tasks),
+            return_exceptions=True,
+        )
+    _PORT_ANALYSIS_JOB_TASKS.clear()
+    return len(active_tasks)
+
+
+async def _run_port_analysis_job(job_id: str) -> None:
+    """Run one background exact port-analysis job to completion."""
+    async with _PORT_ANALYSIS_JOB_SEMAPHORE:
+        job_state = _load_port_analysis_job_state(job_id)
+        if job_state is None:
+            _PORT_ANALYSIS_JOB_TASKS.pop(job_id, None)
+            return
+
+        request = cast(dict[str, Any], job_state["request"])
+        policy_ids = [int(policy_id) for policy_id in list(request["policy_ids"])]
+        adom = str(request["adom"])
+        device_filter = cast(list[dict[str, str]], request["device_filter"])
+        full_time_range = cast(dict[str, str], request["full_time_range"])
+        action = cast(str | None, request.get("action"))
+        estimate = _deserialize_port_analysis_estimate(
+            cast(dict[str, Any] | None, job_state.get("estimate"))
+        )
+        progress = cast(dict[str, Any], job_state["progress"])
+
+        job_state["status"] = "running"
+        job_state["updated_at"] = _utc_timestamp()
+        _store_port_analysis_job_state(job_state)
+
+        results: list[dict[str, Any]] = []
+        started = time.monotonic()
+
+        async def progress_callback(event: str, payload: dict[str, Any]) -> None:
+            if event == "slices_planned":
+                progress["total_slices"] = int(progress["total_slices"]) + int(payload.get("count", 0))
+            elif event == "slice_split":
+                progress["split_slices"] = int(progress["split_slices"]) + 1
+                progress["total_slices"] = int(progress["total_slices"]) + 1
+            elif event in {"slice_cached", "slice_computed"}:
+                if int(progress["completed_slices"]) >= int(progress["total_slices"]):
+                    progress["total_slices"] = int(progress["total_slices"]) + 1
+                progress["completed_slices"] = int(progress["completed_slices"]) + 1
+                if event == "slice_cached":
+                    progress["cached_slices"] = int(progress["cached_slices"]) + 1
+                else:
+                    progress["computed_slices"] = int(progress["computed_slices"]) + 1
+            job_state["updated_at"] = _utc_timestamp()
+            _store_port_analysis_job_state(job_state)
+
+        try:
+            for policy_id in policy_ids:
+                progress["current_policy_id"] = policy_id
+                job_state["updated_at"] = _utc_timestamp()
+                _store_port_analysis_job_state(job_state)
+                try:
+                    slice_minutes = _plan_port_analysis_slice_minutes(
+                        full_time_range=full_time_range,
+                        estimated_hits=estimate.hits_by_policy.get(policy_id),
+                    )
+                    result = await _build_policy_port_analysis_result(
+                        policy_id=policy_id,
+                        adom=adom,
+                        device_filter=device_filter,
+                        full_time_range=full_time_range,
+                        action=action,
+                        slice_minutes=slice_minutes,
+                        fetch_timeout=DEFAULT_PORT_ANALYSIS_BACKGROUND_FETCH_TIMEOUT,
+                        progress_callback=progress_callback,
+                        min_split_minutes=DEFAULT_PORT_ANALYSIS_BACKGROUND_MIN_SPLIT_MINUTES,
+                    )
+                except Exception as exc:
+                    result = {"policy_id": policy_id, "error": str(exc)}
+                results.append(result)
+                progress["completed_policies"] = int(progress["completed_policies"]) + 1
+                progress["current_policy_id"] = None
+                job_state["updated_at"] = _utc_timestamp()
+                _store_port_analysis_job_state(job_state)
+
+            job_state["status"] = "completed"
+            job_state["result"] = {
+                "status": "success",
+                "results": results,
+                "query_time_seconds": round(time.monotonic() - started, 2),
+            }
+            job_state["error"] = None
+        except Exception as exc:
+            job_state["status"] = "failed"
+            job_state["error"] = str(exc)
+        finally:
+            progress["current_policy_id"] = None
+            job_state["updated_at"] = _utc_timestamp()
+            _store_port_analysis_job_state(job_state)
+            _PORT_ANALYSIS_JOB_TASKS.pop(job_id, None)
+
+
 def _aggregate_traffic_profile(logs: list[dict[str, Any]], top_n: int) -> dict[str, Any]:
     """Aggregate fetched log rows into a traffic profile."""
     port_counter: Counter[str] = Counter()
@@ -1688,45 +2925,9 @@ def _aggregate_traffic_profile(logs: list[dict[str, Any]], top_n: int) -> dict[s
 
 def _aggregate_port_analysis(logs: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate a complete fetched log set into an exact port/protocol summary."""
-    port_counter: Counter[str] = Counter()
-    protocol_counter: Counter[str] = Counter()
-    portless_protocols: set[str] = set()
-    icmp_types: Counter[str] = Counter()
-    total = len(logs)
-
-    for log in logs:
-        proto_str = str(log.get("proto", "unknown")).strip() or "unknown"
-        protocol_counter[proto_str] += 1
-
-        dstport = log.get("dstport")
-        if dstport is not None and str(dstport).isdigit() and str(dstport) != "0":
-            port_counter[f"{proto_str}/{dstport}"] += 1
-        else:
-            portless_protocols.add(proto_str)
-
-        if proto_str == "1":
-            service = str(log.get("service", ""))
-            if service:
-                icmp_types[_format_icmp_type_code(service)] += 1
-
-    return {
-        "total_hits": total,
-        "is_exact": True,
-        "ports": sorted(
-            [{"port": p, "hits": c} for p, c in port_counter.items()],
-            key=lambda item: (-int(item["hits"]), _port_pair_sort_key(str(item["port"]))),
-        ),
-        "protocols": sorted(
-            [{"protocol": p, "hits": c} for p, c in protocol_counter.items()],
-            key=lambda item: (-int(item["hits"]), _protocol_sort_key(str(item["protocol"]))),
-        ),
-        "portless_protocols": sorted(portless_protocols, key=_protocol_sort_key),
-        "uncovered_port_hits": 0,
-        "icmp": sorted(
-            [{"type_code": key, "hits": hits} for key, hits in icmp_types.items()],
-            key=lambda item: (-int(item["hits"]), str(item["type_code"])),
-        ),
-    }
+    accumulator = PortAnalysisAccumulator()
+    accumulator.consume_rows(logs)
+    return accumulator.build_result()
 
 
 def _aggregate_protocol_summary(logs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1819,8 +3020,10 @@ async def get_policy_port_analysis(
     """Get exact port/protocol analysis for one or more firewall policies.
 
     This uses a full exact traffic-log fetch for each policy/time window and
-    aggregates locally, so the returned ports, protocols, and ICMP breakdown
-    are 1:1 with the fetched logs whenever the query completes successfully.
+    aggregates pages locally, so the returned ports, protocols, and ICMP
+    breakdown are 1:1 with the fetched logs whenever the query completes
+    successfully. Large requests fail closed before execution when the server
+    estimates they are too expensive for one synchronous call.
     """
     try:
         adom = validate_adom(adom or get_default_adom())
@@ -1831,7 +3034,60 @@ async def get_policy_port_analysis(
 
         device_filter = _build_device_filter(device)
         full_time_range = _parse_time_range(time_range)
-        slice_day_candidates = _build_exact_slice_day_candidates(DEFAULT_EXACT_SLICE_DAYS)
+        fully_cached = all(
+            _has_cached_port_analysis_accumulator(
+                adom=adom,
+                device_filter=device_filter,
+                policy_id=policy_id,
+                action=action,
+                time_range=full_time_range,
+            )
+            for policy_id in policy_ids
+        )
+        run_plan = PortAnalysisRunPlan(estimate=PortAnalysisEstimate(complete=True))
+        if fully_cached:
+            run_plan.policy_slice_minutes = {
+                policy_id: _plan_port_analysis_slice_minutes(
+                    full_time_range=full_time_range,
+                    estimated_hits=None,
+                )
+                for policy_id in policy_ids
+            }
+            logger.info("Port-analysis request for policies %s served from exact cache", policy_ids)
+        else:
+            estimate = PortAnalysisEstimate()
+            if not _should_skip_port_analysis_estimate(
+                policy_ids=policy_ids,
+                full_time_range=full_time_range,
+            ):
+                estimate = await _estimate_port_analysis_hits(
+                    adom=adom,
+                    device_filter=device_filter,
+                    full_time_range=full_time_range,
+                    policy_ids=policy_ids,
+                    action=action,
+                )
+            run_plan = _plan_port_analysis_run(
+                policy_ids=policy_ids,
+                full_time_range=full_time_range,
+                estimate=estimate,
+            )
+            logger.info(
+                "Port-analysis plan for policies %s: execute=%s slices=%d pages=%d est_seconds=%.2f reason=%s",
+                policy_ids,
+                run_plan.should_execute,
+                run_plan.estimated_total_slices,
+                run_plan.estimated_total_pages,
+                run_plan.estimated_wall_seconds,
+                run_plan.reason,
+            )
+            guard_error = _port_analysis_guard_error(
+                policy_ids=policy_ids,
+                full_time_range=full_time_range,
+                plan=run_plan,
+            )
+            if guard_error:
+                return {"status": "error", "message": guard_error}
 
         start = time.monotonic()
         results = await _gather_policy_results(
@@ -1842,7 +3098,7 @@ async def get_policy_port_analysis(
                 device_filter=device_filter,
                 full_time_range=full_time_range,
                 action=action,
-                slice_day_candidates=slice_day_candidates,
+                slice_minutes=run_plan.policy_slice_minutes[policy_id],
             ),
         )
 
@@ -1906,3 +3162,94 @@ async def get_policy_protocol_summary(
     except (OSError, TimeoutError, FazConnectionError, FazTimeoutError, APIError) as e:
         logger.error(f"Network error in get_policy_protocol_summary: {e}")
         return {"status": "error", "message": f"Network error: {e}"}
+
+
+@mcp.tool()
+async def start_policy_port_analysis_job(
+    adom: str | None = None,
+    device: str | None = None,
+    policy_ids: list[int] | None = None,
+    time_range: str = "24-hour",
+    action: str | None = None,
+) -> dict[str, Any]:
+    """Start a background exact port-analysis job for long-running policy windows."""
+    try:
+        adom = validate_adom(adom or get_default_adom())
+        if policy_ids is None:
+            return {"status": "error", "message": "policy_ids is required"}
+        policy_ids = validate_policy_ids(policy_ids)
+        action = validate_action(action)
+
+        device_filter = _build_device_filter(device)
+        full_time_range = _parse_time_range(time_range)
+        estimate = PortAnalysisEstimate()
+        if not _should_skip_port_analysis_estimate(
+            policy_ids=policy_ids,
+            full_time_range=full_time_range,
+        ):
+            estimate = await _estimate_port_analysis_hits(
+                adom=adom,
+                device_filter=device_filter,
+                full_time_range=full_time_range,
+                policy_ids=policy_ids,
+                action=action,
+            )
+        job_id = uuid.uuid4().hex
+        job_state = _build_port_analysis_job_state(
+            job_id=job_id,
+            adom=adom,
+            device=device,
+            device_filter=device_filter,
+            policy_ids=policy_ids,
+            time_range=time_range,
+            full_time_range=full_time_range,
+            action=action,
+            estimate=estimate,
+        )
+        _store_port_analysis_job_state(job_state)
+
+        task = asyncio.create_task(_run_port_analysis_job(job_id))
+        _PORT_ANALYSIS_JOB_TASKS[job_id] = task
+
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "job_status": job_state["status"],
+            "request": job_state["request"],
+            "message": "Background exact port-analysis job started.",
+        }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
+    except RuntimeError as e:
+        return {"status": "error", "message": str(e)}
+    except (OSError, TimeoutError, FazConnectionError, FazTimeoutError, APIError) as e:
+        logger.error(f"Network error in start_policy_port_analysis_job: {e}")
+        return {"status": "error", "message": f"Network error: {e}"}
+
+
+@mcp.tool()
+async def get_policy_port_analysis_job(job_id: str) -> dict[str, Any]:
+    """Get the current status or final result for a background exact-analysis job."""
+    job_id = job_id.strip()
+    if not job_id:
+        return {"status": "error", "message": "job_id is required"}
+
+    job_state = _load_port_analysis_job_state(job_id)
+    if job_state is None:
+        return {"status": "error", "message": f"Unknown job_id: {job_id}"}
+
+    task = _PORT_ANALYSIS_JOB_TASKS.get(job_id)
+    if job_state.get("status") in {"queued", "running"} and (task is None or task.done()):
+        error: str | None = None
+        if task is not None:
+            try:
+                exc = task.exception()
+            except asyncio.InvalidStateError:
+                exc = None
+            if exc is not None:
+                error = str(exc)
+        job_state = _mark_port_analysis_job_interrupted(job_state, error=error)
+        _store_port_analysis_job_state(job_state)
+        _PORT_ANALYSIS_JOB_TASKS.pop(job_id, None)
+
+    return {"status": "success", "job": job_state}
