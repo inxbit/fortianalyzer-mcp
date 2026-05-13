@@ -804,7 +804,7 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 - [Anthropic](https://anthropic.com) for the [Model Context Protocol](https://modelcontextprotocol.io)
 - [Fortinet](https://fortinet.com) for FortiAnalyzer
-- [@nzkller](https://github.com/nzkller) for policy usage analysis design concepts (exact-vs-sampled semantics, `is_exact` fail-closed model)
+- [@inxbit](https://github.com/inxbit) for policy usage analysis design concepts (exact-vs-sampled semantics, `is_exact` fail-closed model)
 
 ## Related Projects
 

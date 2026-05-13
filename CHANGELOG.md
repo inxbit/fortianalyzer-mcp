@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tool-level bounded tests for `get_policy_traffic_profile` and `get_policy_protocol_summary`
 
 ### Credits
-- Bounded slicing approach contributed by [@nzkller](https://github.com/nzkller) (PR [#11](https://github.com/rstierli/fortianalyzer-mcp/pull/11))
+- Bounded slicing approach contributed by [@inxbit](https://github.com/inxbit) (PR [#11](https://github.com/rstierli/fortianalyzer-mcp/pull/11))
 
 ## [1.1.2-beta] - 2026-04-23
 
