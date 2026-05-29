@@ -14,13 +14,26 @@ services:
       - FORTIANALYZER_API_TOKEN=${FORTIANALYZER_API_TOKEN:-}
       - FORTIANALYZER_USERNAME=${FORTIANALYZER_USERNAME:-}
       - FORTIANALYZER_PASSWORD=${FORTIANALYZER_PASSWORD:-}
-      - FORTIANALYZER_VERIFY_SSL=${FORTIANALYZER_VERIFY_SSL:-false}
+      # SECURITY: TLS verification is enabled by default. Disabling it
+      # (VERIFY_SSL=false) exposes the FortiAnalyzer API token and all log/PCAP
+      # data to man-in-the-middle interception. For a self-signed FAZ
+      # certificate, import the FAZ CA into the container's trust store rather
+      # than turning verification off.
+      - FORTIANALYZER_VERIFY_SSL=${FORTIANALYZER_VERIFY_SSL:-true}
       - FORTIANALYZER_TIMEOUT=${FORTIANALYZER_TIMEOUT:-30}
       - FORTIANALYZER_MAX_RETRIES=${FORTIANALYZER_MAX_RETRIES:-3}
       # MCP Server
+      # SECURITY: In HTTP mode the server binds to 0.0.0.0 so the published
+      # port is reachable. If MCP_AUTH_TOKEN is unset, EVERY tool is exposed
+      # UNAUTHENTICATED to anyone who can reach the port (log search, device
+      # add/delete, PCAP download). Always set a strong MCP_AUTH_TOKEN, and
+      # where possible publish the port only on an internal interface or
+      # 127.0.0.1 (e.g. ports: "127.0.0.1:8001:8001").
       - MCP_SERVER_HOST=0.0.0.0
       - MCP_SERVER_PORT=8001
       - MCP_SERVER_MODE=http
+      # Generate a strong token, e.g.: openssl rand -hex 32
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
       - FAZ_TOOL_MODE=${FAZ_TOOL_MODE:-full}
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-INFO}

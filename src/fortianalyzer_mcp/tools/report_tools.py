@@ -16,6 +16,7 @@ from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
+    assert_within_directory,
     get_default_adom,
     validate_adom,
     validate_output_path,
@@ -799,6 +800,10 @@ async def save_report(
                         suffix = original_output.suffix
                         output_file = output_path / f"{stem}_{counter}{suffix}"
                         counter += 1
+
+                    # Defense-in-depth: ensure the resolved path stays inside
+                    # the validated output directory.
+                    output_file = assert_within_directory(output_file, output_path)
 
                     # Write file
                     with open(output_file, "wb") as f:

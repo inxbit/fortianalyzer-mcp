@@ -5,6 +5,18 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-05-29
+
+First stable release — graduated from beta.
+
+### Security
+- **Log-query filter injection fixed** ([#16](https://github.com/rstierli/fortianalyzer-mcp/issues/16)): caller-supplied filter fields in the IPS/PCAP and traffic/security/event log search tools (`srcip`, `dstip`, `srcport`, `dstport`, `severity`, `action`, `level`, `subtype`, `cve`, `attack_name`, `session_id`) are now validated/sanitized before being interpolated into FAZ filter expressions. IPs are checked as IP/CIDR, ports as integers, enums against allowlists, and free-text fields reject quote/operator/boolean characters — preventing a caller from rewriting the filter to widen log scope. Filter operators and quoting are unchanged, so legitimate queries behave identically.
+- **PCAP-by-URL validation** ([#16](https://github.com/rstierli/fortianalyzer-mcp/issues/16)): `download_pcap_by_url` / `get_pcap_file` now validate that `pcapurl` is an internal FAZ resource reference and reject arbitrary external URL schemes before forwarding to FortiAnalyzer.
+- **Archive-extraction path containment** ([#16](https://github.com/rstierli/fortianalyzer-mcp/issues/16)): PCAP and report ZIP extraction now asserts each resolved path stays within the intended output directory (defense-in-depth on top of the existing basename handling).
+
+### Changed
+- **Stability promotion:** no functional changes beyond the security hardening above. Shipped example configs (`docker-compose.yml`, `.env.example`) and README now default to `FORTIANALYZER_VERIFY_SSL=true` with CA-import guidance, document a strong `MCP_AUTH_TOKEN` for HTTP mode, and warn that running HTTP transport without a token leaves all tools unauthenticated. The server's runtime defaults are unchanged (backward compatible).
+
 ## [1.2.1-beta] - 2026-05-17
 
 ### Fixed

@@ -19,9 +19,18 @@ from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
+    assert_within_directory,
     get_default_adom,
+    sanitize_filter_value,
     validate_adom,
+    validate_cve,
+    validate_ip_or_cidr,
+    validate_ips_action,
     validate_output_path,
+    validate_pcapurl,
+    validate_port,
+    validate_session_id,
+    validate_severity,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,49 +100,66 @@ def _build_ips_filter(
     filters = []
 
     # Severity filter: (severity="critical" or severity="high")
+    # Each value validated against the severity allowlist.
     if severity:
-        if len(severity) == 1:
-            filters.append(f'severity="{severity[0]}"')
+        sev_values = [validate_severity(s) for s in severity]
+        if len(sev_values) == 1:
+            filters.append(f'severity="{sev_values[0]}"')
         else:
-            sev_parts = [f'severity="{s}"' for s in severity]
+            sev_parts = [f'severity="{s}"' for s in sev_values]
             filters.append(f"({' or '.join(sev_parts)})")
 
-    # Attack name filter
+    # Attack name filter (free text). sanitize_filter_value rejects/escapes
+    # quote/operator/boolean characters before interpolation. Keep the baseline
+    # `attack="..."` (single `=`, always quoted) form for backward compatibility.
     if attack_exact:
-        filters.append(f'attack="{attack_exact}"')
+        safe = sanitize_filter_value(attack_exact, "attack_exact")
+        if not safe.startswith('"'):
+            safe = f'"{safe}"'
+        filters.append(f"attack={safe}")
     elif attack_contains:
         # Wildcard search: attack=*Remote.Code.Execution*
-        filters.append(f"attack=*{attack_contains}*")
+        # The wildcard syntax requires an unquoted value, so reject any value
+        # that is not a simple token rather than quoting it.
+        safe = sanitize_filter_value(attack_contains, "attack_contains")
+        if safe.startswith('"'):
+            raise ValidationError(
+                f"Invalid attack_contains '{attack_contains}'. "
+                "Only letters, digits, '.', '-', '_' and ':' are allowed."
+            )
+        filters.append(f"attack=*{safe}*")
 
     # Action filter: (action="blocked" or action="dropped")
+    # Each value validated against the IPS action allowlist.
     if action:
-        if len(action) == 1:
-            filters.append(f'action="{action[0]}"')
+        act_values = [validate_ips_action(a) for a in action]
+        if len(act_values) == 1:
+            filters.append(f'action="{act_values[0]}"')
         else:
-            act_parts = [f'action="{a}"' for a in action]
+            act_parts = [f'action="{a}"' for a in act_values]
             filters.append(f"({' or '.join(act_parts)})")
 
     # CVE filters
     if cve:
-        filters.append(f'cve="{cve}"')
+        filters.append(f'cve="{validate_cve(cve)}"')
     elif has_cve:
         filters.append('cve!=""')
 
-    # IP filters
+    # IP filters (validated as IP/CIDR)
     if srcip:
-        filters.append(f'srcip="{srcip}"')
+        filters.append(f'srcip="{validate_ip_or_cidr(srcip, "srcip")}"')
     if dstip:
-        filters.append(f'dstip="{dstip}"')
+        filters.append(f'dstip="{validate_ip_or_cidr(dstip, "dstip")}"')
 
-    # Port filters
+    # Port filters (validated as integers 1-65535)
     if srcport:
-        filters.append(f"srcport=={srcport}")
+        filters.append(f"srcport=={validate_port(srcport, 'srcport')}")
     if dstport:
-        filters.append(f"dstport=={dstport}")
+        filters.append(f"dstport=={validate_port(dstport, 'dstport')}")
 
-    # Session ID filter
+    # Session ID filter (validated as positive integer)
     if session_id:
-        filters.append(f"sessionid=={session_id}")
+        filters.append(f"sessionid=={validate_session_id(session_id)}")
 
     # PCAP availability filter
     if has_pcap:
@@ -390,9 +416,7 @@ async def get_pcap_by_session(
         # Validate inputs
         adom = validate_adom(adom or get_default_adom())
         output_path = validate_output_path(output_dir)
-
-        if session_id <= 0:
-            return {"status": "error", "message": "Invalid session ID"}
+        session_id = validate_session_id(session_id)
 
         client = _get_client()
 
@@ -531,7 +555,9 @@ async def get_pcap_by_session(
                     name_part = os.path.splitext(base_name)[0]
                     out_filename = f"{name_part}_{session_id}_{timestamp}.pcap"
 
-                    out_file = output_path / out_filename
+                    # Defense-in-depth: ensure the resolved path stays inside
+                    # the validated output directory.
+                    out_file = assert_within_directory(output_path / out_filename, output_path)
                     with open(out_file, "wb") as f:
                         f.write(content)
 
@@ -612,8 +638,9 @@ async def download_pcap_by_url(
     try:
         output_path = validate_output_path(output_dir)
 
-        if not pcapurl:
-            return {"status": "error", "message": "pcapurl cannot be empty"}
+        # Validate the caller-supplied pcapurl is a FAZ resource reference,
+        # not an arbitrary external URL, before forwarding it to FAZ.
+        pcapurl = validate_pcapurl(pcapurl)
 
         client = _get_client()
 
@@ -664,7 +691,9 @@ async def download_pcap_by_url(
                     else:
                         out_filename = f"{name_part}_{timestamp}.pcap"
 
-                    out_file = output_path / out_filename
+                    # Defense-in-depth: ensure the resolved path stays inside
+                    # the validated output directory.
+                    out_file = assert_within_directory(output_path / out_filename, output_path)
                     with open(out_file, "wb") as f:
                         f.write(content)
 
@@ -895,7 +924,9 @@ async def search_and_download_pcaps(
                         name_part = os.path.splitext(base_name)[0]
                         out_filename = f"{name_part}_{session_id}_{timestamp}.pcap"
 
-                        out_file = output_path / out_filename
+                        # Defense-in-depth: ensure the resolved path stays
+                        # inside the validated output directory.
+                        out_file = assert_within_directory(output_path / out_filename, output_path)
                         with open(out_file, "wb") as f:
                             f.write(content)
 

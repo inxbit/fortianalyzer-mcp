@@ -6,6 +6,7 @@ Security utilities for:
 - Path validation for file operations
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -160,6 +161,54 @@ VALID_FORTIVIEW_VIEWS = {
 
 # Severity levels
 VALID_SEVERITIES = {"critical", "high", "medium", "low", "info"}
+
+# Traffic log action values (FortiGate)
+VALID_TRAFFIC_ACTIONS = {"accept", "deny", "close", "drop", "ip-conn", "timeout"}
+
+# IPS/attack log action values (FortiGate UTM)
+VALID_IPS_ACTIONS = {"detected", "blocked", "dropped", "reset", "pass", "clear_session"}
+
+# Event log levels (FortiGate syslog levels)
+VALID_EVENT_LEVELS = {
+    "emergency",
+    "alert",
+    "critical",
+    "error",
+    "warning",
+    "notice",
+    "information",
+    "debug",
+}
+
+# Event log subtypes
+VALID_EVENT_SUBTYPES = {
+    "system",
+    "vpn",
+    "user",
+    "router",
+    "wireless",
+    "wad",
+    "endpoint",
+    "ha",
+    "security-rating",
+    "fortiextender",
+    "connector",
+    "sdwan",
+}
+
+# Safe unquoted filter value: alphanumeric, dot, hyphen, underscore, colon (IPv6).
+# Anything matching this contains no quote/operator/boolean injection characters.
+_SAFE_UNQUOTED_FILTER_RE = re.compile(r"^[a-zA-Z0-9._:\-]+$")
+
+# CVE identifier pattern (e.g. CVE-2025-2945)
+_CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
+
+# FortiAnalyzer pcapurl: an internal resource reference returned by FAZ in IPS
+# log entries. It is a path/token-style string, never an absolute external URL.
+# Allowed characters: alphanumerics plus the URL-safe / query separators FAZ uses.
+_PCAPURL_RE = re.compile(r"^[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%\-]+$")
+# Maximum sane length for a pcapurl reference.
+_PCAPURL_MAX_LEN = 4096
 
 
 class ValidationError(ValueError):
@@ -335,6 +384,278 @@ def validate_severity(severity: str) -> str:
 
 
 # =============================================================================
+# Log Filter Value Validation (injection-safe)
+# =============================================================================
+
+
+def validate_ip_or_cidr(value: str, field: str = "IP address") -> str:
+    """Validate an IPv4/IPv6 address or CIDR network.
+
+    Rejects anything that is not a syntactically valid IP address or
+    network, blocking filter-injection payloads such as
+    ``1.1.1.1" or 1==1 or "``.
+
+    Args:
+        value: IP address or CIDR string to validate.
+        field: Field name used in the error message.
+
+    Returns:
+        Validated IP/CIDR string (stripped).
+
+    Raises:
+        ValidationError: If the value is not a valid IP address or network.
+    """
+    if not value:
+        raise ValidationError(f"{field} cannot be empty")
+
+    value = value.strip()
+
+    # Accept a plain host address or a CIDR network.
+    try:
+        if "/" in value:
+            ipaddress.ip_network(value, strict=False)
+        else:
+            ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValidationError(
+            f"Invalid {field} '{value}'. Must be a valid IPv4/IPv6 address or CIDR network."
+        ) from exc
+
+    return value
+
+
+def validate_port(port: int, field: str = "port") -> int:
+    """Validate a TCP/UDP port number.
+
+    Args:
+        port: Port value to validate.
+        field: Field name used in the error message.
+
+    Returns:
+        Validated port integer.
+
+    Raises:
+        ValidationError: If the port is not an int in the range 1-65535.
+    """
+    # bool is a subclass of int; reject it explicitly.
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise ValidationError(f"Invalid {field} '{port}'. Must be an integer 1-65535.")
+    if not 1 <= port <= 65535:
+        raise ValidationError(f"Invalid {field} '{port}'. Must be in range 1-65535.")
+    return port
+
+
+def validate_session_id(session_id: int) -> int:
+    """Validate a FortiAnalyzer session ID.
+
+    Args:
+        session_id: Session ID to validate.
+
+    Returns:
+        Validated session ID integer.
+
+    Raises:
+        ValidationError: If the session ID is not a positive integer.
+    """
+    if isinstance(session_id, bool) or not isinstance(session_id, int) or session_id <= 0:
+        raise ValidationError(f"Invalid session ID '{session_id}'. Must be a positive integer.")
+    return session_id
+
+
+def validate_traffic_action(action: str) -> str:
+    """Validate a traffic log action against the allowlist.
+
+    Args:
+        action: Action string to validate.
+
+    Returns:
+        Validated action (lowercase).
+
+    Raises:
+        ValidationError: If the action is not in the allowlist.
+    """
+    if not action:
+        raise ValidationError("Action cannot be empty")
+    action = action.strip().lower()
+    if action not in VALID_TRAFFIC_ACTIONS:
+        raise ValidationError(
+            f"Invalid action '{action}'. Valid actions: {', '.join(sorted(VALID_TRAFFIC_ACTIONS))}"
+        )
+    return action
+
+
+def validate_ips_action(action: str) -> str:
+    """Validate an IPS/attack log action against the allowlist.
+
+    Args:
+        action: Action string to validate.
+
+    Returns:
+        Validated action (lowercase).
+
+    Raises:
+        ValidationError: If the action is not in the allowlist.
+    """
+    if not action:
+        raise ValidationError("Action cannot be empty")
+    action = action.strip().lower()
+    if action not in VALID_IPS_ACTIONS:
+        raise ValidationError(
+            f"Invalid action '{action}'. Valid actions: {', '.join(sorted(VALID_IPS_ACTIONS))}"
+        )
+    return action
+
+
+def validate_event_level(level: str) -> str:
+    """Validate an event log level against the allowlist.
+
+    Args:
+        level: Level string to validate.
+
+    Returns:
+        Validated level (lowercase).
+
+    Raises:
+        ValidationError: If the level is not in the allowlist.
+    """
+    if not level:
+        raise ValidationError("Level cannot be empty")
+    level = level.strip().lower()
+    if level not in VALID_EVENT_LEVELS:
+        raise ValidationError(
+            f"Invalid level '{level}'. Valid levels: {', '.join(sorted(VALID_EVENT_LEVELS))}"
+        )
+    return level
+
+
+def validate_event_subtype(subtype: str) -> str:
+    """Validate an event log subtype against the allowlist.
+
+    Args:
+        subtype: Subtype string to validate.
+
+    Returns:
+        Validated subtype (lowercase).
+
+    Raises:
+        ValidationError: If the subtype is not in the allowlist.
+    """
+    if not subtype:
+        raise ValidationError("Subtype cannot be empty")
+    subtype = subtype.strip().lower()
+    if subtype not in VALID_EVENT_SUBTYPES:
+        raise ValidationError(
+            f"Invalid subtype '{subtype}'. "
+            f"Valid subtypes: {', '.join(sorted(VALID_EVENT_SUBTYPES))}"
+        )
+    return subtype
+
+
+def validate_cve(cve: str) -> str:
+    """Validate a CVE identifier (e.g. CVE-2025-2945).
+
+    Args:
+        cve: CVE identifier to validate.
+
+    Returns:
+        Validated CVE identifier (uppercase).
+
+    Raises:
+        ValidationError: If the value is not a valid CVE identifier.
+    """
+    if not cve:
+        raise ValidationError("CVE cannot be empty")
+    cve = cve.strip()
+    if not _CVE_RE.match(cve):
+        raise ValidationError(f"Invalid CVE identifier '{cve}'. Expected format: CVE-YYYY-NNNN.")
+    return cve.upper()
+
+
+def sanitize_filter_value(value: str, field: str = "filter value") -> str:
+    """Sanitize a free-text value for use in a FAZ log filter expression.
+
+    Safe alphanumeric values (including dots, hyphens, underscores, and
+    colons for IPv6) are returned as-is. Anything else is escaped and
+    wrapped in double quotes so that quote/operator/boolean characters in
+    attacker-controlled input cannot rewrite the surrounding filter.
+
+    Args:
+        value: Raw filter value.
+        field: Field name used in the error message.
+
+    Returns:
+        Sanitized value safe for interpolation into a filter expression.
+
+    Raises:
+        ValidationError: If the value is empty.
+    """
+    if not value:
+        raise ValidationError(f"{field} cannot be empty")
+    value = value.strip()
+    if not value:
+        raise ValidationError(f"{field} cannot be empty after stripping")
+    if _SAFE_UNQUOTED_FILTER_RE.match(value):
+        return value
+    # Escape backslashes first, then double quotes, then wrap in quotes.
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def validate_pcapurl(pcapurl: str) -> str:
+    """Validate a FortiAnalyzer pcapurl reference before forwarding to FAZ.
+
+    The ``pcapurl`` value originates from a FAZ IPS log entry and is an
+    internal resource reference (a path/token-style string), not an
+    arbitrary external URL. Forwarding an attacker-controlled value to
+    ``/logview/pcapfile`` should be constrained: reject absolute external
+    URLs (those with a scheme such as ``http://``), reject embedded control
+    characters / whitespace / backslashes, and cap the length.
+
+    Args:
+        pcapurl: The pcapurl value to validate.
+
+    Returns:
+        Validated pcapurl string (stripped).
+
+    Raises:
+        ValidationError: If the value does not look like a FAZ pcapurl
+            reference.
+    """
+    if not pcapurl:
+        raise ValidationError("pcapurl cannot be empty")
+
+    pcapurl = pcapurl.strip()
+
+    if not pcapurl:
+        raise ValidationError("pcapurl cannot be empty after stripping")
+
+    if len(pcapurl) > _PCAPURL_MAX_LEN:
+        raise ValidationError(
+            f"pcapurl too long ({len(pcapurl)} chars). Maximum is {_PCAPURL_MAX_LEN}."
+        )
+
+    # Reject control characters, whitespace, and backslashes outright.
+    if any(ord(ch) < 0x20 or ch in (" ", "\t", "\\") for ch in pcapurl):
+        raise ValidationError("pcapurl contains illegal whitespace or control characters")
+
+    # Reject absolute external URLs (anything with a URL scheme like http://,
+    # https://, ftp://, file://, etc.). A FAZ pcapurl is a relative reference.
+    if "://" in pcapurl or re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*:", pcapurl):
+        raise ValidationError(
+            f"Invalid pcapurl '{pcapurl}'. Expected a FortiAnalyzer resource reference, "
+            "not an absolute URL."
+        )
+
+    if not _PCAPURL_RE.match(pcapurl):
+        raise ValidationError(
+            f"Invalid pcapurl '{pcapurl}'. Contains characters not permitted in a "
+            "FortiAnalyzer resource reference."
+        )
+
+    return pcapurl
+
+
+# =============================================================================
 # Path Validation
 # =============================================================================
 
@@ -455,3 +776,32 @@ def validate_filename(filename: str) -> str:
         raise ValidationError(f"Invalid filename: {basename}")
 
     return basename
+
+
+def assert_within_directory(dest: Path, output_dir: Path) -> Path:
+    """Assert that a resolved destination path stays within an output dir.
+
+    Defense-in-depth guard for archive extraction: even when a filename has
+    already been reduced with ``os.path.basename``, this verifies the fully
+    resolved destination does not escape the intended output directory
+    (e.g. via symlinks or unexpected basename behaviour).
+
+    Args:
+        dest: Candidate output file path.
+        output_dir: The directory the file must stay within.
+
+    Returns:
+        The resolved destination path.
+
+    Raises:
+        ValidationError: If the resolved destination escapes output_dir.
+    """
+    resolved_dest = Path(dest).resolve()
+    resolved_dir = Path(output_dir).resolve()
+    try:
+        resolved_dest.relative_to(resolved_dir)
+    except ValueError as exc:
+        raise ValidationError(
+            f"Refusing to write '{resolved_dest}': path escapes output directory '{resolved_dir}'."
+        ) from exc
+    return resolved_dest

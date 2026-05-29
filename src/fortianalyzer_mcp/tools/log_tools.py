@@ -13,8 +13,16 @@ from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
     get_default_adom,
+    sanitize_filter_value,
     validate_adom,
+    validate_event_level,
+    validate_event_subtype,
+    validate_ip_or_cidr,
     validate_log_type,
+    validate_pcapurl,
+    validate_port,
+    validate_severity,
+    validate_traffic_action,
 )
 
 logger = logging.getLogger(__name__)
@@ -504,19 +512,25 @@ async def search_traffic_logs(
     """
     try:
         adom = adom or get_default_adom()
-        # Build filter string using FortiAnalyzer syntax
+        # Build filter string using FortiAnalyzer syntax.
+        # Every caller-supplied value is validated/sanitized before
+        # interpolation to prevent filter injection.
         filters = []
         if srcip:
-            filters.append(f"srcip=={srcip}")
+            filters.append(f"srcip=={validate_ip_or_cidr(srcip, 'srcip')}")
         if dstip:
-            filters.append(f"dstip=={dstip}")
+            filters.append(f"dstip=={validate_ip_or_cidr(dstip, 'dstip')}")
         if srcport:
-            filters.append(f"srcport=={srcport}")
+            filters.append(f"srcport=={validate_port(srcport, 'srcport')}")
         if dstport:
-            filters.append(f"dstport=={dstport}")
+            filters.append(f"dstport=={validate_port(dstport, 'dstport')}")
         if action:
-            filters.append(f"action=={action}")
+            filters.append(f"action=={validate_traffic_action(action)}")
         if policy_id:
+            if isinstance(policy_id, bool) or not isinstance(policy_id, int) or policy_id < 0:
+                raise ValidationError(
+                    f"Invalid policy_id '{policy_id}'. Must be a non-negative integer."
+                )
             filters.append(f"policyid=={policy_id}")
 
         filter_str = " and ".join(filters) if filters else None
@@ -587,16 +601,17 @@ async def search_security_logs(
     """
     try:
         adom = adom or get_default_adom()
-        # Build filter string
+        # Build filter string. Every caller-supplied value is validated or
+        # sanitized before interpolation to prevent filter injection.
         filters = []
         if attack_name:
-            filters.append(f"attack contain {attack_name}")
+            filters.append(f"attack contain {sanitize_filter_value(attack_name, 'attack_name')}")
         if severity:
-            filters.append(f"severity=={severity}")
+            filters.append(f"severity=={validate_severity(severity)}")
         if srcip:
-            filters.append(f"srcip=={srcip}")
+            filters.append(f"srcip=={validate_ip_or_cidr(srcip, 'srcip')}")
         if dstip:
-            filters.append(f"dstip=={dstip}")
+            filters.append(f"dstip=={validate_ip_or_cidr(dstip, 'dstip')}")
 
         filter_str = " and ".join(filters) if filters else None
 
@@ -668,12 +683,13 @@ async def search_event_logs(
     """
     try:
         adom = adom or get_default_adom()
-        # Build filter string
+        # Build filter string. Caller-supplied values are validated against
+        # allowlists before interpolation to prevent filter injection.
         filters = []
         if subtype:
-            filters.append(f"subtype=={subtype}")
+            filters.append(f"subtype=={validate_event_subtype(subtype)}")
         if level:
-            filters.append(f"level=={level}")
+            filters.append(f"level=={validate_event_level(level)}")
 
         filter_str = " and ".join(filters) if filters else None
 
@@ -772,6 +788,20 @@ async def get_pcap_file(
         >>> result = await get_pcap_file(log_entry['pcapurl'], key_type="pcapurl")
     """
     try:
+        # Validate key_type against the allowlist FAZ accepts.
+        if key_type not in ("log-data", "pcapurl"):
+            raise ValidationError(
+                f"Invalid key_type '{key_type}'. Must be 'log-data' or 'pcapurl'."
+            )
+
+        if not log_data:
+            raise ValidationError("log_data cannot be empty")
+
+        # When key_type is a pcapurl, constrain it to a FAZ resource reference
+        # rather than an arbitrary external URL before forwarding to FAZ.
+        if key_type == "pcapurl":
+            log_data = validate_pcapurl(log_data)
+
         client = _get_client()
         result = await client.get_pcapfile(log_data, key_type)
 
@@ -779,6 +809,8 @@ async def get_pcap_file(
             "status": "success",
             "data": result,
         }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to get PCAP file: {e}")
         return {"status": "error", "message": str(e)}

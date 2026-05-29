@@ -3,7 +3,7 @@
 [![CI](https://github.com/rstierli/fortianalyzer-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/rstierli/fortianalyzer-mcp/actions/workflows/ci.yml)
 [![Python Version](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.2.1--beta-green)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.3.0-green)](CHANGELOG.md)
 [![FortiAnalyzer](https://img.shields.io/badge/FortiAnalyzer-7.0%20%7C%207.2%20%7C%207.4%20%7C%207.6%20%7C%208.0-red)](README.md)
 
 A Model Context Protocol (MCP) server for FortiAnalyzer JSON-RPC API. This server enables AI assistants like Claude to interact with FortiAnalyzer for log analysis, reporting, security monitoring, and SOC operations.
@@ -102,18 +102,27 @@ services:
       - MCP_SERVER_HOST=0.0.0.0
       - MCP_SERVER_PORT=8001
       - FORTIANALYZER_HOST=your-faz-hostname
-      - FORTIANALYZER_VERIFY_SSL=false
+      - FORTIANALYZER_VERIFY_SSL=true
       - DEFAULT_ADOM=root
       - FAZ_TOOL_MODE=full
       - LOG_LEVEL=INFO
 ```
+
+> **Security:** Keep `FORTIANALYZER_VERIFY_SSL=true`. For a self-signed FAZ,
+> import the FAZ CA certificate into the container trust store rather than
+> disabling verification (disabling it exposes the FAZ API token to MITM).
+> In HTTP mode, binding to `0.0.0.0` with no `MCP_AUTH_TOKEN` leaves every tool
+> unauthenticated — always set a strong token (below) and, where possible,
+> publish the port only on an internal interface (e.g. `127.0.0.1:8001:8001`).
 
 Create a `.env` file for secrets (not tracked in git):
 
 ```bash
 # .env
 FORTIANALYZER_API_TOKEN=your-api-token
-MCP_AUTH_TOKEN=your-secret-bearer-token  # optional, enables HTTP auth
+# Required when running HTTP mode reachable beyond localhost — without it,
+# every tool is exposed unauthenticated. Generate with: openssl rand -hex 32
+MCP_AUTH_TOKEN=your-secret-bearer-token
 ```
 
 ```bash
@@ -151,8 +160,9 @@ FORTIANALYZER_API_TOKEN=your-api-token-here
 # FORTIANALYZER_USERNAME=admin
 # FORTIANALYZER_PASSWORD=your-password
 
-# SSL Verification (set to false for self-signed certificates)
-FORTIANALYZER_VERIFY_SSL=false
+# SSL Verification (keep true; import the FAZ CA for self-signed certs
+# instead of disabling — see the security note above)
+FORTIANALYZER_VERIFY_SSL=true
 
 # Request Settings
 FORTIANALYZER_TIMEOUT=30
@@ -209,7 +219,7 @@ Add to your Claude Desktop configuration file:
       "env": {
         "FORTIANALYZER_HOST": "your-faz-hostname",
         "FORTIANALYZER_API_TOKEN": "your-api-token",
-        "FORTIANALYZER_VERIFY_SSL": "false",
+        "FORTIANALYZER_VERIFY_SSL": "true",
         "DEFAULT_ADOM": "root",
         "LOG_LEVEL": "INFO"
       }
@@ -232,7 +242,7 @@ Add to `~/.claude/mcp_servers.json`:
       "env": {
         "FORTIANALYZER_HOST": "your-faz-hostname",
         "FORTIANALYZER_API_TOKEN": "your-api-token",
-        "FORTIANALYZER_VERIFY_SSL": "false",
+        "FORTIANALYZER_VERIFY_SSL": "true",
         "DEFAULT_ADOM": "root",
         "LOG_LEVEL": "INFO"
       }
@@ -311,7 +321,7 @@ MCP Client → HTTPS → Reverse Proxy (Traefik/nginx) → HTTP → MCP Containe
    MCP_ALLOWED_HOSTS=["10.1.5.62:*"]
    ```
 
-2. **MCP_AUTH_TOKEN** — Always set a Bearer token for HTTP deployments:
+2. **MCP_AUTH_TOKEN** — Always set a Bearer token for HTTP deployments. If it is unset, the server runs **fail-open**: every tool (log search, device add/delete, PCAP download) is exposed unauthenticated to anyone who can reach the port.
 
    ```bash
    MCP_AUTH_TOKEN=$(openssl rand -hex 32)
@@ -336,7 +346,7 @@ services:
       - MCP_SERVER_HOST=0.0.0.0
       - MCP_SERVER_PORT=8001
       - FORTIANALYZER_HOST=your-faz-hostname
-      - FORTIANALYZER_VERIFY_SSL=false
+      - FORTIANALYZER_VERIFY_SSL=true
       - MCP_ALLOWED_HOSTS=["mcp.example.com"]
       - DEFAULT_ADOM=root
       - FAZ_TOOL_MODE=full
@@ -641,8 +651,9 @@ LOG_LEVEL=DEBUG fortianalyzer-mcp
 - Ensure the account has sufficient permissions
 
 **SSL Certificate Errors**
-- Set `FORTIANALYZER_VERIFY_SSL=false` for self-signed certificates
-- For production, use valid SSL certificates
+- Preferred fix: import the FortiAnalyzer CA certificate into your system/container trust store so verification succeeds
+- `FORTIANALYZER_VERIFY_SSL=false` works around self-signed certs but is insecure — it exposes the FAZ API token and all log/PCAP data to man-in-the-middle interception. Avoid it outside isolated lab use.
+- For production, use a valid (CA-trusted) SSL certificate on the FAZ
 
 **Report Generation Issues**
 - Ensure the report layout exists (use `list_report_layouts`)
@@ -732,6 +743,7 @@ Integration tests require a real FortiAnalyzer instance and are not run in CI.
 # Set up environment
 export FORTIANALYZER_HOST=your-faz-host
 export FORTIANALYZER_API_TOKEN=your-token
+# Only for an isolated lab FAZ with a self-signed cert; keep true otherwise.
 export FORTIANALYZER_VERIFY_SSL=false
 
 # Run integration tests (requires live FAZ)
@@ -775,7 +787,7 @@ When running in HTTP mode (Docker), you can secure the MCP endpoint with Bearer 
 MCP_AUTH_TOKEN=your-secret-token
 ```
 
-When configured, all HTTP requests (except `/health`) must include the `Authorization: Bearer <token>` header. If not set, the server runs without authentication (backwards compatible).
+When configured, all HTTP requests (except `/health`) must include the `Authorization: Bearer <token>` header. If not set, the server runs **fail-open**: it accepts all requests without authentication (kept for backwards compatibility). In HTTP mode this means every tool — including device add/delete and PCAP download — is reachable by anyone who can connect to the port. Always set `MCP_AUTH_TOKEN` for any HTTP deployment reachable beyond `127.0.0.1`, and prefer binding to an internal interface.
 
 ### Environment File Permissions
 
