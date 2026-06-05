@@ -113,6 +113,11 @@ class TestValidatePolicyIds:
         ids = list(range(1, ANALYSIS_QUERY_BUDGET + 1))
         assert validate_policy_ids(ids) == ids
 
+    def test_bool_rejected(self) -> None:
+        """Booleans must be rejected even though bool is an int subclass."""
+        with pytest.raises(ValidationError, match="positive integer"):
+            validate_policy_ids([True])
+
 
 # =============================================================================
 # Bounded analysis planning
@@ -483,9 +488,45 @@ class TestPolicyPortAnalysisToolBounded:
 
         assert result["status"] == "success"
         assert result["results"][0]["policy_id"] == 1
-        assert result["results"][0]["error"] == "policy failed"
+        assert result["results"][0]["error"] == "policy_query_failed"
+        assert result["results"][0]["message"] == "policy failed"
         assert result["results"][1]["policy_id"] == 2
         assert result["results"][1]["observed_hits"] == 1
+
+
+class TestPolicyToolAuditMetadata:
+    """Top-level audit metadata and per-policy filter echo."""
+
+    async def test_top_level_audit_and_per_policy_filter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def fake_estimate(*_args: object, **_kwargs: object) -> dict[int, int]:
+            return {}
+
+        async def fake_slice(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            return [{"dstport": 443, "proto": "6"}]
+
+        monkeypatch.setattr(traffic_tools, "_estimate_policy_hits_best_effort", fake_estimate)
+        monkeypatch.setattr(traffic_tools, "_query_policy_log_slice", fake_slice)
+
+        result = await traffic_tools.get_policy_port_analysis(
+            adom="root",
+            device="FGT70FTK22019321",
+            policy_ids=[2],
+            action="accept",
+            time_range="2024-01-01 00:00:00|2024-01-02 00:00:00",
+        )
+
+        assert result["status"] == "success"
+        assert result["adom"] == "root"
+        assert result["time_range"] == {
+            "start": "2024-01-01 00:00:00",
+            "end": "2024-01-02 00:00:00",
+        }
+        # Custom absolute range skips the TZ client lookup in unit tests.
+        assert result["timezone"] == "unknown"
+        assert result["results"][0]["filter"] == "policyid==2 and action==accept"
 
 
 # =============================================================================

@@ -9,6 +9,7 @@ import logging
 from typing import Any
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
+from fortianalyzer_mcp.utils.responses import build_warnings, error_response, redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
@@ -90,19 +91,21 @@ def _is_invalid_tid_error(exc: Exception) -> bool:
     )
 
 
-def _tid_error_response(tid: int, adom: str, detail: object) -> dict[str, Any]:
+def _tid_error_response(
+    tid: int, adom: str, detail: object, operation: str = "fetch_more_logs"
+) -> dict[str, Any]:
     """Build a structured error response for an invalid/expired tid/handle."""
-    return {
-        "status": "error",
-        "error_type": "tid_invalid_or_expired",
-        "tid": tid,
-        "adom": adom,
-        "message": (
+    return error_response(
+        error="tid_invalid_or_expired",
+        message=(
             f"Search handle {tid} is no longer valid on FortiAnalyzer "
             f"(adom={adom}). It may have expired or been cancelled. Detail: {detail}"
         ),
-        "recommendation": "Re-run query_logs to start a new search and obtain a fresh tid.",
-    }
+        operation=operation,
+        adom=adom,
+        tid=tid,
+        recommendation="Re-run query_logs to start a new search and obtain a fresh tid.",
+    )
 
 
 def _clamp_limit(limit: int) -> int:
@@ -124,6 +127,8 @@ def _compute_has_more(offset: int, count: int, limit: int, total: int | None) ->
     unknown, fall back to the full-page heuristic: a page filled to the limit
     implies more rows may exist.
     """
+    if count == 0:
+        return False
     if total is not None:
         return (offset + count) < total
     return limit > 0 and count >= limit
@@ -326,17 +331,20 @@ async def query_logs(
             - status: "success" or "error"
             - count: Number of logs returned in this page
             - total: Total logs matching the query (int), or None if unknown
-            - total_known: Whether `total` is authoritative (False => unknown/capped)
+            - total_is_known: Whether `total` is authoritative (False => unknown)
             - percentage: Search completion percentage (100 on success)
             - tid: Reusable pagination handle (pass to fetch_more_logs)
             - has_more: Whether more results remain beyond this page
+            - next_offset: Offset to pass to fetch_more_logs, or None when has_more is False
             - logs: List of log entries (bounded by `limit`)
             - adom, logtype, filter, device: Echoed query context (auditability)
             - time_range: Resolved {start, end} bounds actually sent to FAZ
             - timezone: FAZ system timezone the timestamps are interpreted in
             - time_basis: Human note clarifying timestamps are FAZ local time
-            - returned_offset, returned_limit: Paging echoes
-            - message: Error message if failed
+            - offset, limit: Paging echoes (the clamped values actually used)
+            - warnings: Advisory strings (clamp, unknown total/timezone, high volume)
+        On error, a structured envelope: {status: "error", error: <machine code>,
+        message, operation, retry_count, plus adom/logtype/tid where relevant}.
 
     Note on pagination: a FortiAnalyzer logsearch task id is single-use (it is
     reaped after the first fetch). The `tid` returned here is a reusable handle
@@ -372,16 +380,26 @@ async def query_logs(
         try:
             time_range_dict = parse_time_range(time_range, faz_tz=faz_tz)
         except ValueError as e:
-            return {"status": "error", "message": f"Invalid time_range: {e}"}
+            return error_response(
+                error="invalid_time_range",
+                message=f"Invalid time_range: {e}",
+                operation="query_logs",
+                adom=adom,
+                logtype=logtype,
+            )
 
         # Build device filter
         device_filter = _build_device_filter(device)
 
+        requested_limit = limit
         limit = _clamp_limit(limit)
         offset = max(0, offset)
 
         # Run this page as a self-contained search (FAZ tids are single-use).
-        logger.info(f"Starting log search: adom={adom}, logtype={logtype}, filter={filter}")
+        logger.info(
+            f"Starting log search: adom={adom}, logtype={logtype}, "
+            f"filter={redact(str(filter))[:200]}"
+        )
         page = await _run_search_page(
             client,
             adom=adom,
@@ -395,21 +413,37 @@ async def query_logs(
         )
 
         if page["timed_out"]:
-            return {
-                "status": "error",
-                "error_type": "search_timeout",
-                "message": f"Search timed out after {timeout} seconds",
-                "adom": adom,
-                "time_range": time_range_dict,
-                "timezone": tz_name,
-            }
+            return error_response(
+                error="search_timeout",
+                message=f"Search timed out after {timeout} seconds",
+                operation="query_logs",
+                adom=adom,
+                logtype=logtype,
+                time_range=time_range_dict,
+                timezone=tz_name,
+            )
 
         logs = page["logs"]
         count = len(logs)
         total = page["total"]
-        total_known = total is not None
+        total_is_known = total is not None
         has_more = _compute_has_more(offset, count, limit, total)
+        next_offset = offset + count if has_more else None
         handle = page["tid"]
+
+        warnings = build_warnings(
+            requested_limit=requested_limit,
+            limit=limit,
+            total=total,
+            total_is_known=total_is_known,
+            timezone=tz_name,
+            has_more=has_more,
+        )
+        if count == 0 and total_is_known and total is not None and total > offset:
+            warnings.append(
+                "FortiAnalyzer reports more matching rows beyond this offset but returned "
+                "an empty page; the search task may have been reaped -- re-run query_logs."
+            )
 
         # Record the search parameters under the handle so fetch_more_logs can
         # reconstruct and re-run the query at a new offset (the appliance tid is
@@ -430,10 +464,11 @@ async def query_logs(
             "status": "success",
             "count": count,
             "total": total,
-            "total_known": total_known,
+            "total_is_known": total_is_known,
             "percentage": 100,
             "tid": handle,
             "has_more": has_more,
+            "next_offset": next_offset,
             "logs": logs,
             "adom": adom,
             "logtype": logtype,
@@ -444,15 +479,29 @@ async def query_logs(
             "time_basis": (
                 f"time_range and log timestamps are interpreted in FAZ local time ({tz_name})"
             ),
-            "returned_offset": offset,
-            "returned_limit": limit,
+            "offset": offset,
+            "limit": limit,
+            "warnings": warnings,
         }
 
     except ValidationError as e:
-        return {"status": "error", "message": f"Validation error: {e}"}
+        return error_response(
+            error="validation_error",
+            message=f"Validation error: {e}",
+            operation="query_logs",
+            adom=adom,
+            logtype=logtype,
+        )
     except Exception as e:
         logger.error(f"Failed to query logs: {e}")
-        return {"status": "error", "message": str(e)}
+        return error_response(
+            error="faz_operation_failed",
+            message=str(e),
+            operation="query_logs",
+            adom=adom,
+            logtype=logtype,
+            retry_count=getattr(e, "retries_attempted", 0),
+        )
 
 
 @mcp.tool()
@@ -477,11 +526,18 @@ async def get_log_search_progress(
         tid_invalid_or_expired error if the handle is unknown to this process.
     """
     if tid <= 0:
-        return {"status": "error", "message": "Invalid TID"}
+        return error_response(
+            error="invalid_tid", message="Invalid TID", operation="get_log_search_progress"
+        )
 
     context = _get_search_context(tid)
     if context is None:
-        return _tid_error_response(tid, get_default_adom(), "search handle is not known")
+        return _tid_error_response(
+            tid,
+            get_default_adom(),
+            "search handle is not known",
+            operation="get_log_search_progress",
+        )
 
     return {
         "status": "success",
@@ -509,7 +565,7 @@ async def fetch_more_logs(
     offset/limit using the search parameters recorded for `tid`. You normally
     only pass tid/offset/limit. If the handle is unknown to this server process
     (expired or from another process), the response is a structured error with
-    error_type="tid_invalid_or_expired" and a recommendation to re-run query_logs.
+    error="tid_invalid_or_expired" and a recommendation to re-run query_logs.
 
     Args:
         adom: ADOM name (default: reuse the ADOM query_logs used for this handle)
@@ -522,11 +578,14 @@ async def fetch_more_logs(
             - status: "success" or "error"
             - count: Number of logs returned in this page
             - logs: List of log entries
-            - tid, adom: Echoed pagination context
-            - total, total_known, has_more: Pagination metadata
-            - returned_offset, returned_limit: Paging echoes
+            - tid, adom, logtype, filter, device: Echoed pagination context
+            - total, total_is_known, has_more: Pagination metadata
+            - next_offset: Offset for the next page, or None when has_more is False
+            - offset, limit: Paging echoes (the clamped values actually used)
             - timezone, time_basis: FAZ timezone context
-            - error_type, message, recommendation: On error (e.g. unknown handle)
+            - warnings: Advisory strings
+        On error, a structured envelope: {status: "error", error: <machine code>,
+        message, operation, retry_count, plus tid/adom/recommendation where relevant}.
 
     Example:
         >>> # Get first 100 logs
@@ -538,10 +597,11 @@ async def fetch_more_logs(
     """
     try:
         if tid <= 0:
-            return {
-                "status": "error",
-                "message": "Invalid TID. Provide the tid returned by query_logs.",
-            }
+            return error_response(
+                error="invalid_tid",
+                message="Invalid TID. Provide the tid returned by query_logs.",
+                operation="fetch_more_logs",
+            )
 
         # Reconstruct the search from the parameters recorded for this handle.
         context = _get_search_context(tid)
@@ -556,6 +616,7 @@ async def fetch_more_logs(
             adom = context["adom"]
         adom = validate_adom(adom)
 
+        requested_limit = limit
         limit = _clamp_limit(limit)
         offset = max(0, offset)
 
@@ -575,20 +636,36 @@ async def fetch_more_logs(
         )
 
         if page["timed_out"]:
-            return {
-                "status": "error",
-                "error_type": "search_timeout",
-                "message": f"Search timed out after {DEFAULT_SEARCH_TIMEOUT} seconds",
-                "tid": tid,
-                "adom": adom,
-            }
+            return error_response(
+                error="search_timeout",
+                message=f"Search timed out after {DEFAULT_SEARCH_TIMEOUT} seconds",
+                operation="fetch_more_logs",
+                adom=adom,
+                logtype=context.get("logtype"),
+                tid=tid,
+            )
 
         logs = page["logs"]
         count = len(logs)
         total = page["total"]
-        total_known = total is not None
+        total_is_known = total is not None
         has_more = _compute_has_more(offset, count, limit, total)
+        next_offset = offset + count if has_more else None
         timezone = context.get("timezone", "unknown")
+
+        warnings = build_warnings(
+            requested_limit=requested_limit,
+            limit=limit,
+            total=total,
+            total_is_known=total_is_known,
+            timezone=timezone,
+            has_more=has_more,
+        )
+        if count == 0 and total_is_known and total is not None and total > offset:
+            warnings.append(
+                "FortiAnalyzer reports more matching rows beyond this offset but returned "
+                "an empty page; the search task may have been reaped -- re-run query_logs."
+            )
 
         return {
             "status": "success",
@@ -601,18 +678,32 @@ async def fetch_more_logs(
             "device": context.get("device"),
             "time_range": context.get("time_range"),
             "total": total,
-            "total_known": total_known,
+            "total_is_known": total_is_known,
             "has_more": has_more,
-            "returned_offset": offset,
-            "returned_limit": limit,
+            "next_offset": next_offset,
+            "offset": offset,
+            "limit": limit,
             "timezone": timezone,
             "time_basis": f"log timestamps are interpreted in FAZ local time ({timezone})",
+            "warnings": warnings,
         }
     except ValidationError as e:
-        return {"status": "error", "message": f"Validation error: {e}"}
+        return error_response(
+            error="validation_error",
+            message=f"Validation error: {e}",
+            operation="fetch_more_logs",
+            tid=tid,
+        )
     except Exception as e:
         logger.error(f"Failed to fetch more logs: {e}")
-        return {"status": "error", "message": str(e)}
+        return error_response(
+            error="faz_operation_failed",
+            message=str(e),
+            operation="fetch_more_logs",
+            adom=adom,
+            tid=tid,
+            retry_count=getattr(e, "retries_attempted", 0),
+        )
 
 
 @mcp.tool()
@@ -641,7 +732,9 @@ async def cancel_log_search(
     """
     try:
         if tid <= 0:
-            return {"status": "error", "message": "Invalid TID"}
+            return error_response(
+                error="invalid_tid", message="Invalid TID", operation="cancel_log_search"
+            )
 
         # Use the ADOM query_logs ran under when the caller omits it.
         context = _get_search_context(tid)
@@ -666,7 +759,13 @@ async def cancel_log_search(
         }
     except Exception as e:
         logger.error(f"Failed to cancel search: {e}")
-        return {"status": "error", "message": str(e)}
+        return error_response(
+            error="faz_operation_failed",
+            message=str(e),
+            operation="cancel_log_search",
+            tid=tid,
+            retry_count=getattr(e, "retries_attempted", 0),
+        )
 
 
 @mcp.tool()
@@ -834,9 +933,22 @@ async def search_traffic_logs(
 
         return result
 
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=f"Validation error: {e}",
+            operation="search_traffic_logs",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to search traffic logs: {e}")
-        return {"status": "error", "message": str(e)}
+        return error_response(
+            error="faz_operation_failed",
+            message=str(e),
+            operation="search_traffic_logs",
+            adom=adom,
+            retry_count=getattr(e, "retries_attempted", 0),
+        )
 
 
 @mcp.tool()
@@ -914,9 +1026,22 @@ async def search_security_logs(
 
         return result
 
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=f"Validation error: {e}",
+            operation="search_security_logs",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to search security logs: {e}")
-        return {"status": "error", "message": str(e)}
+        return error_response(
+            error="faz_operation_failed",
+            message=str(e),
+            operation="search_security_logs",
+            adom=adom,
+            retry_count=getattr(e, "retries_attempted", 0),
+        )
 
 
 @mcp.tool()
@@ -992,9 +1117,22 @@ async def search_event_logs(
 
         return result
 
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=f"Validation error: {e}",
+            operation="search_event_logs",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to search event logs: {e}")
-        return {"status": "error", "message": str(e)}
+        return error_response(
+            error="faz_operation_failed",
+            message=str(e),
+            operation="search_event_logs",
+            adom=adom,
+            retry_count=getattr(e, "retries_attempted", 0),
+        )
 
 
 @mcp.tool()

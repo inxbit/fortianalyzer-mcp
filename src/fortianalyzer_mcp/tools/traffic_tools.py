@@ -14,10 +14,12 @@ import logging
 import re
 import time
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
+from fortianalyzer_mcp.utils.responses import error_response
 from fortianalyzer_mcp.utils.time_range import (
     parse_time_range,
     parse_time_range_bounds,
@@ -95,7 +97,7 @@ def validate_policy_ids(policy_ids: list[int]) -> list[int]:
             f"Too many policy IDs ({len(policy_ids)}). Maximum is {MAX_POLICY_IDS}."
         )
     for pid in policy_ids:
-        if not isinstance(pid, int) or pid <= 0:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
             raise ValidationError(f"Invalid policy ID: {pid}. Must be a positive integer.")
     return policy_ids
 
@@ -169,6 +171,24 @@ async def _parse_time_range(time_range: str) -> dict[str, str]:
     client = _get_client()
     faz_tz = await client.get_system_timezone()
     return parse_time_range(time_range, faz_tz=faz_tz)
+
+
+async def _resolve_window(time_range: str) -> tuple[dict[str, str], str]:
+    """Resolve the query window once and report the FAZ timezone name.
+
+    Custom absolute ranges (``"start|end"``) skip the TZ client lookup -- the
+    caller already supplied explicit timestamps -- and report timezone
+    ``"unknown"``. Relative presets pull the FAZ system timezone so the naive
+    bounds land in FAZ-local time. Resolving here once keeps the reported
+    ``time_range``, the bounded slices, and the FortiView estimate on a single
+    window (no seconds-level drift from re-parsing relative ranges).
+    """
+    if "|" in time_range:
+        return parse_time_range(time_range), "unknown"
+    client = _get_client()
+    faz_tz = await client.get_system_timezone()
+    tz_name = str(faz_tz) if faz_tz else "unknown"
+    return parse_time_range(time_range, faz_tz=faz_tz), tz_name
 
 
 # parse_time_range_bounds is re-exported from utils.time_range above.
@@ -322,15 +342,19 @@ async def _query_policy_logs_bounded(
     adom: str,
     device: str | None,
     policy_id: int,
-    time_range: str,
+    time_range: dict[str, str],
     action: str | None,
     policy_count: int,
     limit: int = LOG_FETCH_LIMIT,
     timeout: int = DEFAULT_SEARCH_TIMEOUT,
 ) -> dict[str, Any]:
-    """Query fixed bounded slices for one policy and report truncation metadata."""
+    """Query fixed bounded slices for one policy and report truncation metadata.
+
+    ``time_range`` is the already-resolved ``{start, end}`` window (resolved once
+    by the caller) so slices, estimate, and reported metadata share one window.
+    """
     async with _QUERY_SEMAPHORE:
-        full_time_range = await _parse_time_range(time_range)
+        full_time_range = time_range
         device_filter = _build_device_filter(device)
         slice_count = _plan_policy_slice_count(full_time_range, policy_count)
         time_slices = _build_bounded_time_slices(full_time_range, slice_count)
@@ -381,14 +405,17 @@ async def _estimate_policy_hits(
     adom: str,
     device: str | None,
     policy_ids: list[int],
-    time_range: str,
+    time_range: dict[str, str],
     action: str | None,
     timeout: int = 30,
 ) -> dict[int, int]:
-    """Fetch one bounded FortiView policy-hits page as optional metadata."""
+    """Fetch one bounded FortiView policy-hits page as optional metadata.
+
+    ``time_range`` is the already-resolved ``{start, end}`` window.
+    """
     client = _get_client()
     device_filter = _build_device_filter(device)
-    time_range_dict = await _parse_time_range(time_range)
+    time_range_dict = time_range
 
     run_result = await client.fortiview_run(
         adom=adom,
@@ -440,7 +467,7 @@ async def _estimate_policy_hits_best_effort(
     adom: str,
     device: str | None,
     policy_ids: list[int],
-    time_range: str,
+    time_range: dict[str, str],
     action: str | None,
 ) -> dict[int, int]:
     """Return FortiView estimates when available without failing the caller."""
@@ -616,6 +643,126 @@ def _aggregate_protocol_summary(logs: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+async def _run_bounded_policy_analysis(
+    *,
+    operation: str,
+    adom: str | None,
+    device: str | None,
+    policy_ids: list[int] | None,
+    time_range: str,
+    action: str | None,
+    aggregate: Callable[[list[dict[str, Any]]], dict[str, Any]],
+) -> dict[str, Any]:
+    """Shared driver for the bounded per-policy analysis tools.
+
+    Resolves the time window once (so the reported time_range, the bounded
+    slices, and the FortiView estimate share one window), runs the estimate
+    alongside bounded per-policy log queries, and assembles top-level audit
+    metadata plus per-policy results. ``aggregate`` turns one policy's log rows
+    into the tool-specific summary dict.
+    """
+    adom_value: str | None = adom
+    try:
+        adom_value = validate_adom(adom or get_default_adom())
+        if policy_ids is None:
+            return error_response(
+                error="validation_error",
+                message="policy_ids is required",
+                operation=operation,
+                adom=adom_value,
+            )
+        policy_ids = validate_policy_ids(policy_ids)
+        action = validate_action(action)
+
+        try:
+            window, tz_name = await _resolve_window(time_range)
+        except ValueError as e:
+            return error_response(
+                error="invalid_time_range",
+                message=f"Invalid time_range: {e}",
+                operation=operation,
+                adom=adom_value,
+            )
+
+        start = time.monotonic()
+        estimate_task = _estimate_policy_hits_best_effort(
+            adom_value, device, policy_ids, window, action
+        )
+        query_tasks = [
+            _query_policy_logs_bounded(
+                adom_value, device, pid, window, action, policy_count=len(policy_ids)
+            )
+            for pid in policy_ids
+        ]
+        all_results = await asyncio.gather(estimate_task, *query_tasks, return_exceptions=True)
+        estimates = all_results[0] if isinstance(all_results[0], dict) else {}
+        results_list = all_results[1:]
+
+        per_policy = []
+        for pid, result in zip(policy_ids, results_list, strict=True):
+            policy_filter = _build_policy_filter(pid, action)
+            if isinstance(result, Exception):
+                per_policy.append(
+                    {
+                        "policy_id": pid,
+                        "error": "policy_query_failed",
+                        "message": str(result),
+                        "filter": policy_filter,
+                    }
+                )
+            else:
+                policy_result = cast(dict[str, Any], result)
+                logs = policy_result["logs"]
+                entry = aggregate(logs)
+                entry.update(
+                    _bounded_metadata(
+                        observed_hits=len(logs),
+                        slices_scanned=policy_result["slices_scanned"],
+                        truncated_slices=policy_result["truncated_slices"],
+                        estimated_total_hits=estimates.get(pid),
+                    )
+                )
+                entry["policy_id"] = pid
+                entry["filter"] = policy_filter
+                per_policy.append(entry)
+
+        elapsed = time.monotonic() - start
+        return {
+            "status": "success",
+            "adom": adom_value,
+            "time_range": window,
+            "timezone": tz_name,
+            "results": per_policy,
+            "query_time_seconds": round(elapsed, 2),
+        }
+
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=f"Validation error: {e}",
+            operation=operation,
+            adom=adom_value,
+        )
+    except (OSError, TimeoutError) as e:
+        logger.error(f"Network error in {operation}: {e}")
+        return error_response(
+            error="network_error",
+            message=f"Network error: {e}",
+            operation=operation,
+            adom=adom_value,
+            retry_count=getattr(e, "retries_attempted", 0),
+        )
+    except Exception as e:
+        logger.error(f"Error in {operation}: {e}")
+        return error_response(
+            error="faz_operation_failed",
+            message=str(e),
+            operation=operation,
+            adom=adom_value,
+            retry_count=getattr(e, "retries_attempted", 0),
+        )
+
+
 # =============================================================================
 # MCP Tool Functions
 # =============================================================================
@@ -663,76 +810,17 @@ async def get_policy_traffic_profile(
         ...     action="accept"
         ... )
     """
-    try:
-        adom = validate_adom(adom or get_default_adom())
-        if policy_ids is None:
-            return {"status": "error", "message": "policy_ids is required"}
-        policy_ids = validate_policy_ids(policy_ids)
-        action = validate_action(action)
-
-        if top_n < 1:
-            top_n = DEFAULT_TOP_N
-
-        start = time.monotonic()
-
-        # Run FortiView estimate concurrently with bounded log queries
-        estimate_task = _estimate_policy_hits_best_effort(
-            adom, device, policy_ids, time_range, action
-        )
-        query_tasks = [
-            _query_policy_logs_bounded(
-                adom,
-                device,
-                pid,
-                time_range,
-                action,
-                policy_count=len(policy_ids),
-            )
-            for pid in policy_ids
-        ]
-        all_results = await asyncio.gather(estimate_task, *query_tasks, return_exceptions=True)
-        estimates = all_results[0] if isinstance(all_results[0], dict) else {}
-        results_list = all_results[1:]
-
-        per_policy = []
-        for pid, result in zip(policy_ids, results_list, strict=True):
-            if isinstance(result, Exception):
-                per_policy.append(
-                    {
-                        "policy_id": pid,
-                        "error": str(result),
-                    }
-                )
-            else:
-                policy_result = cast(dict[str, Any], result)
-                logs = policy_result["logs"]
-                profile = _aggregate_traffic_profile(logs, top_n)
-                profile.update(
-                    _bounded_metadata(
-                        observed_hits=len(logs),
-                        slices_scanned=policy_result["slices_scanned"],
-                        truncated_slices=policy_result["truncated_slices"],
-                        estimated_total_hits=estimates.get(pid),
-                    )
-                )
-                profile["policy_id"] = pid
-                per_policy.append(profile)
-
-        elapsed = time.monotonic() - start
-
-        return {
-            "status": "success",
-            "results": per_policy,
-            "query_time_seconds": round(elapsed, 2),
-        }
-
-    except ValidationError as e:
-        return {"status": "error", "message": f"Validation error: {e}"}
-    except RuntimeError as e:
-        return {"status": "error", "message": str(e)}
-    except (OSError, TimeoutError) as e:
-        logger.error(f"Network error in get_policy_traffic_profile: {e}")
-        return {"status": "error", "message": f"Network error: {e}"}
+    if top_n < 1:
+        top_n = DEFAULT_TOP_N
+    return await _run_bounded_policy_analysis(
+        operation="get_policy_traffic_profile",
+        adom=adom,
+        device=device,
+        policy_ids=policy_ids,
+        time_range=time_range,
+        action=action,
+        aggregate=lambda logs: _aggregate_traffic_profile(logs, top_n),
+    )
 
 
 @mcp.tool()
@@ -783,73 +871,15 @@ async def get_policy_port_analysis(
         ...     time_range="7-day"
         ... )
     """
-    try:
-        adom = validate_adom(adom or get_default_adom())
-        if policy_ids is None:
-            return {"status": "error", "message": "policy_ids is required"}
-        policy_ids = validate_policy_ids(policy_ids)
-        action = validate_action(action)
-
-        start = time.monotonic()
-
-        # Run FortiView estimate concurrently with bounded log queries
-        estimate_task = _estimate_policy_hits_best_effort(
-            adom, device, policy_ids, time_range, action
-        )
-        query_tasks = [
-            _query_policy_logs_bounded(
-                adom,
-                device,
-                pid,
-                time_range,
-                action,
-                policy_count=len(policy_ids),
-            )
-            for pid in policy_ids
-        ]
-        all_results = await asyncio.gather(estimate_task, *query_tasks, return_exceptions=True)
-        estimates = all_results[0] if isinstance(all_results[0], dict) else {}
-        results_list = all_results[1:]
-
-        per_policy = []
-        for pid, result in zip(policy_ids, results_list, strict=True):
-            if isinstance(result, Exception):
-                per_policy.append(
-                    {
-                        "policy_id": pid,
-                        "error": str(result),
-                    }
-                )
-            else:
-                policy_result = cast(dict[str, Any], result)
-                logs = policy_result["logs"]
-                analysis = _aggregate_port_analysis(logs)
-                analysis.update(
-                    _bounded_metadata(
-                        observed_hits=len(logs),
-                        slices_scanned=policy_result["slices_scanned"],
-                        truncated_slices=policy_result["truncated_slices"],
-                        estimated_total_hits=estimates.get(pid),
-                    )
-                )
-                analysis["policy_id"] = pid
-                per_policy.append(analysis)
-
-        elapsed = time.monotonic() - start
-
-        return {
-            "status": "success",
-            "results": per_policy,
-            "query_time_seconds": round(elapsed, 2),
-        }
-
-    except ValidationError as e:
-        return {"status": "error", "message": f"Validation error: {e}"}
-    except RuntimeError as e:
-        return {"status": "error", "message": str(e)}
-    except (OSError, TimeoutError) as e:
-        logger.error(f"Network error in get_policy_port_analysis: {e}")
-        return {"status": "error", "message": f"Network error: {e}"}
+    return await _run_bounded_policy_analysis(
+        operation="get_policy_port_analysis",
+        adom=adom,
+        device=device,
+        policy_ids=policy_ids,
+        time_range=time_range,
+        action=action,
+        aggregate=_aggregate_port_analysis,
+    )
 
 
 @mcp.tool()
@@ -891,70 +921,12 @@ async def get_policy_protocol_summary(
         ...     time_range="24-hour"
         ... )
     """
-    try:
-        adom = validate_adom(adom or get_default_adom())
-        if policy_ids is None:
-            return {"status": "error", "message": "policy_ids is required"}
-        policy_ids = validate_policy_ids(policy_ids)
-        action = validate_action(action)
-
-        start = time.monotonic()
-
-        # Run FortiView estimate concurrently with bounded log queries
-        estimate_task = _estimate_policy_hits_best_effort(
-            adom, device, policy_ids, time_range, action
-        )
-        query_tasks = [
-            _query_policy_logs_bounded(
-                adom,
-                device,
-                pid,
-                time_range,
-                action,
-                policy_count=len(policy_ids),
-            )
-            for pid in policy_ids
-        ]
-        all_results = await asyncio.gather(estimate_task, *query_tasks, return_exceptions=True)
-        estimates = all_results[0] if isinstance(all_results[0], dict) else {}
-        results_list = all_results[1:]
-
-        per_policy = []
-        for pid, result in zip(policy_ids, results_list, strict=True):
-            if isinstance(result, Exception):
-                per_policy.append(
-                    {
-                        "policy_id": pid,
-                        "error": str(result),
-                    }
-                )
-            else:
-                policy_result = cast(dict[str, Any], result)
-                logs = policy_result["logs"]
-                summary = _aggregate_protocol_summary(logs)
-                summary.update(
-                    _bounded_metadata(
-                        observed_hits=len(logs),
-                        slices_scanned=policy_result["slices_scanned"],
-                        truncated_slices=policy_result["truncated_slices"],
-                        estimated_total_hits=estimates.get(pid),
-                    )
-                )
-                summary["policy_id"] = pid
-                per_policy.append(summary)
-
-        elapsed = time.monotonic() - start
-
-        return {
-            "status": "success",
-            "results": per_policy,
-            "query_time_seconds": round(elapsed, 2),
-        }
-
-    except ValidationError as e:
-        return {"status": "error", "message": f"Validation error: {e}"}
-    except RuntimeError as e:
-        return {"status": "error", "message": str(e)}
-    except (OSError, TimeoutError) as e:
-        logger.error(f"Network error in get_policy_protocol_summary: {e}")
-        return {"status": "error", "message": f"Network error: {e}"}
+    return await _run_bounded_policy_analysis(
+        operation="get_policy_protocol_summary",
+        adom=adom,
+        device=device,
+        policy_ids=policy_ids,
+        time_range=time_range,
+        action=action,
+        aggregate=_aggregate_protocol_summary,
+    )

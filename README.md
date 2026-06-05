@@ -418,12 +418,33 @@ networks:
 | `get_pcap_file` | Download PCAP file for an IPS event |
 
 > **Paginating log results:** call `query_logs(..., limit=N)`, then page with
-> `fetch_more_logs(tid=<handle>, offset=..., limit=...)`. The returned `tid` is a
-> reusable pagination handle — FortiAnalyzer logsearch task ids are single-use,
-> so `fetch_more_logs` re-runs the same query at the new offset (results are
-> stably ordered for a fixed time window). Timestamps in `time_range` and the
-> returned logs are interpreted in the FAZ system timezone reported as
-> `timezone`. Call `cancel_log_search(tid=<handle>)` when finished.
+> `fetch_more_logs(tid=<handle>, offset=next_offset, limit=...)`. The returned
+> `tid` is a reusable pagination handle — FortiAnalyzer logsearch task ids are
+> single-use, so `fetch_more_logs` re-runs the same query at the new offset
+> (results are stably ordered for a fixed time window). Both tools return
+> `total` / `total_is_known`, `has_more`, `next_offset` (the offset for the next
+> page, or `null` when exhausted), `offset`/`limit`, and a `warnings` list (set
+> when the limit was clamped, the total is unknown, the timezone is undetected,
+> or the result set is large enough that the bounded policy tools are a better
+> fit). A 0-result search is a clean `status:"success"` with `count:0` and
+> `has_more:false`. Call `cancel_log_search(tid=<handle>)` when finished; an
+> expired/unknown handle returns `error:"tid_invalid_or_expired"`.
+>
+> **Time & timezone:** `time_range` accepts presets (`1-hour` … `24-hour`,
+> `7-day`, `30-day`, `90-day`) or a custom
+> `"YYYY-MM-DD HH:MM:SS|YYYY-MM-DD HH:MM:SS"` window. Timestamps are interpreted
+> in the FAZ system timezone reported as `timezone`. For a 7-day or 30-day
+> investigation, set `time_range="7-day"` / `"30-day"` on `query_logs`, the
+> `search_*` helpers, or the policy tools and add the filters you need
+> (`action==accept`/`deny`, `policyid==N`, `srcip`/`dstip`/`dstport`, …).
+>
+> **Errors:** every tool error returns one envelope —
+> `{status:"error", error:<code>, message, operation, retry_count}` plus
+> `adom`/`logtype`/`tid` where relevant.
+>
+> **Filters:** the `search_*` helpers validate/sanitize their typed arguments;
+> the raw `filter=` argument on `query_logs` is a caller-controlled expert escape
+> hatch and is **not** parsed for injection safety — pass trusted input only.
 
 ### Report Tools (8 tools)
 

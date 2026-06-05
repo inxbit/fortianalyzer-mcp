@@ -455,6 +455,53 @@ ERROR_CODE_MAP = {
 
 ---
 
+## Log Investigation Response Contract
+
+`query_logs` and `fetch_more_logs` return one self-describing shape:
+
+- `status`, `count`, `logs`
+- `total`, `total_is_known` — true match count from FAZ `total-count`;
+  `total_is_known=false` when the appliance omits it
+- `has_more`, `next_offset` — `next_offset = offset + count` while paging, `null`
+  once `has_more` is false or a page returns `count == 0` (the count==0 guard
+  prevents an infinite paging loop against an inconsistent total)
+- `offset`, `limit` — the clamped values actually used (`limit` is bounded to `[1, 1000]`)
+- `warnings` — deterministic advisories: clamped limit, unknown total, undetected
+  timezone, or a high-volume result set
+  (`has_more and total >= max(10*limit, 10000)`) that should use the bounded policy tools
+- `time_range`, `timezone`, `time_basis` — the resolved `{start, end}` window and
+  the FAZ timezone the naive timestamps are interpreted in
+- `tid` — a **reusable pagination handle**, not the single-use appliance task id
+
+Every error path (across `query_logs`, `fetch_more_logs`, the `search_*` helpers,
+and the three policy tools) returns one envelope built by
+`utils/responses.py::error_response`:
+`{status:"error", error:<machine code>, message, operation, retry_count}` plus
+`adom`/`logtype`/`tid` where relevant. `retry_count` is the number of transient
+request retries `client._execute_resilient` performed (0 on non-retry paths).
+`message` is redacted (secrets masked) and length-bounded.
+
+The bounded policy tools add top-level `adom`/`time_range`/`timezone` and a
+per-policy `filter`. The analysis window is resolved **once** at tool entry and
+threaded into the slice queries and the FortiView estimate, so the reported
+window, the slices, and the estimate never drift.
+
+### Glossary
+
+- **Pagination handle** — the reusable `tid` `query_logs` returns, backed by an
+  in-process registry of the search parameters; distinct from the appliance's
+  single-use logsearch task id.
+- **Single-use tid** — a FortiAnalyzer logsearch task id is reaped after its first
+  fetch, so paging re-runs a fresh search per page.
+- **Bounded sample vs exact** — `is_exact=true` only when no queried slice reached
+  the per-slice row cap (`LOG_FETCH_LIMIT`); otherwise `analysis_mode="bounded_sample"`.
+- **Slice** — a fixed sub-window of a large time range, queried independently to
+  stay under the appliance row cap.
+- **FAZ-local time** — naive `time_range` bounds and log timestamps are interpreted
+  in the FortiAnalyzer system timezone, not the client's.
+
+---
+
 ## Key Design Decisions
 
 ### 1. Why pyfmg instead of raw httpx/requests?

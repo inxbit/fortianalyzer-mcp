@@ -345,6 +345,34 @@ class TestExecuteResilient:
 
         assert len(calls) == 1  # not retried
 
+    async def test_exhausted_retries_records_count(self) -> None:
+        """The final exception records how many transient retries were attempted."""
+        from fortianalyzer_mcp.utils.errors import APIError
+
+        client = _bare_client()
+
+        async def factory() -> str:
+            raise APIError("internal error", code=-1)
+
+        with pytest.raises(APIError) as excinfo:
+            await client._execute_resilient(factory, sleep=_no_sleep)
+
+        assert getattr(excinfo.value, "retries_attempted", None) == client._TRANSIENT_RETRIES
+
+    async def test_non_retried_error_records_zero_retries(self) -> None:
+        """A non-retried error reports zero transient retries via the getattr default."""
+        from fortianalyzer_mcp.utils.errors import ValidationError
+
+        client = _bare_client()
+
+        async def factory() -> str:
+            raise ValidationError("invalid param", code=-5)
+
+        with pytest.raises(ValidationError) as excinfo:
+            await client._execute_resilient(factory, sleep=_no_sleep)
+
+        assert getattr(excinfo.value, "retries_attempted", 0) == 0
+
 
 class TestSessionReconnect:
     """Tests for reviving a server-dropped session mid-request."""

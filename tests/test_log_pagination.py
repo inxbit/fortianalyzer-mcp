@@ -152,7 +152,7 @@ class TestQueryLogsPagination:
         assert result["count"] == 10
         assert [row["id"] for row in result["logs"]] == list(range(10))
         assert result["total"] == 25  # from total-count
-        assert result["total_known"] is True
+        assert result["total_is_known"] is True
         assert result["has_more"] is True
         assert isinstance(result["tid"], int)
         assert result["adom"] == "root"
@@ -251,7 +251,7 @@ class TestFetchMoreLogs:
         result = await log_tools.fetch_more_logs(tid=999999, offset=0, limit=5)
 
         assert result["status"] == "error"
-        assert result["error_type"] == "tid_invalid_or_expired"
+        assert result["error"] == "tid_invalid_or_expired"
         assert result["tid"] == 999999
         assert "recommendation" in result
 
@@ -295,7 +295,7 @@ class TestReissueOnReap:
         )
 
         assert result["status"] == "error"
-        assert result["error_type"] == "search_timeout"
+        assert result["error"] == "search_timeout"
         assert "invalid tid" not in result.get("message", "").lower()
         # The timeout (not a small fixed attempt cap) bounds the work.
         assert len(fake.start_calls) >= 2
@@ -315,7 +315,7 @@ class TestUnknownTotal:
         assert result["status"] == "success"
         assert result["count"] == 10
         assert result["total"] is None
-        assert result["total_known"] is False
+        assert result["total_is_known"] is False
         assert result["has_more"] is True
 
 

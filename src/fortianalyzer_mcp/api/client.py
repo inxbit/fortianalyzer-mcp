@@ -317,6 +317,11 @@ class FortiAnalyzerClient:
                     await self._force_reconnect()
                     continue
                 if retries_left <= 0 or not self._is_transient_error(exc):
+                    # Record transient retries performed so tools can surface
+                    # retry_count. Paths that bypass this raise (force-reconnect
+                    # failure, ensure_connected, invalid-tid reissue) carry no
+                    # attribute and read back as 0 via getattr.
+                    exc.retries_attempted = attempt  # type: ignore[attr-defined]
                     raise
                 retries_left -= 1
                 delay = self._TRANSIENT_BACKOFF_BASE * (2**attempt)
