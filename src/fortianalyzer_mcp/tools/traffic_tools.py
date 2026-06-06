@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from typing import Any, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
+from fortianalyzer_mcp.tools.log_tools import _is_invalid_tid_error
 from fortianalyzer_mcp.utils.responses import error_response
 from fortianalyzer_mcp.utils.time_range import (
     parse_time_range,
@@ -180,8 +181,8 @@ async def _resolve_window(time_range: str) -> tuple[dict[str, str], str]:
     caller already supplied explicit timestamps -- and report timezone
     ``"unknown"``. Relative presets pull the FAZ system timezone so the naive
     bounds land in FAZ-local time. Resolving here once keeps the reported
-    ``time_range``, the bounded slices, and the FortiView estimate on a single
-    window (no seconds-level drift from re-parsing relative ranges).
+    ``time_range`` and the bounded slices on a single window (no seconds-level
+    drift from re-parsing relative ranges).
     """
     if "|" in time_range:
         return parse_time_range(time_range), "unknown"
@@ -244,6 +245,17 @@ def _build_device_filter(device: str | None) -> list[dict[str, str]]:
     return [{"devname": device}]
 
 
+def _coerce_log_total(value: Any) -> int | None:
+    """Coerce a FAZ logsearch total-count value to int."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
 async def _query_policy_log_slice(
     adom: str,
     device_filter: list[dict[str, str]],
@@ -252,51 +264,93 @@ async def _query_policy_log_slice(
     action: str | None,
     limit: int = LOG_FETCH_LIMIT,
     timeout: int = DEFAULT_SEARCH_TIMEOUT,
-) -> list[dict[str, Any]]:
-    """Query traffic logs for a single policy/time slice."""
+) -> dict[str, Any]:
+    """Query traffic logs and total-count for a single policy/time slice.
+
+    Each attempt is its own search because a FortiAnalyzer logsearch ``tid`` is
+    single-use: the first fetch delivers the slice plus ``total-count`` and the
+    task is reaped. The fetch usually returns ``percentage>=100`` on the first
+    try; if it comes back incomplete, or the task was already reaped before our
+    fetch (an invalid-tid error), the search is re-issued from scratch rather
+    than re-fetching the reaped tid. Re-issues are bounded by the wall-clock
+    ``timeout``; on expiry an empty result with an unknown total is returned.
+    """
     client = _get_client()
     filter_str = _build_policy_filter(policy_id, action)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
 
-    start_result = await client.logsearch_start(
-        adom=adom,
-        logtype="traffic",
-        device=device_filter,
-        time_range=time_range,
-        filter=filter_str,
-        limit=limit,
-    )
-
-    tid = start_result.get("tid")
-    if not tid:
-        logger.warning(f"No TID returned for policy {policy_id}: {start_result}")
-        return []
-
-    start_time = time.monotonic()
     while True:
-        elapsed = time.monotonic() - start_time
-        if elapsed > timeout:
+        start_result = await client.logsearch_start(
+            adom=adom,
+            logtype="traffic",
+            device=device_filter,
+            time_range=time_range,
+            filter=filter_str,
+            limit=limit,
+        )
+        tid = start_result.get("tid")
+        if not tid:
+            logger.warning(f"No TID returned for policy {policy_id}: {start_result}")
+            return {"logs": [], "total_hits": None, "total_hits_is_known": False}
+
+        fetch_result: dict[str, Any] | None
+        try:
+            fetch_result = await client.logsearch_fetch(adom=adom, tid=tid, limit=limit, offset=0)
+        except Exception as exc:
+            # Task reaped before our fetch -> re-issue (bounded by deadline).
+            if not _is_invalid_tid_error(exc):
+                raise
+            fetch_result = None
+
+        if fetch_result is not None and fetch_result.get("percentage", 0) >= 100:
+            logs = fetch_result.get("data", [])
+            if not isinstance(logs, list):
+                logs = [logs] if logs else []
+            total_hits = _coerce_log_total(fetch_result.get("total-count"))
+            return {
+                "logs": [log for log in logs if isinstance(log, dict)],
+                "total_hits": total_hits,
+                "total_hits_is_known": total_hits is not None,
+            }
+
+        # Incomplete (the single-use task is now reaped) or reaped before fetch:
+        # re-issue a fresh search until the timeout budget is exhausted.
+        remaining = deadline - loop.time()
+        if remaining <= 0:
             try:
                 await client.logsearch_cancel(adom, tid)
             except (OSError, RuntimeError):
                 pass
             logger.warning(f"Search timed out for policy {policy_id}")
-            return []
+            return {"logs": [], "total_hits": None, "total_hits_is_known": False}
+        await asyncio.sleep(min(POLL_INTERVAL, remaining))
 
-        fetch_result = await client.logsearch_fetch(
-            adom=adom,
-            tid=tid,
-            limit=limit,
-            offset=0,
-        )
 
-        percentage = fetch_result.get("percentage", 0)
-        if percentage >= 100:
-            logs = fetch_result.get("data", [])
-            if not isinstance(logs, list):
-                logs = [logs] if logs else []
-            return [log for log in logs if isinstance(log, dict)]
-
-        await asyncio.sleep(POLL_INTERVAL)
+async def _query_policy_total_count(
+    adom: str,
+    device_filter: list[dict[str, str]],
+    policy_id: int,
+    time_range: dict[str, str],
+    action: str | None,
+    timeout: int = DEFAULT_SEARCH_TIMEOUT,
+) -> dict[str, Any]:
+    """Query authoritative log-search total-count for one full policy window."""
+    result = await _query_policy_log_slice(
+        adom=adom,
+        device_filter=device_filter,
+        policy_id=policy_id,
+        time_range=time_range,
+        action=action,
+        limit=1,
+        timeout=timeout,
+    )
+    total_hits = result.get("total_hits")
+    total_hits_is_known = result.get("total_hits_is_known") is True
+    return {
+        "total_hits": total_hits if total_hits_is_known else None,
+        "total_hits_is_known": total_hits_is_known,
+    }
 
 
 async def _query_policy_logs(
@@ -327,7 +381,7 @@ async def _query_policy_logs(
     async with _QUERY_SEMAPHORE:
         time_range_dict = await _parse_time_range(time_range)
         device_filter = _build_device_filter(device)
-        return await _query_policy_log_slice(
+        result = await _query_policy_log_slice(
             adom=adom,
             device_filter=device_filter,
             policy_id=policy_id,
@@ -336,6 +390,8 @@ async def _query_policy_logs(
             action=action,
             timeout=timeout,
         )
+        logs = result.get("logs", [])
+        return logs if isinstance(logs, list) else []
 
 
 async def _query_policy_logs_bounded(
@@ -351,7 +407,7 @@ async def _query_policy_logs_bounded(
     """Query fixed bounded slices for one policy and report truncation metadata.
 
     ``time_range`` is the already-resolved ``{start, end}`` window (resolved once
-    by the caller) so slices, estimate, and reported metadata share one window.
+    by the caller) so slices and reported metadata share one window.
     """
     async with _QUERY_SEMAPHORE:
         full_time_range = time_range
@@ -360,9 +416,25 @@ async def _query_policy_logs_bounded(
         time_slices = _build_bounded_time_slices(full_time_range, slice_count)
         logs: list[dict[str, Any]] = []
         truncated_slices = 0
+        # The whole-window total-count is best-effort enrichment: its failure must
+        # never discard the per-slice observations (degrade to observed_rows).
+        try:
+            total_result = await _query_policy_total_count(
+                adom=adom,
+                device_filter=device_filter,
+                policy_id=policy_id,
+                time_range=full_time_range,
+                action=action,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            logger.info(f"Total-count unavailable for policy {policy_id}: {exc}")
+            total_result = {"total_hits": None, "total_hits_is_known": False}
+        total_hits = total_result.get("total_hits")
+        total_hits_is_known = total_result.get("total_hits_is_known") is True
 
         for time_slice in time_slices:
-            slice_logs = await _query_policy_log_slice(
+            slice_result = await _query_policy_log_slice(
                 adom=adom,
                 device_filter=device_filter,
                 policy_id=policy_id,
@@ -371,6 +443,9 @@ async def _query_policy_logs_bounded(
                 limit=limit,
                 timeout=timeout,
             )
+            slice_logs = slice_result.get("logs", [])
+            if not isinstance(slice_logs, list):
+                slice_logs = []
             logs.extend(slice_logs)
             if len(slice_logs) >= limit:
                 truncated_slices += 1
@@ -379,124 +454,39 @@ async def _query_policy_logs_bounded(
             "logs": logs,
             "slices_scanned": len(time_slices),
             "truncated_slices": truncated_slices,
+            "total_hits": total_hits if total_hits_is_known else None,
+            "total_hits_is_known": total_hits_is_known,
         }
-
-
-def _extract_policy_hit_count(row: dict[str, Any], action: str | None) -> int | None:
-    """Extract a best-effort hit count from a FortiView policy-hits row."""
-    key = "counts"
-    if action == "accept":
-        key = "count_pass"
-    elif action in {"deny", "drop"}:
-        key = "count_block"
-
-    value = row.get(key)
-    if value is None and key != "counts":
-        value = row.get("counts")
-    if value is None:
-        return None
-    try:
-        return max(int(value), 0)
-    except (TypeError, ValueError):
-        return None
-
-
-async def _estimate_policy_hits(
-    adom: str,
-    device: str | None,
-    policy_ids: list[int],
-    time_range: dict[str, str],
-    action: str | None,
-    timeout: int = 30,
-) -> dict[int, int]:
-    """Fetch one bounded FortiView policy-hits page as optional metadata.
-
-    ``time_range`` is the already-resolved ``{start, end}`` window.
-    """
-    client = _get_client()
-    device_filter = _build_device_filter(device)
-    time_range_dict = time_range
-
-    run_result = await client.fortiview_run(
-        adom=adom,
-        view_name="policy-hits",
-        device=device_filter,
-        time_range=time_range_dict,
-        limit=1000,
-        sort_by=[{"field": "counts", "order": "desc"}],
-    )
-    tid = run_result.get("tid")
-    if not tid:
-        return {}
-
-    start_time = time.monotonic()
-    while True:
-        if time.monotonic() - start_time > timeout:
-            return {}
-
-        result = await client.fortiview_fetch(
-            adom=adom,
-            view_name="policy-hits",
-            tid=tid,
-        )
-        rows = result.get("data", [])
-        if not isinstance(rows, list):
-            rows = [rows] if rows else []
-
-        if result.get("percentage", 100) >= 100 or rows:
-            wanted = set(policy_ids)
-            estimates: dict[int, int] = {}
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                raw_policy_id = row.get("agg_policyid", row.get("policyid"))
-                if raw_policy_id is None or not str(raw_policy_id).isdigit():
-                    continue
-                policy_id = int(raw_policy_id)
-                if policy_id not in wanted:
-                    continue
-                hits = _extract_policy_hit_count(row, action)
-                if hits is not None:
-                    estimates[policy_id] = hits
-            return estimates
-
-        await asyncio.sleep(POLL_INTERVAL)
-
-
-async def _estimate_policy_hits_best_effort(
-    adom: str,
-    device: str | None,
-    policy_ids: list[int],
-    time_range: dict[str, str],
-    action: str | None,
-) -> dict[int, int]:
-    """Return FortiView estimates when available without failing the caller."""
-    try:
-        return await _estimate_policy_hits(adom, device, policy_ids, time_range, action)
-    except Exception as exc:
-        logger.info(f"FortiView policy-hit estimate unavailable: {exc}")
-        return {}
 
 
 def _bounded_metadata(
     observed_hits: int,
     slices_scanned: int,
     truncated_slices: int,
-    estimated_total_hits: int | None = None,
+    total_hits: int | None = None,
+    total_hits_is_known: bool = False,
 ) -> dict[str, Any]:
     """Build common bounded-analysis response metadata."""
-    is_exact = truncated_slices == 0
+    authoritative = total_hits if (total_hits_is_known and total_hits is not None) else None
+    if authoritative is not None:
+        resolved_total_hits = authoritative
+        # "complete" must mean the breakdown covers exactly the authoritative
+        # matching log count. Any mismatch keeps the result bounded.
+        is_exact = truncated_slices == 0 and observed_hits == authoritative
+    else:
+        resolved_total_hits = observed_hits
+        is_exact = truncated_slices == 0
     metadata: dict[str, Any] = {
         "is_exact": is_exact,
         "analysis_mode": "complete" if is_exact else "bounded_sample",
+        "total_hits": resolved_total_hits,
+        "total_hits_is_known": total_hits_is_known,
+        "total_hit_source": "logsearch_total-count" if total_hits_is_known else "observed_rows",
         "observed_hits": observed_hits,
         "slices_scanned": slices_scanned,
         "truncated_slices": truncated_slices,
         "log_limit_per_slice": LOG_FETCH_LIMIT,
-        "estimate_available": estimated_total_hits is not None,
     }
-    if estimated_total_hits is not None:
-        metadata["estimated_total_hits"] = estimated_total_hits
     if not is_exact:
         metadata["recommendation"] = (
             "Narrow the request to 24-hour, 6-hour, or a custom shorter window for exact proof."
@@ -655,11 +645,10 @@ async def _run_bounded_policy_analysis(
 ) -> dict[str, Any]:
     """Shared driver for the bounded per-policy analysis tools.
 
-    Resolves the time window once (so the reported time_range, the bounded
-    slices, and the FortiView estimate share one window), runs the estimate
-    alongside bounded per-policy log queries, and assembles top-level audit
-    metadata plus per-policy results. ``aggregate`` turns one policy's log rows
-    into the tool-specific summary dict.
+    Resolves the time window once so the reported time_range and bounded slices
+    share one window, then assembles top-level audit metadata plus per-policy
+    results. ``aggregate`` turns one policy's log rows into the tool-specific
+    summary dict.
     """
     adom_value: str | None = adom
     try:
@@ -674,6 +663,11 @@ async def _run_bounded_policy_analysis(
         policy_ids = validate_policy_ids(policy_ids)
         action = validate_action(action)
 
+        # Revive an idle-closed streamable-HTTP session before any FAZ call, like
+        # query_logs; otherwise the first policy query after the session drops
+        # fails with a raw "Not connected" error.
+        await _get_client().ensure_connected()
+
         try:
             window, tz_name = await _resolve_window(time_range)
         except ValueError as e:
@@ -685,18 +679,13 @@ async def _run_bounded_policy_analysis(
             )
 
         start = time.monotonic()
-        estimate_task = _estimate_policy_hits_best_effort(
-            adom_value, device, policy_ids, window, action
-        )
         query_tasks = [
             _query_policy_logs_bounded(
                 adom_value, device, pid, window, action, policy_count=len(policy_ids)
             )
             for pid in policy_ids
         ]
-        all_results = await asyncio.gather(estimate_task, *query_tasks, return_exceptions=True)
-        estimates = all_results[0] if isinstance(all_results[0], dict) else {}
-        results_list = all_results[1:]
+        results_list = await asyncio.gather(*query_tasks, return_exceptions=True)
 
         per_policy = []
         for pid, result in zip(policy_ids, results_list, strict=True):
@@ -719,7 +708,8 @@ async def _run_bounded_policy_analysis(
                         observed_hits=len(logs),
                         slices_scanned=policy_result["slices_scanned"],
                         truncated_slices=policy_result["truncated_slices"],
-                        estimated_total_hits=estimates.get(pid),
+                        total_hits=policy_result.get("total_hits"),
+                        total_hits_is_known=policy_result.get("total_hits_is_known") is True,
                     )
                 )
                 entry["policy_id"] = pid
@@ -799,7 +789,17 @@ async def get_policy_traffic_profile(
     Returns:
         dict with keys:
             - status: "success" or "error"
-            - results: Per-policy traffic profiles with top ports, services, apps
+            - adom, time_range, timezone: resolved query-window audit metadata
+            - results: Per-policy traffic profiles with top ports, services, apps,
+              plus per-policy total accounting:
+                - total_hits: authoritative whole-window match count when
+                  total_hits_is_known, else the observed row count
+                - total_hits_is_known / total_hit_source: True with
+                  "logsearch_total-count" when the total came from a FAZ
+                  whole-window total-count; False with "observed_rows" otherwise
+                - observed_hits: rows actually fetched and aggregated
+                Top ports/services/applications and their residuals describe the
+                observed rows only, not total_hits.
             - query_time_seconds: Total query duration
             - message: Error message if failed
 
@@ -853,15 +853,23 @@ async def get_policy_port_analysis(
     Returns:
         dict with keys:
             - status: "success" or "error"
+            - adom, time_range, timezone: resolved query-window audit metadata
             - results: Per-policy port analysis with:
-                - is_exact: Whether the port list is complete for queried window
+                - is_exact: True only when the breakdown covers every matching
+                  log (no truncated slice AND total_hits == observed_hits)
                 - analysis_mode: "complete" or "bounded_sample"
-                - observed_hits: Number of log rows aggregated
+                - total_hits: authoritative whole-window match count when
+                  total_hits_is_known, else the observed row count
+                - total_hits_is_known / total_hit_source: True with
+                  "logsearch_total-count" when the total came from a FAZ
+                  whole-window total-count; False with "observed_rows" otherwise
+                - observed_hits: Number of log rows fetched and aggregated
                 - ports: List of port/protocol pairs with hit counts
                 - protocols: Protocol breakdown
                 - portless_protocols: Protocols without ports (ICMP, GRE, etc.)
                 - uncovered_port_hits: Hits without a destination port
                 - icmp: ICMP type/code breakdown (if applicable)
+              ports/protocols/uncovered counts describe observed rows only.
             - query_time_seconds: Total query duration
             - message: Error message if failed
 
@@ -911,7 +919,11 @@ async def get_policy_protocol_summary(
     Returns:
         dict with keys:
             - status: "success" or "error"
-            - results: Per-policy protocol summaries with hit counts
+            - adom, time_range, timezone: resolved query-window audit metadata
+            - results: Per-policy protocol summaries with hit counts, plus
+              total_hits / total_hits_is_known / total_hit_source and
+              observed_hits (the protocol breakdown describes observed rows only;
+              total_hits is the authoritative whole-window count when known)
             - query_time_seconds: Total query duration
             - message: Error message if failed
 

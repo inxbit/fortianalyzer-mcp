@@ -522,6 +522,12 @@ number of log slices per request. A result is marked `is_exact=true` only when
 every queried slice returns below the per-slice log limit. If any slice reaches
 the limit, the tool returns observed results with `analysis_mode=bounded_sample`,
 truncation metadata, and a recommendation to narrow the time window for exact proof.
+For bounded samples, `total_hits` comes from a whole-window FortiAnalyzer
+log-search `total-count` for the same policy/action/device/time filter when
+available, but port, protocol, service, and application breakdowns still
+describe only the fetched rows. Use `observed_hits`, `total_hits_is_known`, and
+`total_hit_source` to distinguish observed row counts from authoritative
+matching-log totals.
 
 ### PCAP Tools (5 tools)
 

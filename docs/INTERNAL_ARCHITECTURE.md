@@ -482,9 +482,16 @@ request retries `client._execute_resilient` performed (0 on non-retry paths).
 `message` is redacted (secrets masked) and length-bounded.
 
 The bounded policy tools add top-level `adom`/`time_range`/`timezone` and a
-per-policy `filter`. The analysis window is resolved **once** at tool entry and
-threaded into the slice queries and the FortiView estimate, so the reported
-window, the slices, and the estimate never drift.
+per-policy `filter`, plus per-policy `total_hits`, `total_hits_is_known`, and
+`total_hit_source` (`"logsearch_total-count"` when the count is authoritative,
+`"observed_rows"` when it fell back to fetched rows). The analysis window is
+resolved **once** at tool entry and threaded into the slice queries and the
+whole-window total-count query, so the reported window, the slices, and the
+total never drift. Like `query_logs`, each slice and the total-count re-run a
+fresh search per page because the appliance `tid` is single-use; the total-count
+is best-effort (its failure degrades to `"observed_rows"`, never failing the
+policy), and `is_exact` is true only when no slice truncated **and**
+`total_hits == observed_hits`.
 
 ### Glossary
 
