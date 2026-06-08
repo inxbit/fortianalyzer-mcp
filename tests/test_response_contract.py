@@ -114,6 +114,19 @@ class TestQueryLogsContractFields:
         assert "returned_offset" not in r
         assert "returned_limit" not in r
 
+    async def test_time_basis_fields_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """query_logs surfaces the time-basis source and clock skew."""
+        fake = ContractFaz(page=_rows(3), total=3)
+        _install(monkeypatch, fake)
+
+        r = await log_tools.query_logs(adom="root", time_range=CUSTOM_RANGE, limit=10)
+
+        # A custom absolute range carries explicit bounds -> "custom" basis.
+        assert r["time_basis_source"] == "custom"
+        assert r["clock_skew_seconds"] is None
+        # The FAZ tz is still reported for label purposes.
+        assert r["timezone"] == "US/Pacific"
+
     async def test_clean_query_has_empty_warnings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = ContractFaz(page=_rows(3), total=3)
         _install(monkeypatch, fake)

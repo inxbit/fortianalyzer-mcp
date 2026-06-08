@@ -19,7 +19,13 @@ from datetime import datetime, timedelta
 from typing import Any, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
-from fortianalyzer_mcp.tools.log_tools import _is_invalid_tid_error
+from fortianalyzer_mcp.tools.log_tools import (
+    PREMATURE_REISSUE_LIMIT,
+    _is_invalid_tid_error,
+    _normalize_logs,
+    _page_is_final,
+)
+from fortianalyzer_mcp.utils.log_clock import resolve_time_window
 from fortianalyzer_mcp.utils.responses import error_response
 from fortianalyzer_mcp.utils.time_range import (
     parse_time_range,
@@ -27,6 +33,7 @@ from fortianalyzer_mcp.utils.time_range import (
 )
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
+    build_device_filter,
     get_default_adom,
     validate_adom,
 )
@@ -174,24 +181,6 @@ async def _parse_time_range(time_range: str) -> dict[str, str]:
     return parse_time_range(time_range, faz_tz=faz_tz)
 
 
-async def _resolve_window(time_range: str) -> tuple[dict[str, str], str]:
-    """Resolve the query window once and report the FAZ timezone name.
-
-    Custom absolute ranges (``"start|end"``) skip the TZ client lookup -- the
-    caller already supplied explicit timestamps -- and report timezone
-    ``"unknown"``. Relative presets pull the FAZ system timezone so the naive
-    bounds land in FAZ-local time. Resolving here once keeps the reported
-    ``time_range`` and the bounded slices on a single window (no seconds-level
-    drift from re-parsing relative ranges).
-    """
-    if "|" in time_range:
-        return parse_time_range(time_range), "unknown"
-    client = _get_client()
-    faz_tz = await client.get_system_timezone()
-    tz_name = str(faz_tz) if faz_tz else "unknown"
-    return parse_time_range(time_range, faz_tz=faz_tz), tz_name
-
-
 # parse_time_range_bounds is re-exported from utils.time_range above.
 _parse_time_range_bounds = parse_time_range_bounds
 
@@ -234,15 +223,8 @@ def _build_bounded_time_slices(
     return slices
 
 
-def _build_device_filter(device: str | None) -> list[dict[str, str]]:
-    """Build device filter for API. Mirrors log_tools._build_device_filter."""
-    if not device:
-        return [{"devid": "All_FortiGate"}]
-    if device.startswith(("FG", "FM", "FW", "FA", "FS", "FD", "FP", "FC")):
-        return [{"devid": device}]
-    if device.startswith("All_"):
-        return [{"devid": device}]
-    return [{"devname": device}]
+# Shared device-filter construction (see utils.validation.build_device_filter).
+_build_device_filter = build_device_filter
 
 
 def _coerce_log_total(value: Any) -> int | None:
@@ -279,6 +261,7 @@ async def _query_policy_log_slice(
     filter_str = _build_policy_filter(policy_id, action)
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
+    premature_retries_left = PREMATURE_REISSUE_LIMIT
 
     while True:
         start_result = await client.logsearch_start(
@@ -303,19 +286,23 @@ async def _query_policy_log_slice(
                 raise
             fetch_result = None
 
+        reissue_immediately = False
         if fetch_result is not None and fetch_result.get("percentage", 0) >= 100:
-            logs = fetch_result.get("data", [])
-            if not isinstance(logs, list):
-                logs = [logs] if logs else []
+            logs = [log for log in _normalize_logs(fetch_result.get("data")) if isinstance(log, dict)]
             total_hits = _coerce_log_total(fetch_result.get("total-count"))
-            return {
-                "logs": [log for log in logs if isinstance(log, dict)],
-                "total_hits": total_hits,
-                "total_hits_is_known": total_hits is not None,
-            }
+            # 7.6.7 can report 100% with an empty page while total-count claims
+            # rows; re-issue a bounded number of times before accepting the page.
+            if _page_is_final(logs, total_hits, 0) or premature_retries_left <= 0:
+                return {
+                    "logs": logs,
+                    "total_hits": total_hits,
+                    "total_hits_is_known": total_hits is not None,
+                }
+            premature_retries_left -= 1
+            reissue_immediately = True
 
-        # Incomplete (the single-use task is now reaped) or reaped before fetch:
-        # re-issue a fresh search until the timeout budget is exhausted.
+        # Incomplete (the single-use task is now reaped), reaped before fetch, or
+        # a premature-100 re-issue: run a fresh search until the budget is spent.
         remaining = deadline - loop.time()
         if remaining <= 0:
             try:
@@ -324,7 +311,8 @@ async def _query_policy_log_slice(
                 pass
             logger.warning(f"Search timed out for policy {policy_id}")
             return {"logs": [], "total_hits": None, "total_hits_is_known": False}
-        await asyncio.sleep(min(POLL_INTERVAL, remaining))
+        if not reissue_immediately:
+            await asyncio.sleep(min(POLL_INTERVAL, remaining))
 
 
 async def _query_policy_total_count(
@@ -669,7 +657,9 @@ async def _run_bounded_policy_analysis(
         await _get_client().ensure_connected()
 
         try:
-            window, tz_name = await _resolve_window(time_range)
+            resolved = await resolve_time_window(
+                _get_client(), adom_value, time_range, device, faz_tz_for_custom=False
+            )
         except ValueError as e:
             return error_response(
                 error="invalid_time_range",
@@ -677,6 +667,8 @@ async def _run_bounded_policy_analysis(
                 operation=operation,
                 adom=adom_value,
             )
+        window = resolved.time_range
+        tz_name = resolved.timezone
 
         start = time.monotonic()
         query_tasks = [
@@ -722,6 +714,8 @@ async def _run_bounded_policy_analysis(
             "adom": adom_value,
             "time_range": window,
             "timezone": tz_name,
+            "time_basis_source": resolved.time_basis_source,
+            "clock_skew_seconds": resolved.clock_skew_seconds,
             "results": per_policy,
             "query_time_seconds": round(elapsed, 2),
         }

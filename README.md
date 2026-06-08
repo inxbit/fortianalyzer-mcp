@@ -433,7 +433,11 @@ networks:
 > **Time & timezone:** `time_range` accepts presets (`1-hour` … `24-hour`,
 > `7-day`, `30-day`, `90-day`) or a custom
 > `"YYYY-MM-DD HH:MM:SS|YYYY-MM-DD HH:MM:SS"` window. Timestamps are interpreted
-> in the FAZ system timezone reported as `timezone`. For a 7-day or 30-day
+> in the FAZ system timezone reported as `timezone`. Relative presets are
+> anchored on the appliance's latest LogView ingest time (so a post-upgrade
+> clock skew doesn't miss recent logs); `time_basis_source` reports which clock
+> was used (`logfiles_state`/`logstats`/`faz_tz`/`naive`, or `custom` for an
+> explicit window) and `clock_skew_seconds` the detected offset. For a 7-day or 30-day
 > investigation, set `time_range="7-day"` / `"30-day"` on `query_logs`, the
 > `search_*` helpers, or the policy tools and add the filters you need
 > (`action==accept`/`deny`, `policyid==N`, `srcip`/`dstip`/`dstport`, …).

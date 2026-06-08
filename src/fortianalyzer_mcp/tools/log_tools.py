@@ -9,10 +9,12 @@ import logging
 from typing import Any
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
+from fortianalyzer_mcp.utils.log_clock import resolve_time_window
 from fortianalyzer_mcp.utils.responses import build_warnings, error_response, redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
+    build_device_filter,
     get_default_adom,
     sanitize_filter_value,
     validate_adom,
@@ -34,6 +36,11 @@ DEFAULT_SEARCH_TIMEOUT = 60
 POLL_INTERVAL = 1.0
 # Appliance maximum for the logsearch fetch limit (rejects > 1000).
 LOG_FETCH_LIMIT_MAX = 1000
+# Bounded re-issues for the 7.6.7 "premature 100%" case (percentage>=100 with an
+# empty data page while total-count claims rows at/after this offset). A small
+# fixed bound lets a transient empty completion settle without looping a
+# genuinely-empty deterministic result to the wall-clock timeout.
+PREMATURE_REISSUE_LIMIT = 2
 
 
 # In-process registry of log-search context, keyed by a pagination handle.
@@ -145,6 +152,31 @@ def _coerce_total(value: Any) -> int | None:
     return None
 
 
+def _normalize_logs(data: Any) -> list[Any]:
+    """Normalize a logsearch ``data`` field to a list."""
+    if isinstance(data, list):
+        return data
+    return [data] if data else []
+
+
+def _page_is_final(logs: list[Any], total: int | None, offset: int) -> bool:
+    """Decide whether a ``percentage>=100`` fetch is genuinely complete.
+
+    FortiAnalyzer 7.6.7 can report ``percentage:100`` with an *empty* ``data``
+    page even though ``total-count`` says matching rows exist at/after the
+    requested offset. That is not a real completion -- treating it as one returns
+    a misleading zero-result success. Such a page is reported as non-final so the
+    caller re-issues a fresh search (bounded). A page is final when it carries
+    rows, or when the total is unknown, or when the total does not claim rows
+    beyond this offset (a genuine empty result).
+    """
+    if logs:
+        return True
+    if total is not None and total > offset:
+        return False
+    return True
+
+
 async def _run_search_page(
     client: Any,
     *,
@@ -172,6 +204,7 @@ async def _run_search_page(
     """
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
+    premature_retries_left = PREMATURE_REISSUE_LIMIT
     tid: int | None = None
 
     while True:
@@ -199,19 +232,24 @@ async def _run_search_page(
                 raise
             fetch_result = None
 
+        # ``reissue_immediately`` distinguishes the 7.6.7 premature-100 case (a
+        # fresh search may immediately return rows, so no poll wait) from a
+        # still-in-progress search (poll-sleep before re-issuing).
+        reissue_immediately = False
         if fetch_result is not None and fetch_result.get("percentage", 0) >= 100:
-            logs = fetch_result.get("data", [])
-            if not isinstance(logs, list):
-                logs = [logs] if logs else []
-            return {
-                "timed_out": False,
-                "tid": tid,
-                "logs": logs,
-                "total": _coerce_total(fetch_result.get("total-count")),
-            }
+            logs = _normalize_logs(fetch_result.get("data"))
+            total = _coerce_total(fetch_result.get("total-count"))
+            if _page_is_final(logs, total, offset) or premature_retries_left <= 0:
+                # Final, or we have exhausted premature re-issues: return what FAZ
+                # gave us (an empty page here is surfaced to the caller, which
+                # warns and stops paging rather than erroring).
+                return {"timed_out": False, "tid": tid, "logs": logs, "total": total}
+            # Premature 100%: empty page while total claims rows here. Re-issue.
+            premature_retries_left -= 1
+            reissue_immediately = True
 
-        # Incomplete (the single-use task is now reaped) or reaped before fetch:
-        # re-issue a fresh search until the timeout budget is exhausted.
+        # Incomplete (the single-use task is now reaped), reaped before fetch, or
+        # a premature-100 re-issue: run a fresh search until the budget is spent.
         remaining = deadline - loop.time()
         if remaining <= 0:
             try:
@@ -219,7 +257,8 @@ async def _run_search_page(
             except Exception:
                 pass
             return {"timed_out": True, "tid": tid, "logs": [], "total": None}
-        await asyncio.sleep(min(POLL_INTERVAL, remaining))
+        if not reissue_immediately:
+            await asyncio.sleep(min(POLL_INTERVAL, remaining))
 
 
 def _get_client():
@@ -245,37 +284,10 @@ async def _parse_time_range(time_range: str) -> dict[str, str]:
     return parse_time_range(time_range, faz_tz=faz_tz)
 
 
-def _build_device_filter(device: str | None) -> list[dict[str, str]]:
-    """Build device filter for API.
-
-    Args:
-        device: Device serial number, name, or None for all FortiGate devices.
-                - Serial number format: FGxxxxxxxxxxxxxx (e.g., FG100FTK19001333)
-                - Device name format: device-name or device-name[vdom]
-                - None: Uses All_FortiGate to search all FortiGate devices
-
-    Returns:
-        Device filter list for API.
-
-    Note:
-        The FAZ API requires a device filter. Without one, searches return 0 results.
-        Use the device serial number for best results. Device names may not work
-        if they don't match exactly in the FAZ database.
-    """
-    if not device:
-        # Default to all FortiGate devices - empty list returns 0 results
-        return [{"devid": "All_FortiGate"}]
-
-    # Check if it looks like a serial number (starts with FG, FM, etc.)
-    if device.startswith(("FG", "FM", "FW", "FA", "FS", "FD", "FP", "FC")):
-        return [{"devid": device}]
-
-    # Check for special "All_*" device types
-    if device.startswith("All_"):
-        return [{"devid": device}]
-
-    # Otherwise, try as device name (devname)
-    return [{"devname": device}]
+# Device filter construction is shared across the log, traffic, and pcap tools;
+# the single implementation lives in utils.validation. Kept as a module alias so
+# existing call sites (and any callers importing this name) keep working.
+_build_device_filter = build_device_filter
 
 
 @mcp.tool()
@@ -372,13 +384,14 @@ async def query_logs(
         client = _get_client()
         await client.ensure_connected()
 
-        # Resolve the FAZ system timezone once: used both to align relative
-        # time ranges and to label the returned timestamps (FAZ interprets the
-        # naive bounds in its own local TZ).
-        faz_tz = await client.get_system_timezone()
-        tz_name = str(faz_tz) if faz_tz else "unknown"
+        # Resolve the query window. Relative presets are anchored on the detected
+        # LogView ingest clock (so a post-upgrade clock skew does not miss recent
+        # logs); custom ranges pass through verbatim. tz_name labels the returned
+        # timestamps (FAZ interprets the naive bounds in its own local TZ).
         try:
-            time_range_dict = parse_time_range(time_range, faz_tz=faz_tz)
+            window = await resolve_time_window(
+                client, adom, time_range, device, faz_tz_for_custom=True
+            )
         except ValueError as e:
             return error_response(
                 error="invalid_time_range",
@@ -387,6 +400,10 @@ async def query_logs(
                 adom=adom,
                 logtype=logtype,
             )
+        time_range_dict = window.time_range
+        tz_name = window.timezone
+        time_basis_source = window.time_basis_source
+        clock_skew_seconds = window.clock_skew_seconds
 
         # Build device filter
         device_filter = _build_device_filter(device)
@@ -457,6 +474,8 @@ async def query_logs(
                 "device": device,
                 "time_range": time_range_dict,
                 "timezone": tz_name,
+                "time_basis_source": time_basis_source,
+                "clock_skew_seconds": clock_skew_seconds,
             },
         )
 
@@ -479,6 +498,8 @@ async def query_logs(
             "time_basis": (
                 f"time_range and log timestamps are interpreted in FAZ local time ({tz_name})"
             ),
+            "time_basis_source": time_basis_source,
+            "clock_skew_seconds": clock_skew_seconds,
             "offset": offset,
             "limit": limit,
             "warnings": warnings,
@@ -652,6 +673,8 @@ async def fetch_more_logs(
         has_more = _compute_has_more(offset, count, limit, total)
         next_offset = offset + count if has_more else None
         timezone = context.get("timezone", "unknown")
+        time_basis_source = context.get("time_basis_source", "unknown")
+        clock_skew_seconds = context.get("clock_skew_seconds")
 
         warnings = build_warnings(
             requested_limit=requested_limit,
@@ -685,6 +708,8 @@ async def fetch_more_logs(
             "limit": limit,
             "timezone": timezone,
             "time_basis": f"log timestamps are interpreted in FAZ local time ({timezone})",
+            "time_basis_source": time_basis_source,
+            "clock_skew_seconds": clock_skew_seconds,
             "warnings": warnings,
         }
     except ValidationError as e:

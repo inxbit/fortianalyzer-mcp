@@ -670,6 +670,8 @@ class TestPolicyToolAuditMetadata:
         }
         # Custom absolute range skips the TZ client lookup in unit tests.
         assert result["timezone"] == "unknown"
+        assert result["time_basis_source"] == "custom"
+        assert result["clock_skew_seconds"] is None
         assert result["results"][0]["filter"] == "policyid==2 and action==accept"
 
 

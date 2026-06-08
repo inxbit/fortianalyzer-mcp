@@ -20,6 +20,7 @@ from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
     assert_within_directory,
+    build_device_filter,
     get_default_adom,
     sanitize_filter_value,
     validate_adom,
@@ -292,7 +293,7 @@ async def search_ips_logs(
         time_range_dict = await _parse_time_range(time_range)
 
         # Build device filter
-        device_filter = [{"devid": device}] if device else [{"devid": "All_FortiGate"}]
+        device_filter = build_device_filter(device)
 
         logger.info(f"Searching IPS logs: adom={adom}, filter={filter_str}")
 
@@ -423,7 +424,7 @@ async def get_pcap_by_session(
         # Build filter for specific session ID
         filter_str = f"sessionid=={session_id}"
         time_range_dict = await _parse_time_range(time_range)
-        device_filter = [{"devid": device}] if device else [{"devid": "All_FortiGate"}]
+        device_filter = build_device_filter(device)
 
         logger.info(f"Searching for session {session_id} in ADOM {adom}")
 
@@ -808,7 +809,7 @@ async def search_and_download_pcaps(
         )
 
         time_range_dict = await _parse_time_range(time_range)
-        device_filter = [{"devid": device}] if device else [{"devid": "All_FortiGate"}]
+        device_filter = build_device_filter(device)
 
         logger.info(f"Searching IPS logs for PCAP download: {filter_str}")
 

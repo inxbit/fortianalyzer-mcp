@@ -335,6 +335,94 @@ class TestCancelLogSearch:
         assert tid not in log_tools._SEARCH_REGISTRY
 
 
+class PrematureFaz:
+    """Models the 7.6.7 premature-100 case.
+
+    Returns ``percentage:100`` with an *empty* ``data`` page while ``total-count``
+    reports rows exist, until ``data_on_attempt`` searches have started -- at
+    which point the page carries real data. Each search is a fresh single-use tid.
+    """
+
+    def __init__(self, dataset: list[dict[str, object]], *, data_on_attempt: int) -> None:
+        self.dataset = dataset
+        self.data_on_attempt = data_on_attempt
+        self.connected = True
+        self.reconnects = 0
+        self._next_tid = 2000
+        self._attempt = 0
+        self._tasks: dict[int, int] = {}
+        self.cancelled: list[int] = []
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected
+
+    async def ensure_connected(self) -> None:
+        if not self.connected:
+            self.reconnects += 1
+            self.connected = True
+
+    async def get_system_timezone(self):  # noqa: ANN201 - test fake
+        return None
+
+    async def logsearch_start(self, **_kw: object) -> dict[str, object]:
+        self._attempt += 1
+        tid = self._next_tid
+        self._next_tid += 1
+        self._tasks[tid] = self._attempt
+        return {"tid": tid}
+
+    async def logsearch_fetch(
+        self, adom: str, tid: int, limit: int = 50, offset: int = 0
+    ) -> dict[str, object]:
+        attempt = self._tasks[tid]
+        data = self.dataset[offset : offset + limit] if attempt >= self.data_on_attempt else []
+        return {
+            "percentage": 100,
+            "data": data,
+            "total-count": len(self.dataset),
+            "tid": tid,
+            "status": {"code": 0, "message": "succeeded"},
+        }
+
+    async def logsearch_cancel(self, adom: str, tid: int) -> dict[str, object]:
+        self.cancelled.append(tid)
+        return {"status": {"code": 0, "message": "ok"}}
+
+
+class TestPremature100:
+    async def test_empty_100pct_with_total_reissues_then_returns_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """percentage:100 + empty data + total-count>0 must re-issue, not report 0."""
+        fake = PrematureFaz(_rows(5), data_on_attempt=2)
+        _install(monkeypatch, fake)
+
+        result = await log_tools.query_logs(adom="root", time_range=CUSTOM_RANGE, limit=10)
+
+        assert result["status"] == "success"
+        assert result["count"] == 5
+        assert result["total"] == 5
+        assert fake._attempt == 2  # first empty completion re-issued once
+
+    async def test_persistent_empty_100pct_is_bounded_and_warns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A deterministically empty 100% page stops after a bounded re-issue
+        count (it must not loop to the timeout) and surfaces the inconsistency."""
+        fake = PrematureFaz(_rows(5), data_on_attempt=10_000)  # never yields data
+        _install(monkeypatch, fake)
+
+        result = await log_tools.query_logs(adom="root", time_range=CUSTOM_RANGE, limit=10)
+
+        assert result["status"] == "success"
+        assert result["count"] == 0
+        assert result["has_more"] is False
+        assert any("beyond this offset" in w for w in result["warnings"])
+        # Bounded: one initial search + PREMATURE_REISSUE_LIMIT re-issues.
+        assert fake._attempt == 1 + log_tools.PREMATURE_REISSUE_LIMIT
+
+
 class TestReconnectOnce:
     async def test_query_logs_reconnects_when_session_dropped(
         self, monkeypatch: pytest.MonkeyPatch
