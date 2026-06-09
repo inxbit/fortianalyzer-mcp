@@ -5,7 +5,32 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.1] - 2026-06-09
+
+Reliability hardening for FortiAnalyzer 7.6.7. PR [#18](https://github.com/rstierli/fortianalyzer-mcp/pull/18) by [@inxbit](https://github.com/inxbit). 529 unit tests pass; live-verified end-to-end on a 7.6.7 appliance.
+
+### Fixed
+- **Log search no longer drains the appliance search-slot pool on FortiAnalyzer 7.6.7.** The shared page runner used to call `logsearch_fetch` immediately after `logsearch_start`, before the async search had finished. On 7.6.7 that premature fetch returned an incomplete page **and reaped the single-use tid**, so the runner re-issued a fresh `logsearch_start` ~once/second for 60s — no search ever completed, and the ~60 starts drained the appliance's search-slot pool (`query_logs` / `fetch_more_logs` / bounded policy slices / PCAP searches all returned zero rows / `search_timeout` / `No available slot for searching`). Replaced with a shared `_run_logsearch_page` whose contract is **poll-before-fetch**: `ensure_connected → logsearch_start → poll logsearch_count` (a cheap GET that does NOT reap the tid) until the scan is complete, then `logsearch_fetch` exactly once. Readiness is `progress-percent >= 100` OR (`total-logs > 0` AND `scanned-logs >= total-logs`) — `matched-logs` is deliberately not a readiness signal.
+- **Server lifecycle no longer disconnects the shared client around every HTTP request.** `FastMCP(lifespan=...)` with `stateless_http=True` runs the lifespan per request/session, so the global `faz_client` was being connected then disconnected around every call, dropping the session out from under concurrent requests. Lifecycle ownership moved to `run_http`'s `app_lifespan` (Starlette-level) and `run_stdio`'s coroutine — a single owner for the server's lifetime.
+- **Concurrent reconnects no longer race to tear down a revived session.** `_force_reconnect` is now serialized by an `asyncio.Lock` with a generation counter — when several concurrent requests all hit a dropped session, only the first re-logs in; the others observe the bumped generation and return without clearing the revived `_fmg`.
+- **Relative time-range windows no longer silently miss recent logs after an upgrade.** FAZ interprets the naive `time-range` timestamps a logview search sends against its LogView ingest clock, which can drift from system "now" — notably after a version upgrade — so a relative window like `"1-hour"` anchored on system-now could land *ahead* of the newest ingested log and return zero rows even though traffic exists. Relative windows are now anchored on the appliance's LogView clock via a probe chain (`logfiles_state → logstats → faz_tz → naive`), with ±2-day / +400-day plausibility guards. Custom absolute ranges (`"start|end"`) skip the probe.
+
+### Added
+- **Bounded concurrent in-flight searches across every call site in this process.** A global `asyncio.Semaphore(LOGSEARCH_CONCURRENCY_LIMIT=4)` wraps the page runner, so `query_logs`, `fetch_more_logs`, the policy fan-out, and PCAP searches share one cap. Because a search now **holds** a slot for its whole budget (poll-before-fetch), the appliance-slot guard lives at the shared runner rather than only in the policy fan-out.
+- **Shared bounded recovery budget across all reissue causes.** A single `MAX_SEARCH_REISSUES=3` budget covers invalid-tid during count, the invalid-tid race during fetch, and the "premature 100%" empty page — so a reaping appliance can spin at most `1 + MAX_SEARCH_REISSUES = 4` starts per page and is bounded by the wall-clock deadline as well. No new start or fetch is issued past the deadline.
+- **Bounded `logsearch_count` and `logsearch_fetch` awaits.** Both calls are wrapped in `asyncio.wait_for` against the remaining wall-clock budget, so a stuck count/fetch cannot extend the slot hold past the search's own timeout.
+- **Shielded best-effort cleanup-cancel on non-delivered exits.** Any path that leaves a started search un-fetched (count/fetch error, cancellation, deadline) issues a `logsearch_cancel` under `asyncio.shield(asyncio.wait_for(..., 2.0))` so a cancelled request still dispatches the cancel before the `CancelledError` propagates. If even the dispatch cannot run, the appliance reaps the single-use task on its own.
+- **`MAX_SEARCH_TIMEOUT = 300s` upper bound on a single search's wall-clock budget.** Prevents a caller passing a huge timeout from monopolizing a concurrency slot.
+- **Fallback for older builds without `logsearch/count`.** A clear unsupported-endpoint error (e.g. `Unknown URL`) falls back to a single direct fetch on the same tid and caches the per-client flag so subsequent searches skip the count probe entirely. Invalid-tid and timeout errors deliberately do NOT trigger the fallback.
+- **`time_basis_source` and `clock_skew_seconds` on log-query responses.** Surfaces the LogView clock detection outcome (`logfiles_state` / `logstats` / `faz_tz` / `naive`) so callers can audit which clock anchored the window and by how much it skewed from FAZ "now".
+- **`tests/test_logsearch_runner.py`** (646 lines): regression coverage that makes the fakes raise invalid-tid on fetch-before-complete, so the "exactly one start" assertions would fail against the old fetch-first runner. Pins the no-slot-exhaustion contract, the shared-budget cap, deadline behavior across 5 separate branches, leak cleanup, concurrency-cap saturation, and the count-unsupported fallback.
+
+### Security
+- **Defense-in-depth path-traversal guard on the report raw-save branch.** `save_report` now asserts the resolved output file stays within the validated output directory, mirroring the ZIP-extract guard added in 1.3.0.
+
+## [2.0.0] - 2026-06-09
+
+Breaking change: policy `estimated_total_hits` / `estimate_available` removed in favor of authoritative `total_hits` + `total_hits_is_known` + `total_hit_source`. See **Changed** section. PR [#17](https://github.com/rstierli/fortianalyzer-mcp/pull/17) by [@inxbit](https://github.com/inxbit).
 
 ### Fixed
 - **Log search restored on FortiAnalyzer 7.6.7.** After upgrading from 7.4.x to 7.6.7, the log-search tools (`query_logs`, the `search_*` helpers, and the policy-analysis tools) regressed to zero rows and intermittent `Not connected` / `Invalid JSON response` / `search_timeout` errors, while FortiView kept returning traffic from the same appliance. Four independent defects were addressed:
