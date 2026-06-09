@@ -20,10 +20,7 @@ from typing import Any, cast
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tools.log_tools import (
-    PREMATURE_REISSUE_LIMIT,
-    _is_invalid_tid_error,
-    _normalize_logs,
-    _page_is_final,
+    _run_logsearch_page,
 )
 from fortianalyzer_mcp.utils.log_clock import resolve_time_window
 from fortianalyzer_mcp.utils.responses import error_response
@@ -45,7 +42,6 @@ _QUERY_SEMAPHORE = asyncio.Semaphore(5)
 
 # Default and max search parameters
 DEFAULT_SEARCH_TIMEOUT = 120
-POLL_INTERVAL = 1.0
 LOG_FETCH_LIMIT = 1000
 ANALYSIS_QUERY_BUDGET = 24
 MAX_SLICES_PER_POLICY = 4
@@ -227,17 +223,6 @@ def _build_bounded_time_slices(
 _build_device_filter = build_device_filter
 
 
-def _coerce_log_total(value: Any) -> int | None:
-    """Coerce a FAZ logsearch total-count value to int."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return None
-
-
 async def _query_policy_log_slice(
     adom: str,
     device_filter: list[dict[str, str]],
@@ -249,70 +234,49 @@ async def _query_policy_log_slice(
 ) -> dict[str, Any]:
     """Query traffic logs and total-count for a single policy/time slice.
 
-    Each attempt is its own search because a FortiAnalyzer logsearch ``tid`` is
-    single-use: the first fetch delivers the slice plus ``total-count`` and the
-    task is reaped. The fetch usually returns ``percentage>=100`` on the first
-    try; if it comes back incomplete, or the task was already reaped before our
-    fetch (an invalid-tid error), the search is re-issued from scratch rather
-    than re-fetching the reaped tid. Re-issues are bounded by the wall-clock
-    ``timeout``; on expiry an empty result with an unknown total is returned.
+    Delegates to the shared :func:`_run_logsearch_page` runner, which polls
+    ``logsearch_count`` (a cheap GET that does not reap the single-use ``tid``)
+    until the scan is complete and then fetches exactly once -- so we never fetch
+    a still-running search. The runner owns connection revival, limit/timeout
+    clamping, the global concurrency guard, and all bounded re-issue/cancel
+    recovery (invalid-tid races and 7.6.7 premature-100% empty pages). On a
+    timed-out page an empty result with an unknown total is returned.
     """
     client = _get_client()
     filter_str = _build_policy_filter(policy_id, action)
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    premature_retries_left = PREMATURE_REISSUE_LIMIT
 
-    while True:
-        start_result = await client.logsearch_start(
+    try:
+        page = await _run_logsearch_page(
+            client,
             adom=adom,
             logtype="traffic",
-            device=device_filter,
+            device_filter=device_filter,
             time_range=time_range,
             filter=filter_str,
+            offset=0,
             limit=limit,
+            timeout=timeout,
         )
-        tid = start_result.get("tid")
-        if not tid:
-            logger.warning(f"No TID returned for policy {policy_id}: {start_result}")
-            return {"logs": [], "total_hits": None, "total_hits_is_known": False}
+    except RuntimeError as exc:
+        # An abnormal start with no TID would abort the whole policy fan-out;
+        # for one slice, degrade to an empty/unknown result (as the prior
+        # fetch-first slice did) so other slices/policies still report.
+        if "no TID returned" not in str(exc):
+            raise
+        logger.warning(f"No TID returned for policy {policy_id}: {exc}")
+        return {"logs": [], "total_hits": None, "total_hits_is_known": False}
 
-        fetch_result: dict[str, Any] | None
-        try:
-            fetch_result = await client.logsearch_fetch(adom=adom, tid=tid, limit=limit, offset=0)
-        except Exception as exc:
-            # Task reaped before our fetch -> re-issue (bounded by deadline).
-            if not _is_invalid_tid_error(exc):
-                raise
-            fetch_result = None
+    if page["timed_out"]:
+        logger.warning(f"Search timed out for policy {policy_id}")
+        return {"logs": [], "total_hits": None, "total_hits_is_known": False}
 
-        reissue_immediately = False
-        if fetch_result is not None and fetch_result.get("percentage", 0) >= 100:
-            logs = [log for log in _normalize_logs(fetch_result.get("data")) if isinstance(log, dict)]
-            total_hits = _coerce_log_total(fetch_result.get("total-count"))
-            # 7.6.7 can report 100% with an empty page while total-count claims
-            # rows; re-issue a bounded number of times before accepting the page.
-            if _page_is_final(logs, total_hits, 0) or premature_retries_left <= 0:
-                return {
-                    "logs": logs,
-                    "total_hits": total_hits,
-                    "total_hits_is_known": total_hits is not None,
-                }
-            premature_retries_left -= 1
-            reissue_immediately = True
-
-        # Incomplete (the single-use task is now reaped), reaped before fetch, or
-        # a premature-100 re-issue: run a fresh search until the budget is spent.
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            try:
-                await client.logsearch_cancel(adom, tid)
-            except (OSError, RuntimeError):
-                pass
-            logger.warning(f"Search timed out for policy {policy_id}")
-            return {"logs": [], "total_hits": None, "total_hits_is_known": False}
-        if not reissue_immediately:
-            await asyncio.sleep(min(POLL_INTERVAL, remaining))
+    logs = [log for log in page["logs"] if isinstance(log, dict)]
+    total_hits = page["total"]
+    return {
+        "logs": logs,
+        "total_hits": total_hits,
+        "total_hits_is_known": total_hits is not None,
+    }
 
 
 async def _query_policy_total_count(
