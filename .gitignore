@@ -76,7 +76,7 @@ dmypy.json
 # Package Managers
 # =============================================================================
 .uv/
-uv.lock
+# uv.lock is intentionally tracked: dependency lockfile for SCA + reproducible installs
 pip-log.txt
 pip-delete-this-directory.txt
 poetry.lock

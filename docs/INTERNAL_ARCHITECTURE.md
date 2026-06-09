@@ -471,6 +471,10 @@ ERROR_CODE_MAP = {
   (`has_more and total >= max(10*limit, 10000)`) that should use the bounded policy tools
 - `time_range`, `timezone`, `time_basis` — the resolved `{start, end}` window and
   the FAZ timezone the naive timestamps are interpreted in
+- `time_basis_source`, `clock_skew_seconds` — which clock a relative window was
+  anchored on (`logfiles_state` | `logstats` | `faz_tz` | `naive` | `custom`,
+  resolved by `utils/log_clock.py`) and the detected LogView-vs-system clock
+  offset in seconds (when measurable)
 - `tid` — a **reusable pagination handle**, not the single-use appliance task id
 
 Every error path (across `query_logs`, `fetch_more_logs`, the `search_*` helpers,
@@ -481,7 +485,8 @@ and the three policy tools) returns one envelope built by
 request retries `client._execute_resilient` performed (0 on non-retry paths).
 `message` is redacted (secrets masked) and length-bounded.
 
-The bounded policy tools add top-level `adom`/`time_range`/`timezone` and a
+The bounded policy tools add top-level `adom`/`time_range`/`timezone`/
+`time_basis_source`/`clock_skew_seconds` and a
 per-policy `filter`, plus per-policy `total_hits`, `total_hits_is_known`, and
 `total_hit_source` (`"logsearch_total-count"` when the count is authoritative,
 `"observed_rows"` when it fell back to fetched rows). The analysis window is
