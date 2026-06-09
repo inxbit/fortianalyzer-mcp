@@ -33,6 +33,21 @@ opaque key in a local registry — never re-sent to the appliance as a live task
 fresh search at the new offset from the registered params.
 _Avoid_: implying it is a still-live appliance task.
 
+**Baseline total**:
+The whole-window total-count observed on the *first* page fetched for a Pagination handle. The MCP
+reports it as that handle's `total` for every subsequent page, so the headline figure does not wobble
+as the appliance re-counts the same frozen window. The latest page's raw total-count is surfaced
+separately as the page observation, never overwriting the baseline.
+_Avoid_: treating it as a live, exact, per-page count.
+
+**Total drift**:
+When a later page's re-run search reports a different total-count than the Baseline total for the
+*same frozen window* — caused by rows indexed into that window after the first page was fetched (not a
+sliding window; the bounds are fixed absolute timestamps). Surfaced explicitly: the broad/high-volume
+total is non-exact, and because each page re-runs the search, row offsets may also shift (duplicate or
+skipped rows possible).
+_Avoid_: "pagination bug" (offsets are stable; the appliance's match count changed).
+
 **Premature-100**:
 FAZ 7.6.7 behavior where a fetch reports `percentage >= 100` with empty `data` while more rows exist
 (`total-count > offset`). Triggers a bounded re-issue.
