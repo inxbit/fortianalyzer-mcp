@@ -72,7 +72,10 @@ class Settings(BaseSettings):
 
     # MCP Server Settings
     MCP_SERVER_HOST: str = Field(
-        default="0.0.0.0",
+        # Operator-controlled bind. The HTTP transport is fail-closed
+        # (MCP_AUTH_TOKEN required, see server._ensure_http_auth_or_die), so a
+        # 0.0.0.0 bind is never unauthenticated.
+        default="0.0.0.0",  # nosec B104
         description="MCP server bind address",
     )
 
@@ -94,6 +97,14 @@ class Settings(BaseSettings):
         default=None,
         description="Bearer token for HTTP auth. If set, all HTTP requests (except /health) "
         "must include Authorization: Bearer <token>",
+    )
+
+    MCP_ALLOW_NO_AUTH: bool = Field(
+        default=False,
+        description="Explicit opt-out to run the HTTP transport WITHOUT authentication when "
+        "MCP_AUTH_TOKEN is unset. Default False = fail closed: the HTTP server refuses to start "
+        "without a token, so destructive tools are never exposed unauthenticated. Only enable on "
+        "a trusted, isolated bind (e.g. 127.0.0.1 behind a gateway).",
     )
 
     # MCP Allowed Hosts (for reverse proxy / Docker deployments)

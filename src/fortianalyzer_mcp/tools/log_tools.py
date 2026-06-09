@@ -452,7 +452,8 @@ async def _run_logsearch_page_unlocked(
                         )
                     )
                 except Exception:  # noqa: BLE001 - cleanup must not mask the real exit
-                    pass
+                    # intentional best-effort cleanup cancel
+                    pass  # nosec B110
 
 
 def _get_client():
@@ -1145,7 +1146,7 @@ async def get_log_stats(
         }
     except Exception as e:
         logger.error(f"Failed to get log stats for ADOM {adom}: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": redact(str(e))}
 
 
 @mcp.tool()
@@ -1184,7 +1185,7 @@ async def get_log_fields(
         }
     except Exception as e:
         logger.error(f"Failed to get log fields: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": redact(str(e))}
 
 
 @mcp.tool()
@@ -1525,7 +1526,7 @@ async def get_logfiles_state(
         }
     except Exception as e:
         logger.error(f"Failed to get log files state: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": redact(str(e))}
 
 
 @mcp.tool()
@@ -1578,4 +1579,4 @@ async def get_pcap_file(
         return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to get PCAP file: {e}")
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": redact(str(e))}
