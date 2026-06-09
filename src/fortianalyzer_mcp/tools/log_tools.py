@@ -229,10 +229,7 @@ def _search_complete(count: dict[str, Any]) -> bool:
     total_logs = _coerce_num(count.get("total-logs"))
     scanned = _coerce_num(count.get("scanned-logs"))
     return (
-        total_logs is not None
-        and total_logs > 0
-        and scanned is not None
-        and scanned >= total_logs
+        total_logs is not None and total_logs > 0 and scanned is not None and scanned >= total_logs
     )
 
 
