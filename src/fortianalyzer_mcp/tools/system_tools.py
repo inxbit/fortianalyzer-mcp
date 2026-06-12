@@ -6,14 +6,15 @@ Based on FNDN FortiAnalyzer 7.6.5 SYS, DVMDB, CLI, and TASK API specifications.
 import logging
 from typing import Any
 
+from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.responses import redact
-from fortianalyzer_mcp.utils.validation import get_default_adom
+from fortianalyzer_mcp.utils.validation import get_default_adom, sanitize_for_logging
 
 logger = logging.getLogger(__name__)
 
 
-def _get_client():
+def _get_client() -> FortiAnalyzerClient:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -208,7 +209,9 @@ async def list_devices(
         return {
             "status": "success",
             "count": len(devices),
-            "devices": devices,
+            # DVMDB device objects carry credential material (adm_pass, etc.);
+            # mask it before returning over MCP.
+            "devices": sanitize_for_logging(devices),
         }
     except Exception as e:
         logger.error(f"Failed to list devices in ADOM {adom}: {e}")
@@ -246,7 +249,9 @@ async def get_device(
         device = await client.get_device(name, adom, loadsub=loadsub)
         return {
             "status": "success",
-            "device": device,
+            # DVMDB device objects carry credential material (adm_pass, etc.);
+            # mask it before returning over MCP.
+            "device": sanitize_for_logging(device),
         }
     except Exception as e:
         logger.error(f"Failed to get device {name}: {e}")
@@ -385,10 +390,10 @@ async def wait_for_task(
 
     try:
         client = _get_client()
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
 
         while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout:
                 return {
                     "status": "error",

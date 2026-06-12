@@ -8,15 +8,16 @@ import asyncio
 import logging
 from typing import Any
 
+from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.responses import redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
-from fortianalyzer_mcp.utils.validation import get_default_adom
+from fortianalyzer_mcp.utils.validation import build_device_filter, get_default_adom
 
 logger = logging.getLogger(__name__)
 
 
-def _get_client():
+def _get_client() -> FortiAnalyzerClient:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -102,7 +103,7 @@ async def acknowledge_ioc_events(
 
         result = await client.acknowledge_ioc_events(
             adom=adom,
-            ioc_ids=ioc_ids,
+            event_ids=ioc_ids,
             user=user,
         )
 
@@ -153,7 +154,7 @@ async def run_ioc_rescan(
 
         result = await client.ioc_rescan_run(
             adom=adom,
-            device=device,
+            device=build_device_filter(device),
             time_range=tr,
         )
 
@@ -300,7 +301,7 @@ async def run_and_wait_ioc_rescan(
         # Start the rescan
         run_result = await client.ioc_rescan_run(
             adom=adom,
-            device=device,
+            device=build_device_filter(device),
             time_range=tr,
         )
 
@@ -312,11 +313,11 @@ async def run_and_wait_ioc_rescan(
             }
 
         # Poll for completion
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         poll_interval = 2.0
 
         while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout:
                 return {
                     "status": "timeout",
@@ -328,7 +329,9 @@ async def run_and_wait_ioc_rescan(
 
             if isinstance(status_result, dict):
                 state = status_result.get("state", status_result.get("status", ""))
-                percentage = status_result.get("percentage", status_result.get("percent", 0))
+                raw_pct = status_result.get("percentage", status_result.get("percent", 0))
+                # FAZ can send a null percentage; treat anything non-numeric as 0.
+                percentage = raw_pct if isinstance(raw_pct, (int, float)) else 0
 
                 if state in ("done", "completed") or percentage >= 100:
                     return {

@@ -5,6 +5,31 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+QA pass across all tool modules: one broken tool fixed, FortiView correctness fix, credential-leak fix on device tools, blocking-I/O offload, and assorted hardening. 558 unit tests pass (18 new regression tests in `tests/test_tool_regressions.py`).
+
+### Fixed
+- **`acknowledge_ioc_events` was completely broken.** The tool called the client with `ioc_ids=` but `FortiAnalyzerClient.acknowledge_ioc_events()` takes `event_ids=`, so every invocation raised `TypeError` and returned an error response. The regression test uses a signature-accurate fake client so a plain `MagicMock` can never hide this class of bug again.
+- **`run_and_wait_report` verifies completion instead of assuming it.** When the TID disappeared from the running-reports list the tool returned `status: success` without checking whether the report actually generated. It now confirms via `report_fetch`: `state == "generated"` is success, `pending`/`running` keeps polling (covers the startup race where the TID is not yet visible in the running list), anything else is an error (live-verified states on 7.6.7: `running` → `generated`).
+- **`run_ioc_rescan` / `run_and_wait_ioc_rescan` send a proper device filter.** Both passed the raw `device` string (or `None`) where the API expects a filter list like `[{"devid": ...}]`; they now route through the shared `build_device_filter()` like the log tools. The rescan status poll also tolerates a null `percentage` instead of crashing on `None >= 100`.
+- **`execute_advanced_tool` could not dispatch the layout-listing tool.** Its dispatch map still referenced `report_tools.list_report_templates`, which no longer exists, so any call to the dynamic dispatcher raised `AttributeError` while building the map; the entry is now `list_report_layouts`.
+- **`mypy src/` is clean (was 75 errors).** The JSON-RPC helpers now have a single typed cast point (`_request_dict` / `_raw_request_dict`), the per-tool `_get_client()` helpers are annotated with `FortiAnalyzerClient` (this typing surfaced the two IOC-rescan bugs above), and `filter` parameters accept the nested `[field, op, value]` triples FAZ actually takes.
+- **`get_fortiview_data` (and the `get_top_*` convenience tools) no longer return partial results.** The polling loop exited on the first non-empty `data` even when `percentage < 100`, handing back incomplete aggregates (wrong top-N rankings). It now polls until `percentage >= 100`; a missing `percentage` still defaults to complete so older builds return immediately.
+- **FortiVoice serials now build a `devid` filter.** `FV` was accepted by `DEVICE_SERIAL_PATTERN` but missing from `_DEVICE_SERIAL_PREFIXES`, so an FV serial passed as `device` was sent as a `devname` filter and matched nothing.
+
+### Security
+- **Device tools no longer return credential material.** `list_devices`, `get_device`, `search_devices`, and `get_device_info` returned raw DVMDB device objects, which include the `adm_pass` encrypted-credential blob (verified live on 7.6.7). Device objects are now passed through the existing sensitive-field masker before leaving the tool.
+- **ZIP extraction caps the actual decompressed bytes.** The PCAP and report extract paths checked only `ZipInfo.file_size` — central-directory metadata that a crafted archive can understate — before `zf.read()`. All four sites now stream-read at most the size cap + 1 byte and error out when exceeded, bounding memory regardless of what the ZIP header claims.
+- **Auth token comparison no longer leaks token length.** `hmac.compare_digest` returns early on length mismatch, so an attacker could probe the bearer-token length via response timing. Both sides are now hashed (SHA-256) before the constant-time compare.
+- **Mutation tools validate inputs before they reach the appliance.** `add_device` / `delete_device` / `add_devices_bulk` / `delete_devices_bulk` now run `validate_adom` / `validate_device_name`; `create_incident` / `update_incident` validate `severity` and `status` against their documented allowlists.
+
+### Changed
+- **Blocking pyfmg I/O moved off the event loop.** Every pyfmg call (login, logout, raw LogView POST, and the generic verb methods) ran synchronous `requests` I/O directly on the asyncio event loop, starving every other coroutine — health checks, MCP keepalives, concurrent tool calls — for up to `FORTIANALYZER_TIMEOUT` per request. These calls now run via `asyncio.to_thread`, serialized by a per-client `asyncio.Lock` (pyfmg shares one non-thread-safe `requests.Session` and `req_id` counter), which preserves the previous one-request-at-a-time behavior while keeping the loop responsive. `connect()` holds the same lock across its connected-check and login so concurrent connects cannot double-login.
+- `asyncio.get_event_loop()` replaced with `asyncio.get_running_loop()` in the five polling loops (log, fortiview, report, system, ioc) — the former is a deprecated alias inside coroutines on Python 3.12.
+- **Single `ValidationError` class.** `utils.validation.ValidationError(ValueError)` and `utils.errors.ValidationError(FortiAnalyzerError)` were two unrelated classes with the same name. The canonical class now lives in `utils.errors`, subclasses both `FortiAnalyzerError` and `ValueError`, and is re-exported from `utils.validation` so existing imports keep working.
+- `.python-version` added to `.gitignore` (local interpreter pin, not project state).
+
 ## [2.2.0] - 2026-06-12
 
 Fail closed: the streamable-HTTP transport now refuses to start without `MCP_AUTH_TOKEN` unless the operator explicitly opts out with `MCP_ALLOW_NO_AUTH=true`. PR [#25](https://github.com/rstierli/fortianalyzer-mcp/pull/25) by [@inxbit](https://github.com/inxbit). Closes [#20](https://github.com/rstierli/fortianalyzer-mcp/issues/20). 544 unit tests pass.

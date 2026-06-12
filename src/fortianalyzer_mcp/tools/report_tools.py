@@ -12,6 +12,7 @@ import os
 import zipfile
 from typing import Any
 
+from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.responses import redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
@@ -26,7 +27,7 @@ from fortianalyzer_mcp.utils.validation import (
 logger = logging.getLogger(__name__)
 
 
-def _get_client():
+def _get_client() -> FortiAnalyzerClient:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -120,13 +121,15 @@ async def _get_layout_id_by_title(client: Any, adom: str, title: str) -> int | N
         for layout in layouts:
             layout_title = layout.get("title", "")
             if layout_title.lower() == title_lower:
-                return layout.get("layout-id")
+                layout_id = layout.get("layout-id")
+                return layout_id if isinstance(layout_id, int) else None
 
         # Try partial match if exact match fails
         for layout in layouts:
             layout_title = layout.get("title", "")
             if title_lower in layout_title.lower():
-                return layout.get("layout-id")
+                layout_id = layout.get("layout-id")
+                return layout_id if isinstance(layout_id, int) else None
 
         return None
     except Exception as e:
@@ -624,11 +627,11 @@ async def run_and_wait_report(
             }
 
         # Step 5: Poll for completion using get_running_reports
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         poll_interval = 3.0
 
         while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout:
                 return {
                     "status": "timeout",
@@ -669,18 +672,34 @@ async def run_and_wait_report(
                         "message": "Report completed. Use get_report_data() to download.",
                     }
             else:
-                # Report not in running list - either completed or failed
-                # Try to get report data to confirm completion
-                logger.info(f"Report {tid} no longer in running list, checking if completed")
-                return {
-                    "status": "success",
-                    "tid": tid,
-                    "layout": layout,
-                    "layout_id": layout_id,
-                    "adom": adom,
-                    "time_period": time_period,
-                    "message": "Report completed. Use get_report_data() to download.",
-                }
+                # Report not in running list - either completed or failed.
+                # Verify via report_fetch instead of assuming success
+                # (state is "generated" on completion; a vanished tid raises).
+                logger.info(f"Report {tid} not in running list, verifying completion")
+                fetch_result = await client.report_fetch(adom=adom, tid=tid)
+                state = fetch_result.get("state") if isinstance(fetch_result, dict) else None
+                if state == "generated":
+                    return {
+                        "status": "success",
+                        "tid": tid,
+                        "layout": layout,
+                        "layout_id": layout_id,
+                        "adom": adom,
+                        "time_period": time_period,
+                        "message": "Report completed. Use get_report_data() to download.",
+                    }
+                if state not in ("pending", "running"):
+                    return {
+                        "status": "error",
+                        "tid": tid,
+                        "layout": layout,
+                        "layout_id": layout_id,
+                        "adom": adom,
+                        "time_period": time_period,
+                        "message": f"Report ended in state '{state}' without completing.",
+                    }
+                # pending/running: not yet visible in the running list
+                # (startup race); fall through and keep polling.
 
             await asyncio.sleep(poll_interval)
 
@@ -781,9 +800,21 @@ async def save_report(
                             "message": f"Total extraction size exceeds limit ({MAX_TOTAL_SIZE} bytes)",
                         }
 
-                    # Read file content
-                    content = zf.read(filename)
+                    # Read file content. The central-directory file_size above is
+                    # untrusted metadata; cap the actual decompressed bytes too.
+                    with zf.open(filename) as src:
+                        content = src.read(MAX_EXTRACT_SIZE + 1)
+                    if len(content) > MAX_EXTRACT_SIZE:
+                        return {
+                            "status": "error",
+                            "message": f"File too large: {filename} (exceeds {MAX_EXTRACT_SIZE} bytes)",
+                        }
                     total_extracted += len(content)
+                    if total_extracted > MAX_TOTAL_SIZE:
+                        return {
+                            "status": "error",
+                            "message": f"Total extraction size exceeds limit ({MAX_TOTAL_SIZE} bytes)",
+                        }
 
                     # Determine output filename
                     # Use original filename or create based on report name

@@ -8,6 +8,7 @@ import asyncio
 import logging
 from typing import Any
 
+from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.responses import redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
@@ -21,7 +22,7 @@ from fortianalyzer_mcp.utils.validation import (
 logger = logging.getLogger(__name__)
 
 
-def _get_client():
+def _get_client() -> FortiAnalyzerClient:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -279,11 +280,11 @@ async def get_fortiview_data(
             }
 
         # Poll for results
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         poll_interval = 0.5
 
         while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout:
                 return {
                     "status": "timeout",
@@ -297,12 +298,15 @@ async def get_fortiview_data(
                 tid=tid,
             )
 
-            # Check if we have data
+            # Only return once the query is complete; returning on first
+            # non-empty data hands back partial aggregates (wrong top-N).
+            # A missing percentage defaults to 100 so builds that omit it
+            # still return immediately.
             if isinstance(fetch_result, dict):
                 data = fetch_result.get("data", [])
                 percentage = fetch_result.get("percentage", 100)
 
-                if percentage >= 100 or data:
+                if percentage >= 100:
                     if not isinstance(data, list):
                         data = [data] if data else []
 
@@ -353,7 +357,7 @@ async def get_top_sources(
         >>> for source in result["data"]:
         ...     print(f"{source['srcip']}: {source['bandwidth']} bytes")
     """
-    return await get_fortiview_data(
+    result: dict[str, Any] = await get_fortiview_data(
         view_name="top-sources",
         adom=adom,
         device=device,
@@ -361,6 +365,7 @@ async def get_top_sources(
         limit=limit,
         sort_by=sort_by,
     )
+    return result
 
 
 @mcp.tool()
@@ -385,7 +390,7 @@ async def get_top_destinations(
     Returns:
         dict with top destinations data
     """
-    return await get_fortiview_data(
+    result: dict[str, Any] = await get_fortiview_data(
         view_name="top-destinations",
         adom=adom,
         device=device,
@@ -393,6 +398,7 @@ async def get_top_destinations(
         limit=limit,
         sort_by=sort_by,
     )
+    return result
 
 
 @mcp.tool()
@@ -422,7 +428,7 @@ async def get_top_applications(
         >>> for app in result["data"]:
         ...     print(f"{app['app']}: {app['bandwidth']} bytes")
     """
-    return await get_fortiview_data(
+    result: dict[str, Any] = await get_fortiview_data(
         view_name="top-applications",
         adom=adom,
         device=device,
@@ -430,6 +436,7 @@ async def get_top_applications(
         limit=limit,
         sort_by=sort_by,
     )
+    return result
 
 
 @mcp.tool()
@@ -462,7 +469,7 @@ async def get_top_threats(
         >>> for threat in result["data"]:
         ...     print(f"{threat['threat']}: {threat['threatweight']} score")
     """
-    return await get_fortiview_data(
+    result: dict[str, Any] = await get_fortiview_data(
         view_name="top-threats",
         adom=adom,
         device=device,
@@ -470,6 +477,7 @@ async def get_top_threats(
         limit=limit,
         sort_by=sort_by,
     )
+    return result
 
 
 @mcp.tool()
@@ -494,7 +502,7 @@ async def get_top_websites(
     Returns:
         dict with top websites data
     """
-    return await get_fortiview_data(
+    result: dict[str, Any] = await get_fortiview_data(
         view_name="top-websites",
         adom=adom,
         device=device,
@@ -502,6 +510,7 @@ async def get_top_websites(
         limit=limit,
         sort_by=sort_by,
     )
+    return result
 
 
 @mcp.tool()
@@ -526,7 +535,7 @@ async def get_top_cloud_applications(
     Returns:
         dict with top cloud applications data
     """
-    return await get_fortiview_data(
+    result: dict[str, Any] = await get_fortiview_data(
         view_name="top-cloud-applications",
         adom=adom,
         device=device,
@@ -534,6 +543,7 @@ async def get_top_cloud_applications(
         limit=limit,
         sort_by=sort_by,
     )
+    return result
 
 
 @mcp.tool()
@@ -560,7 +570,7 @@ async def get_policy_hits(
     Returns:
         dict with policy hit statistics including policyid
     """
-    return await get_fortiview_data(
+    result: dict[str, Any] = await get_fortiview_data(
         view_name="policy-hits",
         adom=adom,
         device=device,
@@ -568,3 +578,4 @@ async def get_policy_hits(
         limit=limit,
         sort_by=sort_by,
     )
+    return result

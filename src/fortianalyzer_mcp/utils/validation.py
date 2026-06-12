@@ -13,6 +13,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+# Canonical ValidationError lives in utils.errors (also mapped from FAZ
+# error code -5); re-exported here so validator callers keep importing it
+# from this module.
+from fortianalyzer_mcp.utils.errors import ValidationError
+
 # Sensitive fields that should be masked in logs
 SENSITIVE_FIELDS = {
     "password",
@@ -211,12 +216,6 @@ _PCAPURL_RE = re.compile(r"^[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%\-]+$")
 _PCAPURL_MAX_LEN = 4096
 
 
-class ValidationError(ValueError):
-    """Raised when input validation fails."""
-
-    pass
-
-
 def validate_adom(adom: str) -> str:
     """Validate ADOM name format.
 
@@ -309,7 +308,7 @@ def validate_device_serial(serial: str) -> str:
 # Serial-number prefixes used to decide whether a device string is a serial
 # (devid) or a device name (devname). Kept here as the single source of truth so
 # every tool builds the FAZ device filter identically.
-_DEVICE_SERIAL_PREFIXES = ("FG", "FM", "FW", "FA", "FS", "FD", "FP", "FC")
+_DEVICE_SERIAL_PREFIXES = ("FG", "FM", "FW", "FA", "FS", "FD", "FP", "FC", "FV")
 
 
 def build_device_filter(device: str | None) -> list[dict[str, str]]:

@@ -1,5 +1,6 @@
 """FortiAnalyzer MCP Server implementation."""
 
+import hashlib
 import hmac
 import logging
 from collections.abc import AsyncIterator
@@ -143,7 +144,7 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
                 ("get_policy_hits", "Get policy hit statistics"),
             ],
             "reports": [
-                ("list_report_templates", "List report templates"),
+                ("list_report_layouts", "List runnable report layouts"),
                 ("run_report", "Run a report"),
                 ("fetch_report", "Fetch report status"),
                 ("get_report_data", "Download report data"),
@@ -278,7 +279,7 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
             "get_top_cloud_applications": fortiview_tools.get_top_cloud_applications,
             "get_policy_hits": fortiview_tools.get_policy_hits,
             # Report tools
-            "list_report_templates": report_tools.list_report_templates,
+            "list_report_layouts": report_tools.list_report_layouts,
             "run_report": report_tools.run_report,
             "fetch_report": report_tools.fetch_report,
             "get_report_data": report_tools.get_report_data,
@@ -536,7 +537,13 @@ def run_http() -> None:
             auth_value = headers.get(b"authorization", b"").decode()
             expected = f"Bearer {settings.MCP_AUTH_TOKEN}"
 
-            if not hmac.compare_digest(auth_value, expected):
+            # Hash both sides before comparing: compare_digest short-circuits on
+            # length mismatch, which would leak the token length as a timing
+            # side-channel. Equal-length digests keep it constant-time.
+            if not hmac.compare_digest(
+                hashlib.sha256(auth_value.encode()).digest(),
+                hashlib.sha256(expected.encode()).digest(),
+            ):
                 response = Response(
                     content=json.dumps(
                         {"error": "Unauthorized", "detail": "Invalid or missing Bearer token"}

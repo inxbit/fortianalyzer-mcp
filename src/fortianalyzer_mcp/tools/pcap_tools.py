@@ -15,6 +15,7 @@ import zipfile
 from datetime import datetime
 from typing import Any
 
+from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tools.log_tools import _clamp_timeout, _run_logsearch_page
 from fortianalyzer_mcp.utils.responses import redact
@@ -43,7 +44,7 @@ DEFAULT_SEARCH_TIMEOUT = 60
 MAX_PCAP_SIZE = 50 * 1024 * 1024  # 50MB per PCAP file
 
 
-def _get_client():
+def _get_client() -> FortiAnalyzerClient:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -502,7 +503,16 @@ async def get_pcap_by_session(
                             "message": f"PCAP file too large: {info.file_size} bytes",
                         }
 
-                    content = zf.read(filename)
+                    # The central-directory file_size above is untrusted metadata;
+                    # cap the actual decompressed bytes too.
+                    with zf.open(filename) as src:
+                        content = src.read(MAX_PCAP_SIZE + 1)
+                    if len(content) > MAX_PCAP_SIZE:
+                        return {
+                            "status": "error",
+                            "session_id": session_id,
+                            "message": f"PCAP file too large: exceeds {MAX_PCAP_SIZE} bytes",
+                        }
                     file_size = len(content)
 
                     # Generate filename with session ID and timestamp
@@ -635,7 +645,15 @@ async def download_pcap_by_url(
                             "message": f"PCAP too large: {info.file_size} bytes",
                         }
 
-                    content = zf.read(filename)
+                    # The central-directory file_size above is untrusted metadata;
+                    # cap the actual decompressed bytes too.
+                    with zf.open(filename) as src:
+                        content = src.read(MAX_PCAP_SIZE + 1)
+                    if len(content) > MAX_PCAP_SIZE:
+                        return {
+                            "status": "error",
+                            "message": f"PCAP too large: exceeds {MAX_PCAP_SIZE} bytes",
+                        }
                     file_size = len(content)
 
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -853,7 +871,14 @@ async def search_and_download_pcaps(
                             failed_count += 1
                             break
 
-                        content = zf.read(filename)
+                        # The central-directory file_size above is untrusted
+                        # metadata; cap the actual decompressed bytes too.
+                        with zf.open(filename) as src:
+                            content = src.read(MAX_PCAP_SIZE + 1)
+                        if len(content) > MAX_PCAP_SIZE:
+                            errors.append(f"Session {session_id}: File too large")
+                            failed_count += 1
+                            break
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         base_name = os.path.basename(filename)
                         name_part = os.path.splitext(base_name)[0]
@@ -950,7 +975,7 @@ async def list_available_pcaps(
         adom = validate_adom(adom or get_default_adom())
 
         # Use search_ips_logs with has_pcap=True
-        search_result = await search_ips_logs(
+        search_result: dict[str, Any] = await search_ips_logs(
             adom=adom,
             severity=severity,
             attack_contains=attack_contains,
