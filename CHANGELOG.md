@@ -5,6 +5,16 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-06-11
+
+Fail closed: the streamable-HTTP transport now refuses to start without `MCP_AUTH_TOKEN` unless the operator explicitly opts out with `MCP_ALLOW_NO_AUTH=true`. PR [#25](https://github.com/rstierli/fortianalyzer-mcp/pull/25) by [@inxbit](https://github.com/inxbit). Closes [#20](https://github.com/rstierli/fortianalyzer-mcp/issues/20). 544 unit tests pass.
+
+### Changed
+- **The HTTP transport now fails closed when `MCP_AUTH_TOKEN` is unset.** The streamable-HTTP server fronts the full tool surface (including device add/delete and PCAP download), so it previously could serve everything unauthenticated if the token was simply forgotten. `run_http()` now refuses to start without a token and exits with a message that names the fix, unless the operator explicitly opts out with `MCP_ALLOW_NO_AUTH=true` (logged at CRITICAL; intended only for a trusted, isolated bind such as 127.0.0.1 behind a gateway). **Upgrade note:** a deployment that ran on a `0.0.0.0` bind without a token must now set either `MCP_AUTH_TOKEN` or `MCP_ALLOW_NO_AUTH=true` to keep starting.
+
+### Added
+- `MCP_ALLOW_NO_AUTH` setting (default `false`) — the explicit opt-out for running HTTP without a token. 4 tests cover token-set start, no-token fail-closed, empty-token fail-closed, and the explicit opt-out.
+
 ## [2.1.1] - 2026-06-11
 
 Security hardening: redact remaining tool error messages + warn when TLS verification is disabled. PR [#23](https://github.com/rstierli/fortianalyzer-mcp/pull/23) by [@inxbit](https://github.com/inxbit). Closes [#22](https://github.com/rstierli/fortianalyzer-mcp/issues/22). 540 unit tests pass.
