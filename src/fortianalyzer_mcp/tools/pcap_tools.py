@@ -15,6 +15,7 @@ import zipfile
 from datetime import datetime
 from typing import Any
 
+from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tools.log_tools import _clamp_timeout, _run_logsearch_page
 from fortianalyzer_mcp.utils.responses import redact
@@ -43,7 +44,7 @@ DEFAULT_SEARCH_TIMEOUT = 60
 MAX_PCAP_SIZE = 50 * 1024 * 1024  # 50MB per PCAP file
 
 
-def _get_client():
+def _get_client() -> FortiAnalyzerClient:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -974,7 +975,7 @@ async def list_available_pcaps(
         adom = validate_adom(adom or get_default_adom())
 
         # Use search_ips_logs with has_pcap=True
-        search_result = await search_ips_logs(
+        search_result: dict[str, Any] = await search_ips_logs(
             adom=adom,
             severity=severity,
             attack_contains=attack_contains,

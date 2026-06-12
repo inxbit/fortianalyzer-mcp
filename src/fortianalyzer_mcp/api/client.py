@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pyFMG.fortimgr import FortiManager
@@ -558,6 +558,18 @@ class FortiAnalyzerClient:
         """Execute EXEC request."""
         return await self._generic_request("execute", url, **kwargs)
 
+    async def _request_dict(self, verb: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        """Typed _generic_request for endpoints whose payload is a JSON object.
+
+        The JSON-RPC layer is untyped (payload shape varies by endpoint);
+        this is the single cast point for object-shaped responses.
+        """
+        return cast(dict[str, Any], await self._generic_request(verb, url, **kwargs))
+
+    async def _raw_request_dict(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        """Typed _raw_request counterpart for object-shaped LogView responses."""
+        return cast(dict[str, Any], await self._raw_request(method, url, **kwargs))
+
     # =========================================================================
     # DVMDB - Device Manager Database (from dvmdb.json)
     # =========================================================================
@@ -565,7 +577,7 @@ class FortiAnalyzerClient:
     async def list_adoms(
         self,
         fields: list[str] | None = None,
-        filter: list[str] | None = None,
+        filter: list[Any] | None = None,
         loadsub: int = 0,
     ) -> list[dict[str, Any]]:
         """List all ADOMs.
@@ -586,13 +598,13 @@ class FortiAnalyzerClient:
 
         FNDN: GET /dvmdb/adom/{adom}
         """
-        return await self.get(f"/dvmdb/adom/{name}", loadsub=loadsub)
+        return await self._request_dict("get", f"/dvmdb/adom/{name}", loadsub=loadsub)
 
     async def list_devices(
         self,
         adom: str = "root",
         fields: list[str] | None = None,
-        filter: list[str] | None = None,
+        filter: list[Any] | None = None,
         loadsub: int = 0,
     ) -> list[dict[str, Any]]:
         """List devices in ADOM.
@@ -613,7 +625,9 @@ class FortiAnalyzerClient:
 
         FNDN: GET /dvmdb/adom/{adom}/device/{device}
         """
-        return await self.get(f"/dvmdb/adom/{adom}/device/{device}", loadsub=loadsub)
+        return await self._request_dict(
+            "get", f"/dvmdb/adom/{adom}/device/{device}", loadsub=loadsub
+        )
 
     async def list_device_vdoms(self, device: str, adom: str = "root") -> list[dict[str, Any]]:
         """List VDOMs for a device.
@@ -659,7 +673,7 @@ class FortiAnalyzerClient:
         if flags:
             data["flags"] = flags
 
-        return await self.execute("/dvm/cmd/add/device", **data)
+        return await self._request_dict("execute", "/dvm/cmd/add/device", **data)
 
     async def delete_device(
         self,
@@ -675,7 +689,7 @@ class FortiAnalyzerClient:
         if flags:
             data["flags"] = flags
 
-        return await self.execute("/dvm/cmd/del/device", **data)
+        return await self._request_dict("execute", "/dvm/cmd/del/device", **data)
 
     async def add_device_list(
         self,
@@ -691,7 +705,7 @@ class FortiAnalyzerClient:
         if flags:
             data["flags"] = flags
 
-        return await self.execute("/dvm/cmd/add/dev-list", **data)
+        return await self._request_dict("execute", "/dvm/cmd/add/dev-list", **data)
 
     async def delete_device_list(
         self,
@@ -707,7 +721,7 @@ class FortiAnalyzerClient:
         if flags:
             data["flags"] = flags
 
-        return await self.execute("/dvm/cmd/del/dev-list", **data)
+        return await self._request_dict("execute", "/dvm/cmd/del/dev-list", **data)
 
     # =========================================================================
     # LogView - Log Search Operations (from logview.json)
@@ -760,7 +774,7 @@ class FortiAnalyzerClient:
         if filter:
             data["filter"] = filter
 
-        return await self._raw_request("add", f"/logview/adom/{adom}/logsearch", **data)
+        return await self._raw_request_dict("add", f"/logview/adom/{adom}/logsearch", **data)
 
     async def logsearch_fetch(
         self,
@@ -787,7 +801,7 @@ class FortiAnalyzerClient:
                 "status": {"code": 0, "message": "..."}
             }
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/logview/adom/{adom}/logsearch/{tid}",
             apiver=API_VERSION,
@@ -808,7 +822,7 @@ class FortiAnalyzerClient:
                 "total-logs": 10000
             }
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/logview/adom/{adom}/logsearch/count/{tid}",
             apiver=API_VERSION,
@@ -819,7 +833,7 @@ class FortiAnalyzerClient:
 
         FNDN: DELETE /logview/adom/{adom}/logsearch/{tid}
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "delete",
             f"/logview/adom/{adom}/logsearch/{tid}",
             apiver=API_VERSION,
@@ -835,7 +849,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /logview/adom/{adom}/logfields
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/logview/adom/{adom}/logfields",
             apiver=API_VERSION,
@@ -861,7 +875,7 @@ class FortiAnalyzerClient:
         if device:
             params["device"] = device
 
-        return await self._raw_request("get", f"/logview/adom/{adom}/logstats", **params)
+        return await self._raw_request_dict("get", f"/logview/adom/{adom}/logstats", **params)
 
     async def get_logfiles_state(
         self,
@@ -882,7 +896,7 @@ class FortiAnalyzerClient:
         if time_range:
             params["time-range"] = time_range
 
-        return await self._raw_request("get", f"/logview/adom/{adom}/logfiles/state", **params)
+        return await self._raw_request_dict("get", f"/logview/adom/{adom}/logfiles/state", **params)
 
     async def get_logfiles_data(
         self,
@@ -902,7 +916,7 @@ class FortiAnalyzerClient:
             data_type: "base64", "csv/gzip/base64", "text/gzip/base64"
             length: Max 50MB (52428800)
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/logview/adom/{adom}/logfiles/data",
             apiver=API_VERSION,
@@ -943,7 +957,9 @@ class FortiAnalyzerClient:
         if filter:
             params["filter"] = filter
 
-        return await self._raw_request("get", f"/logview/adom/{adom}/logfiles/search", **params)
+        return await self._raw_request_dict(
+            "get", f"/logview/adom/{adom}/logfiles/search", **params
+        )
 
     async def get_pcapfile(
         self,
@@ -958,7 +974,7 @@ class FortiAnalyzerClient:
             key_data: Log data (JSON or pcapurl)
             key_type: "log-data" or "pcapurl"
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             "/logview/pcapfile",
             apiver=API_VERSION,
@@ -971,7 +987,7 @@ class FortiAnalyzerClient:
 
     async def list_tasks(
         self,
-        filter: list[str] | None = None,
+        filter: list[Any] | None = None,
     ) -> list[dict[str, Any]]:
         """List all tasks.
 
@@ -989,7 +1005,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /task/task/{task_id}
         """
-        return await self.get(f"/task/task/{task_id}")
+        return await self._request_dict("get", f"/task/task/{task_id}")
 
     async def get_task_line(self, task_id: int) -> list[dict[str, Any]]:
         """Get task line details.
@@ -1008,14 +1024,14 @@ class FortiAnalyzerClient:
 
         FNDN: GET /sys/status
         """
-        return await self.get("/sys/status")
+        return await self._request_dict("get", "/sys/status")
 
     async def get_ha_status(self) -> dict[str, Any]:
         """Get HA status.
 
         FNDN: GET /sys/ha/status
         """
-        return await self.get("/sys/ha/status")
+        return await self._request_dict("get", "/sys/ha/status")
 
     # =========================================================================
     # Event Management (from eventmgmt.json)
@@ -1053,7 +1069,7 @@ class FortiAnalyzerClient:
         if filter:
             params["filter"] = filter
 
-        return await self._raw_request("get", f"/eventmgmt/adom/{adom}/alerts", **params)
+        return await self._raw_request_dict("get", f"/eventmgmt/adom/{adom}/alerts", **params)
 
     async def get_alerts_count(
         self,
@@ -1071,7 +1087,7 @@ class FortiAnalyzerClient:
         if filter:
             params["filter"] = filter
 
-        return await self._raw_request("get", f"/eventmgmt/adom/{adom}/alerts/count", **params)
+        return await self._raw_request_dict("get", f"/eventmgmt/adom/{adom}/alerts/count", **params)
 
     async def acknowledge_alerts(
         self,
@@ -1083,7 +1099,7 @@ class FortiAnalyzerClient:
 
         FNDN: UPDATE /eventmgmt/adom/{adom}/alerts/ack
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "update",
             f"/eventmgmt/adom/{adom}/alerts/ack",
             apiver=API_VERSION,
@@ -1101,7 +1117,7 @@ class FortiAnalyzerClient:
 
         FNDN: UPDATE /eventmgmt/adom/{adom}/alerts/unack
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "update",
             f"/eventmgmt/adom/{adom}/alerts/unack",
             apiver=API_VERSION,
@@ -1121,7 +1137,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /eventmgmt/adom/{adom}/alertlogs
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/eventmgmt/adom/{adom}/alertlogs",
             apiver=API_VERSION,
@@ -1140,7 +1156,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /eventmgmt/adom/{adom}/alerts/extra-details
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/eventmgmt/adom/{adom}/alerts/extra-details",
             apiver=API_VERSION,
@@ -1158,7 +1174,7 @@ class FortiAnalyzerClient:
 
         FNDN: ADD /eventmgmt/adom/{adom}/alerts/comment
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "add",
             f"/eventmgmt/adom/{adom}/alerts/comment",
             apiver=API_VERSION,
@@ -1180,7 +1196,7 @@ class FortiAnalyzerClient:
         Args:
             stat_type: "severity", "severity-timescale", "status", etc.
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/eventmgmt/adom/{adom}/alert-incident/stats",
             apiver=API_VERSION,
@@ -1244,7 +1260,9 @@ class FortiAnalyzerClient:
         if sort_by:
             params["sort-by"] = sort_by
 
-        return await self._raw_request("add", f"/fortiview/adom/{adom}/{view_name}/run", **params)
+        return await self._raw_request_dict(
+            "add", f"/fortiview/adom/{adom}/{view_name}/run", **params
+        )
 
     async def fortiview_fetch(
         self,
@@ -1256,7 +1274,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /fortiview/adom/{adom}/{view-name}/run/{tid}
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/fortiview/adom/{adom}/{view_name}/run/{tid}",
             apiver=API_VERSION,
@@ -1293,7 +1311,9 @@ class FortiAnalyzerClient:
         if filter:
             params["filter"] = filter
 
-        return await self._raw_request("get", f"/config/adom/{adom}/sql-report/layout", **params)
+        return await self._raw_request_dict(
+            "get", f"/config/adom/{adom}/sql-report/layout", **params
+        )
 
     async def report_run(
         self,
@@ -1330,7 +1350,7 @@ class FortiAnalyzerClient:
         if device:
             params["device"] = device
 
-        return await self._raw_request("add", f"/report/adom/{adom}/run", **params)
+        return await self._raw_request_dict("add", f"/report/adom/{adom}/run", **params)
 
     async def report_fetch(
         self,
@@ -1345,7 +1365,9 @@ class FortiAnalyzerClient:
             adom: ADOM name
             tid: Task ID (UUID string from report_run)
         """
-        return await self._raw_request("get", f"/report/adom/{adom}/run/{tid}", apiver=API_VERSION)
+        return await self._raw_request_dict(
+            "get", f"/report/adom/{adom}/run/{tid}", apiver=API_VERSION
+        )
 
     async def report_get_data(
         self,
@@ -1364,7 +1386,7 @@ class FortiAnalyzerClient:
             output_format: Output format - "PDF", "HTML", "CSV", "XML"
             data_type: Data encoding type - "string" (base64)
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/report/adom/{adom}/reports/data/{tid}",
             apiver=API_VERSION,
@@ -1380,7 +1402,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /report/adom/{adom}/template/list
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get", f"/report/adom/{adom}/template/list", apiver=API_VERSION
         )
 
@@ -1409,7 +1431,7 @@ class FortiAnalyzerClient:
         if title:
             params["title"] = title
 
-        return await self._raw_request("get", f"/report/adom/{adom}/reports/state", **params)
+        return await self._raw_request_dict("get", f"/report/adom/{adom}/reports/state", **params)
 
     async def get_report_schedules(
         self,
@@ -1434,7 +1456,9 @@ class FortiAnalyzerClient:
         if layout_id is not None:
             params["filter"] = ["name", "==", str(layout_id)]
 
-        return await self._raw_request("get", f"/config/adom/{adom}/sql-report/schedule", **params)
+        return await self._raw_request_dict(
+            "get", f"/config/adom/{adom}/sql-report/schedule", **params
+        )
 
     async def create_report_schedule(
         self,
@@ -1460,7 +1484,7 @@ class FortiAnalyzerClient:
         if device_filter:
             data["device"] = device_filter
 
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "set",
             f"/report/adom/{adom}/config/schedule/{layout_id}",
             apiver=API_VERSION,
@@ -1477,7 +1501,7 @@ class FortiAnalyzerClient:
 
         Returns list of reports currently being generated.
         """
-        return await self._raw_request("get", f"/report/adom/{adom}/run", apiver=API_VERSION)
+        return await self._raw_request_dict("get", f"/report/adom/{adom}/run", apiver=API_VERSION)
 
     # =========================================================================
     # Incident Management (from incidentmgmt.json)
@@ -1505,7 +1529,7 @@ class FortiAnalyzerClient:
         if filter:
             params["filter"] = filter
 
-        return await self._raw_request("get", f"/incidentmgmt/adom/{adom}/incidents", **params)
+        return await self._raw_request_dict("get", f"/incidentmgmt/adom/{adom}/incidents", **params)
 
     async def get_incident(
         self,
@@ -1516,7 +1540,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /incidentmgmt/adom/{adom}/incident/{incid}
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get", f"/incidentmgmt/adom/{adom}/incident/{incident_id}", apiver=API_VERSION
         )
 
@@ -1536,7 +1560,7 @@ class FortiAnalyzerClient:
         if filter:
             params["filter"] = filter
 
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get", f"/incidentmgmt/adom/{adom}/incidents/count", **params
         )
 
@@ -1562,7 +1586,7 @@ class FortiAnalyzerClient:
         if description:
             params["description"] = description
 
-        return await self._raw_request("add", f"/incidentmgmt/adom/{adom}/incident", **params)
+        return await self._raw_request_dict("add", f"/incidentmgmt/adom/{adom}/incident", **params)
 
     async def update_incident(
         self,
@@ -1584,7 +1608,7 @@ class FortiAnalyzerClient:
         if assignee:
             params["assignee"] = assignee
 
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "update", f"/incidentmgmt/adom/{adom}/incident/{incident_id}", **params
         )
 
@@ -1612,7 +1636,7 @@ class FortiAnalyzerClient:
         if stats_items is None:
             stats_items = ["total", "severity", "status"]
 
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get",
             f"/incidentmgmt/adom/{adom}/incident/stats",
             apiver=API_VERSION,
@@ -1628,7 +1652,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /ioc/license/state
         """
-        return await self._raw_request("get", "/ioc/license/state", apiver=API_VERSION)
+        return await self._raw_request_dict("get", "/ioc/license/state", apiver=API_VERSION)
 
     async def acknowledge_ioc_events(
         self,
@@ -1640,7 +1664,7 @@ class FortiAnalyzerClient:
 
         FNDN: UPDATE /ioc/adom/{adom}/events/ack
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "update",
             f"/ioc/adom/{adom}/events/ack",
             apiver=API_VERSION,
@@ -1660,7 +1684,7 @@ class FortiAnalyzerClient:
 
         Returns TID for tracking.
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "add",
             f"/ioc/adom/{adom}/rescan/run",
             apiver=API_VERSION,
@@ -1677,7 +1701,7 @@ class FortiAnalyzerClient:
 
         FNDN: GET /ioc/adom/{adom}/rescan/run/{tid}
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get", f"/ioc/adom/{adom}/rescan/run/{tid}", apiver=API_VERSION
         )
 
@@ -1689,6 +1713,6 @@ class FortiAnalyzerClient:
 
         FNDN: GET /ioc/adom/{adom}/rescan/history
         """
-        return await self._raw_request(
+        return await self._raw_request_dict(
             "get", f"/ioc/adom/{adom}/rescan/history", apiver=API_VERSION
         )

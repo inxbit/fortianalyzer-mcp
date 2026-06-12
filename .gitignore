@@ -77,6 +77,7 @@ dmypy.json
 # =============================================================================
 .uv/
 uv.lock
+.python-version
 pip-log.txt
 pip-delete-this-directory.txt
 poetry.lock

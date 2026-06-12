@@ -6,6 +6,7 @@ Based on FNDN FortiAnalyzer 7.6.5 SYS, DVMDB, CLI, and TASK API specifications.
 import logging
 from typing import Any
 
+from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.responses import redact
 from fortianalyzer_mcp.utils.validation import get_default_adom, sanitize_for_logging
@@ -13,7 +14,7 @@ from fortianalyzer_mcp.utils.validation import get_default_adom, sanitize_for_lo
 logger = logging.getLogger(__name__)
 
 
-def _get_client():
+def _get_client() -> FortiAnalyzerClient:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:

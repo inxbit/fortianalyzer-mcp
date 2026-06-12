@@ -15,6 +15,7 @@ import fortianalyzer_mcp.tools.dvm_tools as dvm_tools
 import fortianalyzer_mcp.tools.fortiview_tools as fortiview_tools
 import fortianalyzer_mcp.tools.incident_tools as incident_tools
 import fortianalyzer_mcp.tools.ioc_tools as ioc_tools
+import fortianalyzer_mcp.tools.report_tools as report_tools
 import fortianalyzer_mcp.tools.system_tools as system_tools
 from fortianalyzer_mcp.utils.validation import MASK_VALUE
 
@@ -219,3 +220,93 @@ class TestDvmMutationValidation:
         result = await dvm_tools.delete_device(adom="root", device="x/../../etc")
         assert result["status"] == "error"
         assert "Validation error" in result["message"]
+
+
+class TestRunAndWaitReportVerifiesCompletion:
+    """Regression: tid vanishing from the running list was reported as success
+    without checking whether the report actually generated."""
+
+    @staticmethod
+    def _fake_client(fetch_result: dict[str, Any] | Exception) -> Any:
+        class FakeClient:
+            async def get_report_schedules(
+                self, adom: str, layout_id: int | None = None
+            ) -> dict[str, Any]:
+                return {"data": [{"schedule": str(layout_id)}]}
+
+            async def report_run(
+                self,
+                adom: str,
+                layout_id: int,
+                time_period: str = "last-7-days",
+                device: list[dict[str, str]] | None = None,
+            ) -> dict[str, Any]:
+                return {"tid": "TID-1"}
+
+            async def get_running_reports(self, adom: str) -> dict[str, Any]:
+                return {"data": []}  # tid never appears -> vanish branch
+
+            async def report_fetch(self, adom: str, tid: str) -> dict[str, Any]:
+                if isinstance(fetch_result, Exception):
+                    raise fetch_result
+                return fetch_result
+
+        return FakeClient()
+
+    async def test_generated_state_is_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = self._fake_client({"state": "generated", "progress-percent": 100})
+        monkeypatch.setattr(report_tools, "get_faz_client", lambda: client)
+
+        result = await report_tools.run_and_wait_report(layout="4", adom="root")
+        assert result["status"] == "success"
+        assert result["tid"] == "TID-1"
+
+    async def test_non_generated_state_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = self._fake_client({"state": "aborted", "progress-percent": 40})
+        monkeypatch.setattr(report_tools, "get_faz_client", lambda: client)
+
+        result = await report_tools.run_and_wait_report(layout="4", adom="root")
+        assert result["status"] == "error"
+        assert "aborted" in result["message"]
+
+    async def test_unknown_tid_is_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = self._fake_client(RuntimeError("Cannot find a report uuid=TID-1"))
+        monkeypatch.setattr(report_tools, "get_faz_client", lambda: client)
+
+        result = await report_tools.run_and_wait_report(layout="4", adom="root")
+        assert result["status"] == "error"
+
+    async def test_startup_race_keeps_polling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Fetch says running while the tid is absent from the running list
+        (startup race): keep polling rather than declaring failure."""
+        states = iter([{"state": "running"}, {"state": "generated"}])
+
+        class FakeClient:
+            async def get_report_schedules(
+                self, adom: str, layout_id: int | None = None
+            ) -> dict[str, Any]:
+                return {"data": [{"schedule": str(layout_id)}]}
+
+            async def report_run(
+                self,
+                adom: str,
+                layout_id: int,
+                time_period: str = "last-7-days",
+                device: list[dict[str, str]] | None = None,
+            ) -> dict[str, Any]:
+                return {"tid": "TID-1"}
+
+            async def get_running_reports(self, adom: str) -> dict[str, Any]:
+                return {"data": []}
+
+            async def report_fetch(self, adom: str, tid: str) -> dict[str, Any]:
+                return next(states)
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(report_tools, "get_faz_client", lambda: FakeClient())
+        monkeypatch.setattr(report_tools.asyncio, "sleep", no_sleep)
+
+        result = await report_tools.run_and_wait_report(layout="4", adom="root")
+        assert result["status"] == "success"

@@ -279,7 +279,7 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
             "get_top_cloud_applications": fortiview_tools.get_top_cloud_applications,
             "get_policy_hits": fortiview_tools.get_policy_hits,
             # Report tools
-            "list_report_templates": report_tools.list_report_templates,
+            "list_report_layouts": report_tools.list_report_layouts,
             "run_report": report_tools.run_report,
             "fetch_report": report_tools.fetch_report,
             "get_report_data": report_tools.get_report_data,

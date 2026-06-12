@@ -13,6 +13,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+# Canonical ValidationError lives in utils.errors (also mapped from FAZ
+# error code -5); re-exported here so validator callers keep importing it
+# from this module.
+from fortianalyzer_mcp.utils.errors import ValidationError
+
 # Sensitive fields that should be masked in logs
 SENSITIVE_FIELDS = {
     "password",
@@ -209,12 +214,6 @@ _CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.IGNORECASE)
 _PCAPURL_RE = re.compile(r"^[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%\-]+$")
 # Maximum sane length for a pcapurl reference.
 _PCAPURL_MAX_LEN = 4096
-
-
-class ValidationError(ValueError):
-    """Raised when input validation fails."""
-
-    pass
 
 
 def validate_adom(adom: str) -> str:

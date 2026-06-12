@@ -253,4 +253,6 @@ def get_settings() -> Settings:
         ValidationError: If required settings are missing or invalid
     """
     _check_env_file_permissions()
-    return Settings()
+    # Required fields (FORTIANALYZER_HOST) come from the environment at
+    # runtime; pydantic-settings raises if they are missing.
+    return Settings()  # type: ignore[call-arg]
