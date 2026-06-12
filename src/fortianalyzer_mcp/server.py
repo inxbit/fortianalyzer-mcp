@@ -144,7 +144,7 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
                 ("get_policy_hits", "Get policy hit statistics"),
             ],
             "reports": [
-                ("list_report_templates", "List report templates"),
+                ("list_report_layouts", "List runnable report layouts"),
                 ("run_report", "Run a report"),
                 ("fetch_report", "Fetch report status"),
                 ("get_report_data", "Download report data"),

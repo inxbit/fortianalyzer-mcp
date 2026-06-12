@@ -371,11 +371,11 @@ class MCPToolsTestRunner:
         """Run all report tools tests."""
         print("\n=== Report Tools Tests ===")
 
-        # Test list_report_templates
+        # Test list_report_layouts
         await self.run_test(
-            "report_tools.list_report_templates",
+            "report_tools.list_report_layouts",
             "report",
-            self.report_tools.list_report_templates(adom="root"),
+            self.report_tools.list_report_layouts(adom="root"),
         )
 
         # Test get_report_history
@@ -539,7 +539,7 @@ Examples:
             "  log       - log_tools: get_log_fields, get_log_stats, query_logs, fetch_more_logs,"
         )
         print("              search_traffic_logs, search_event_logs, search_security_logs")
-        print("  report    - report_tools: list_report_templates, get_report_history")
+        print("  report    - report_tools: list_report_layouts, get_report_history")
         print("  incident  - incident_tools: get_incidents, get_incident_count, get_incident_stats")
         print("  ioc       - ioc_tools: get_ioc_license_state, get_ioc_rescan_history")
         print("  all       - Run all tests")
