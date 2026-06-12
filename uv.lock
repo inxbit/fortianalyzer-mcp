@@ -376,7 +376,7 @@ wheels = [
 
 [[package]]
 name = "fortianalyzer-mcp"
-version = "2.0.1"
+version = "2.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
