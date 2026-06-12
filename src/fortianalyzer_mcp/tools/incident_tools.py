@@ -10,7 +10,14 @@ from typing import Any
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.responses import redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
-from fortianalyzer_mcp.utils.validation import get_default_adom
+from fortianalyzer_mcp.utils.validation import (
+    ValidationError,
+    get_default_adom,
+    validate_severity,
+)
+
+# FAZ incident workflow states accepted by update_incident.
+_VALID_INCIDENT_STATUSES = {"new", "investigating", "contained", "resolved", "closed"}
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +228,7 @@ async def create_incident(
     """
     try:
         adom = adom or get_default_adom()
+        severity = validate_severity(severity)
         client = _get_client()
 
         logger.info(f"Creating incident '{name}' in ADOM {adom}")
@@ -240,6 +248,8 @@ async def create_incident(
             "severity": severity,
             "data": result,
         }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to create incident: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -281,6 +291,14 @@ async def update_incident(
     """
     try:
         adom = adom or get_default_adom()
+        if severity is not None:
+            severity = validate_severity(severity)
+        if status is not None and status.lower() not in _VALID_INCIDENT_STATUSES:
+            valid = ", ".join(sorted(_VALID_INCIDENT_STATUSES))
+            return {
+                "status": "error",
+                "message": f"Validation error: Invalid status '{status}'. Must be one of: {valid}",
+            }
         client = _get_client()
 
         logger.info(f"Updating incident {incident_id} in ADOM {adom}")
@@ -299,6 +317,8 @@ async def update_incident(
             "incident_id": incident_id,
             "data": result,
         }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to update incident {incident_id}: {e}")
         return {"status": "error", "message": redact(str(e))}

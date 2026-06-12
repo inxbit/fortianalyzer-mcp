@@ -502,7 +502,16 @@ async def get_pcap_by_session(
                             "message": f"PCAP file too large: {info.file_size} bytes",
                         }
 
-                    content = zf.read(filename)
+                    # The central-directory file_size above is untrusted metadata;
+                    # cap the actual decompressed bytes too.
+                    with zf.open(filename) as src:
+                        content = src.read(MAX_PCAP_SIZE + 1)
+                    if len(content) > MAX_PCAP_SIZE:
+                        return {
+                            "status": "error",
+                            "session_id": session_id,
+                            "message": f"PCAP file too large: exceeds {MAX_PCAP_SIZE} bytes",
+                        }
                     file_size = len(content)
 
                     # Generate filename with session ID and timestamp
@@ -635,7 +644,15 @@ async def download_pcap_by_url(
                             "message": f"PCAP too large: {info.file_size} bytes",
                         }
 
-                    content = zf.read(filename)
+                    # The central-directory file_size above is untrusted metadata;
+                    # cap the actual decompressed bytes too.
+                    with zf.open(filename) as src:
+                        content = src.read(MAX_PCAP_SIZE + 1)
+                    if len(content) > MAX_PCAP_SIZE:
+                        return {
+                            "status": "error",
+                            "message": f"PCAP too large: exceeds {MAX_PCAP_SIZE} bytes",
+                        }
                     file_size = len(content)
 
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -853,7 +870,14 @@ async def search_and_download_pcaps(
                             failed_count += 1
                             break
 
-                        content = zf.read(filename)
+                        # The central-directory file_size above is untrusted
+                        # metadata; cap the actual decompressed bytes too.
+                        with zf.open(filename) as src:
+                            content = src.read(MAX_PCAP_SIZE + 1)
+                        if len(content) > MAX_PCAP_SIZE:
+                            errors.append(f"Session {session_id}: File too large")
+                            failed_count += 1
+                            break
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         base_name = os.path.basename(filename)
                         name_part = os.path.splitext(base_name)[0]

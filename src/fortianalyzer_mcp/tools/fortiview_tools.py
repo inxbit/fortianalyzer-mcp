@@ -279,11 +279,11 @@ async def get_fortiview_data(
             }
 
         # Poll for results
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         poll_interval = 0.5
 
         while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout:
                 return {
                     "status": "timeout",
@@ -297,12 +297,15 @@ async def get_fortiview_data(
                 tid=tid,
             )
 
-            # Check if we have data
+            # Only return once the query is complete; returning on first
+            # non-empty data hands back partial aggregates (wrong top-N).
+            # A missing percentage defaults to 100 so builds that omit it
+            # still return immediately.
             if isinstance(fetch_result, dict):
                 data = fetch_result.get("data", [])
                 percentage = fetch_result.get("percentage", 100)
 
-                if percentage >= 100 or data:
+                if percentage >= 100:
                     if not isinstance(data, list):
                         data = [data] if data else []
 

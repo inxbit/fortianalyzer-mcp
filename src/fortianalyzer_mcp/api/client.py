@@ -78,6 +78,11 @@ class FortiAnalyzerClient:
         # lets a waiter detect that a peer already reconnected while it blocked.
         self._reconnect_lock = asyncio.Lock()
         self._reconnect_generation = 0
+        # Serialize all blocking pyfmg I/O. pyfmg shares one requests.Session
+        # and req_id counter, neither safe under concurrent use from worker
+        # threads. One in-flight FAZ request at a time matches the previous
+        # (loop-blocking) behavior while keeping the event loop responsive.
+        self._io_lock = asyncio.Lock()
 
         logger.info(f"Initialized FortiAnalyzer client for {self.host}")
 
@@ -108,47 +113,53 @@ class FortiAnalyzerClient:
                 "Prefer trusting the FAZ CA (set the CA bundle) over disabling verification."
             )
 
-        try:
-            if self.api_token:
-                self._fmg = FortiManager(
-                    self.host,
-                    apikey=self.api_token,
-                    debug=False,
-                    use_ssl=True,
-                    verify_ssl=self.verify_ssl,
-                    timeout=self.timeout,
-                    check_adom_workspace=False,
-                )
-            elif self.username and self.password:
-                self._fmg = FortiManager(
-                    self.host,
-                    self.username,
-                    self.password,
-                    debug=False,
-                    use_ssl=True,
-                    verify_ssl=self.verify_ssl,
-                    timeout=self.timeout,
-                )
-            else:
-                raise AuthenticationError(
-                    "No authentication provided. Set API token or username/password."
-                )
+        # Hold the I/O lock across the connected-check and login so two
+        # concurrent connect() calls (now possible since login runs off-loop)
+        # cannot both log in and leak a session.
+        async with self._io_lock:
+            if self._connected:
+                return
+            try:
+                if self.api_token:
+                    self._fmg = FortiManager(
+                        self.host,
+                        apikey=self.api_token,
+                        debug=False,
+                        use_ssl=True,
+                        verify_ssl=self.verify_ssl,
+                        timeout=self.timeout,
+                        check_adom_workspace=False,
+                    )
+                elif self.username and self.password:
+                    self._fmg = FortiManager(
+                        self.host,
+                        self.username,
+                        self.password,
+                        debug=False,
+                        use_ssl=True,
+                        verify_ssl=self.verify_ssl,
+                        timeout=self.timeout,
+                    )
+                else:
+                    raise AuthenticationError(
+                        "No authentication provided. Set API token or username/password."
+                    )
 
-            code, response = self._fmg.login()
+                code, response = await asyncio.to_thread(self._fmg.login)
 
-            if code != 0:
-                error_msg = response.get("status", {}).get("message", "Login failed")
-                raise AuthenticationError(f"FortiAnalyzer login failed: {error_msg}")
+                if code != 0:
+                    error_msg = response.get("status", {}).get("message", "Login failed")
+                    raise AuthenticationError(f"FortiAnalyzer login failed: {error_msg}")
 
-            self._connected = True
-            self._ever_connected = True
-            logger.info("Successfully connected to FortiAnalyzer")
+                self._connected = True
+                self._ever_connected = True
+                logger.info("Successfully connected to FortiAnalyzer")
 
-        except AuthenticationError:
-            raise
-        except Exception as e:
-            logger.error(f"Connection failed: {e}")
-            raise ConnectionError(f"Failed to connect to FortiAnalyzer: {e}") from e
+            except AuthenticationError:
+                raise
+            except Exception as e:
+                logger.error(f"Connection failed: {e}")
+                raise ConnectionError(f"Failed to connect to FortiAnalyzer: {e}") from e
 
     async def disconnect(self) -> None:
         """Disconnect and cleanup resources."""
@@ -158,7 +169,8 @@ class FortiAnalyzerClient:
         logger.info("Disconnecting from FortiAnalyzer")
 
         try:
-            self._fmg.logout()
+            async with self._io_lock:
+                await asyncio.to_thread(self._fmg.logout)
         except Exception as e:
             logger.warning(f"Logout failed: {e}")
         finally:
@@ -438,14 +450,17 @@ class FortiAnalyzerClient:
         else:
             headers = {"content-type": "application/json"}
 
-        # Make request
-        response = fmg.sess.post(
-            fmg._url,
-            data=json.dumps(json_request),
-            verify=fmg.verify_ssl,
-            timeout=fmg.timeout,
-            headers=headers,
-        )
+        # Make request off the event loop; serialized via the I/O lock so the
+        # shared requests.Session is never used from two threads at once.
+        async with self._io_lock:
+            response = await asyncio.to_thread(
+                fmg.sess.post,
+                fmg._url,
+                data=json.dumps(json_request),
+                verify=fmg.verify_ssl,
+                timeout=fmg.timeout,
+                headers=headers,
+            )
 
         try:
             result = response.json()
@@ -511,7 +526,10 @@ class FortiAnalyzerClient:
         async def _factory() -> Any:
             fmg = self._ensure_connected()
             method = getattr(fmg, verb)
-            code, response = method(url, **kwargs)
+            # Run the blocking pyfmg verb off the event loop; serialized via
+            # the I/O lock (shared requests.Session is not thread-safe).
+            async with self._io_lock:
+                code, response = await asyncio.to_thread(lambda: method(url, **kwargs))
             return self._handle_response(code, response, f"{verb.upper()} {url}")
 
         return await self._execute_resilient(_factory)

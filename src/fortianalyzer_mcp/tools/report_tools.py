@@ -624,11 +624,11 @@ async def run_and_wait_report(
             }
 
         # Step 5: Poll for completion using get_running_reports
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         poll_interval = 3.0
 
         while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout:
                 return {
                     "status": "timeout",
@@ -781,9 +781,21 @@ async def save_report(
                             "message": f"Total extraction size exceeds limit ({MAX_TOTAL_SIZE} bytes)",
                         }
 
-                    # Read file content
-                    content = zf.read(filename)
+                    # Read file content. The central-directory file_size above is
+                    # untrusted metadata; cap the actual decompressed bytes too.
+                    with zf.open(filename) as src:
+                        content = src.read(MAX_EXTRACT_SIZE + 1)
+                    if len(content) > MAX_EXTRACT_SIZE:
+                        return {
+                            "status": "error",
+                            "message": f"File too large: {filename} (exceeds {MAX_EXTRACT_SIZE} bytes)",
+                        }
                     total_extracted += len(content)
+                    if total_extracted > MAX_TOTAL_SIZE:
+                        return {
+                            "status": "error",
+                            "message": f"Total extraction size exceeds limit ({MAX_TOTAL_SIZE} bytes)",
+                        }
 
                     # Determine output filename
                     # Use original filename or create based on report name

@@ -334,7 +334,7 @@ async def _run_logsearch_page_unlocked(
     Returns ``{"timed_out": bool, "tid": int|None, "logs": list, "total": int|None}``.
     """
     await client.ensure_connected()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     timeout = _clamp_timeout(timeout)
     limit = _clamp_limit(limit)
     deadline = loop.time() + timeout

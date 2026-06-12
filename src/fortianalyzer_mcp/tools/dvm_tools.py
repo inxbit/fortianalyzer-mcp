@@ -10,7 +10,13 @@ from typing import Any
 
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.responses import redact
-from fortianalyzer_mcp.utils.validation import get_default_adom
+from fortianalyzer_mcp.utils.validation import (
+    ValidationError,
+    get_default_adom,
+    sanitize_for_logging,
+    validate_adom,
+    validate_device_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +176,8 @@ async def add_device(
         ... )
     """
     try:
+        adom = validate_adom(adom)
+        name = validate_device_name(name)
         client = _get_client()
 
         # Build device configuration
@@ -215,6 +223,8 @@ async def add_device(
             "device": device_result,
             "task_id": result.get("taskid"),
         }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to add device {name}: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -250,6 +260,8 @@ async def delete_device(
         ...     print("Device removed from FortiAnalyzer")
     """
     try:
+        adom = validate_adom(adom)
+        device = validate_device_name(device)
         client = _get_client()
 
         result = await client.delete_device(
@@ -263,6 +275,8 @@ async def delete_device(
             "task_id": result.get("taskid"),
             "message": f"Device {device} deleted successfully",
         }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to delete device {device}: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -309,6 +323,7 @@ async def add_devices_bulk(
         if not devices:
             return {"status": "error", "message": "No devices provided"}
 
+        adom = validate_adom(adom)
         client = _get_client()
 
         result = await client.add_device_list(
@@ -327,6 +342,8 @@ async def add_devices_bulk(
             "devices": devices_safe,
             "task_id": result.get("taskid"),
         }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to add devices in bulk: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -363,10 +380,11 @@ async def delete_devices_bulk(
         if not devices:
             return {"status": "error", "message": "No devices provided"}
 
+        adom = validate_adom(adom)
         client = _get_client()
 
         # Convert device names to the expected format
-        device_list = [{"name": name} for name in devices]
+        device_list = [{"name": validate_device_name(name)} for name in devices]
 
         result = await client.delete_device_list(
             adom=adom,
@@ -379,6 +397,8 @@ async def delete_devices_bulk(
             "deleted_count": len(devices),
             "task_id": result.get("taskid"),
         }
+    except ValidationError as e:
+        return {"status": "error", "message": f"Validation error: {e}"}
     except Exception as e:
         logger.error(f"Failed to delete devices in bulk: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -418,7 +438,9 @@ async def get_device_info(
 
         result: dict[str, Any] = {
             "status": "success",
-            "device": device_data,
+            # DVMDB device objects carry credential material (adm_pass, etc.);
+            # mask it before returning over MCP.
+            "device": sanitize_for_logging(device_data),
         }
 
         if include_vdoms:
@@ -487,7 +509,9 @@ async def search_devices(
         return {
             "status": "success",
             "count": len(devices),
-            "devices": devices,
+            # DVMDB device objects carry credential material (adm_pass, etc.);
+            # mask it before returning over MCP.
+            "devices": sanitize_for_logging(devices),
         }
     except Exception as e:
         logger.error(f"Failed to search devices: {e}")

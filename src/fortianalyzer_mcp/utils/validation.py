@@ -309,7 +309,7 @@ def validate_device_serial(serial: str) -> str:
 # Serial-number prefixes used to decide whether a device string is a serial
 # (devid) or a device name (devname). Kept here as the single source of truth so
 # every tool builds the FAZ device filter identically.
-_DEVICE_SERIAL_PREFIXES = ("FG", "FM", "FW", "FA", "FS", "FD", "FP", "FC")
+_DEVICE_SERIAL_PREFIXES = ("FG", "FM", "FW", "FA", "FS", "FD", "FP", "FC", "FV")
 
 
 def build_device_filter(device: str | None) -> list[dict[str, str]]:

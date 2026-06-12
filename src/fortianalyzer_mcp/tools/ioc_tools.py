@@ -102,7 +102,7 @@ async def acknowledge_ioc_events(
 
         result = await client.acknowledge_ioc_events(
             adom=adom,
-            ioc_ids=ioc_ids,
+            event_ids=ioc_ids,
             user=user,
         )
 
@@ -312,11 +312,11 @@ async def run_and_wait_ioc_rescan(
             }
 
         # Poll for completion
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         poll_interval = 2.0
 
         while True:
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout:
                 return {
                     "status": "timeout",
