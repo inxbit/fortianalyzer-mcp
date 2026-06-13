@@ -1,20 +1,18 @@
 """Tests for log search pagination, tid lifecycle, and reuse.
 
 These exercise query_logs / fetch_more_logs / cancel_log_search through a
-stateful in-memory FortiAnalyzer fake that models the *real* appliance
-contract discovered on the lab FAZ (7.6.x), under the poll-before-fetch rule:
+stateful in-memory FortiAnalyzer fake that models the documented appliance
+contract (upstream issue #27, verified live on 7.6.7):
 
 - ``logsearch_start(offset, limit)`` issues a task id (tid).
-- ``logsearch_count(adom, tid)`` is a cheap GET that does NOT reap the tid; its
-  ``progress-percent`` climbs 0 -> 100 over a few polls.
-- ``logsearch_fetch`` may only be called once the scan is complete: a fetch
-  while the search is still running RAISES "Invalid tid" (the runner must poll
-  ``logsearch_count`` first). The first valid fetch returns
-  ``data[offset:offset+limit]`` plus ``total-count`` and reaps the task, so a
-  *second* fetch on the same tid raises "Invalid tid".
-- Therefore pagination is done by running a *fresh* search per page (the tid is
-  not reusable). For a fixed time window the row order is stable across
-  searches, so offset/limit paging is consistent.
+- ``logsearch_fetch`` (``GET /logsearch/{tid}``) is the single read endpoint:
+  it can be polled repeatedly while the scan runs, reporting ``percentage``
+  below 100 with a partial/empty page, and a completed scan returns
+  ``percentage: 100`` with ``data[offset:offset+limit]`` plus ``total-count``.
+  Fetching does NOT reap the task; the runner cancels it explicitly.
+- Pagination is done by running a *fresh* search per page (appliance-side
+  tasks are short-lived). For a fixed time window the row order is stable
+  across searches, so offset/limit paging is consistent.
 
 The tools expose a reusable *pagination handle* (still called ``tid`` for
 compatibility) backed by an in-process registry of search parameters.
@@ -29,8 +27,8 @@ from fortianalyzer_mcp.utils.errors import ResourceNotFoundError
 
 CUSTOM_RANGE = "2024-01-01 00:00:00|2024-01-02 00:00:00"
 
-# Number of logsearch_count polls a search reports as in-progress before it
-# reads 100% (so a normal search makes >=1 count call before the single fetch).
+# Number of logsearch_fetch polls a search reports as in-progress before it
+# reads 100% (so a normal search makes >=1 sub-100 fetch before the page).
 _POLLS_TO_COMPLETE = 2
 
 
@@ -50,16 +48,16 @@ def _fast_polls(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class FakeFaz:
-    """Faithful fake of the FortiAnalyzer log-search surface (poll-before-fetch).
+    """Faithful fake of the FortiAnalyzer log-search surface (spec contract).
 
-    Each ``logsearch_start`` issues a fresh single-use tid. ``logsearch_count``
-    climbs ``progress-percent`` 0 -> 100 over ``_POLLS_TO_COMPLETE`` polls and
-    never reaps. ``logsearch_fetch`` raises "Invalid tid" if called before the
-    scan is complete *or* a second time on a reaped tid; a valid fetch delivers
-    the offset slice plus ``total-count`` and reaps the task.
+    Each ``logsearch_start`` issues a fresh tid. ``logsearch_fetch`` climbs
+    ``percentage`` to 100 over ``_POLLS_TO_COMPLETE`` polls -- sub-100 polls
+    return an empty partial page -- and a completed fetch delivers the offset
+    slice plus ``total-count`` WITHOUT reaping the task (verified live:
+    fetching does not reap; only cancel does).
 
     ``complete_on_attempt`` models an appliance that reaps a search mid-poll: a
-    search whose start-attempt number is below it has its ``logsearch_count``
+    search whose start-attempt number is below it has its ``logsearch_fetch``
     raise an invalid-tid error, forcing the runner to re-issue from scratch.
     """
 
@@ -90,7 +88,6 @@ class FakeFaz:
         self._next_tid = 1000
         self._start_count = 0
         self.start_calls: list[dict[str, object]] = []
-        self.count_calls: list[int] = []
         self.fetch_calls: list[int] = []
         self.cancelled: list[int] = []
 
@@ -133,27 +130,6 @@ class FakeFaz:
         self._tasks[tid] = {"adom": adom, "alive": True, "attempt": self._start_count, "polls": 0}
         return {"tid": tid}
 
-    async def logsearch_count(self, adom: str, tid: int) -> dict[str, object]:
-        """Report scan progress without reaping the tid (a cheap GET)."""
-        self.count_calls.append(tid)
-        task = self._tasks.get(tid)
-        if task is None or task["adom"] != adom:
-            raise ResourceNotFoundError(f"Invalid tid {tid} for count.", code=-1)
-        # A search reaped before completing (older attempt) surfaces as an
-        # invalid-tid during count, forcing a fresh re-issue.
-        if int(task["attempt"]) < self.complete_on_attempt:
-            task["alive"] = False
-            raise ResourceNotFoundError(f"Invalid tid {tid} reaped mid-poll.", code=-1)
-        task["polls"] = int(task["polls"]) + 1
-        done = (not self.stall) and int(task["polls"]) >= _POLLS_TO_COMPLETE
-        total = len(self.dataset)
-        return {
-            "progress-percent": 100 if done else 50,
-            "matched-logs": min(total, int(task["polls"])),
-            "scanned-logs": total if done else 0,
-            "total-logs": total,
-        }
-
     async def logsearch_fetch(
         self,
         adom: str,
@@ -163,12 +139,25 @@ class FakeFaz:
     ) -> dict[str, object]:
         self.fetch_calls.append(tid)
         task = self._tasks.get(tid)
-        # Poll-before-fetch: fetching a still-running or reaped tid is invalid.
         if task is None or not task["alive"] or task["adom"] != adom:
             raise ResourceNotFoundError(f"Invalid tid {tid} for fetching result.", code=-1)
-        if int(task["polls"]) < _POLLS_TO_COMPLETE:
-            raise ResourceNotFoundError(f"Invalid tid {tid}: search not complete.", code=-1)
-        task["alive"] = False  # single-use: task is reaped after one fetch
+        # A search reaped before completing (older attempt) surfaces as an
+        # invalid-tid during the fetch poll, forcing a fresh re-issue.
+        if int(task["attempt"]) < self.complete_on_attempt:
+            task["alive"] = False
+            raise ResourceNotFoundError(f"Invalid tid {tid} reaped mid-poll.", code=-1)
+        task["polls"] = int(task["polls"]) + 1
+        done = (not self.stall) and int(task["polls"]) >= _POLLS_TO_COMPLETE
+        if not done:
+            # In progress: sub-100 percentage with a partial (empty) page.
+            return {
+                "percentage": 50,
+                "return-lines": 0,
+                "data": [],
+                "tid": tid,
+                "status": {"code": 0, "message": "succeeded"},
+            }
+        # Completed: deliver the slice. The task is NOT reaped by fetching.
         page = self.dataset[offset : offset + limit]
         result: dict[str, object] = {
             "percentage": 100,
@@ -388,10 +377,11 @@ class TestReissueOnReap:
         assert result["status"] == "error"
         assert result["error"] == "search_timeout"
         assert "invalid tid" not in result.get("message", "").lower()
-        # A stalled scan is bounded by the deadline, not a fetch loop: the single
-        # search is polled but never fetched.
+        # A stalled scan is bounded by the deadline, not a start loop: the
+        # single search is fetch-polled (sub-100 every time) until timeout.
         assert len(fake.start_calls) == 1
-        assert fake.fetch_calls == []
+        assert len(fake.fetch_calls) >= 1
+        assert set(fake.fetch_calls) == {1000}  # all polls hit the one started tid
 
 
 class TestUnknownTotal:
@@ -429,13 +419,12 @@ class TestCancelLogSearch:
 
 
 class PrematureFaz:
-    """Models the 7.6.7 premature-100 case under poll-before-fetch.
+    """Models the 7.6.7 premature-100 case.
 
-    ``logsearch_count`` always reports the scan complete (``progress-percent``
-    100), but the fetch returns an *empty* ``data`` page while ``total-count``
-    reports rows exist, until ``data_on_attempt`` searches have started -- at
-    which point the page carries real data. Each search is a fresh single-use
-    tid; the runner must therefore re-issue on a premature-empty-100 page.
+    Every fetch reports ``percentage: 100`` but returns an *empty* ``data``
+    page while ``total-count`` reports rows exist, until ``data_on_attempt``
+    searches have started -- at which point the page carries real data. The
+    runner must therefore re-issue on a premature-empty-100 page.
     """
 
     def __init__(self, dataset: list[dict[str, object]], *, data_on_attempt: int) -> None:
@@ -446,7 +435,6 @@ class PrematureFaz:
         self._next_tid = 2000
         self._attempt = 0
         self._tasks: dict[int, int] = {}
-        self.count_calls: list[int] = []
         self.cancelled: list[int] = []
 
     @property
@@ -467,17 +455,6 @@ class PrematureFaz:
         self._next_tid += 1
         self._tasks[tid] = self._attempt
         return {"tid": tid}
-
-    async def logsearch_count(self, adom: str, tid: int) -> dict[str, object]:
-        """Always report the scan complete (the premature-100 case)."""
-        self.count_calls.append(tid)
-        total = len(self.dataset)
-        return {
-            "progress-percent": 100,
-            "matched-logs": total,
-            "scanned-logs": total,
-            "total-logs": total,
-        }
 
     async def logsearch_fetch(
         self, adom: str, tid: int, limit: int = 50, offset: int = 0

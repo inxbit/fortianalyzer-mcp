@@ -202,15 +202,12 @@ class FAZTestRunner:
 
             logs_found = fetch_result.get("return-lines", 0)
             print(f"       Found {logs_found} logs")
-
-            # Step 3: Check count/progress
-            count_result = await self.client.logsearch_count(adom="root", tid=tid)
-            print(f"       Progress: {count_result.get('progress-percent', 0)}%")
+            print(f"       Progress: {fetch_result.get('percentage', 0)}%")
 
             result.result = {
                 "tid": tid,
                 "logs_found": logs_found,
-                "progress": count_result,
+                "progress": fetch_result.get("percentage"),
             }
             result.passed = True
 
