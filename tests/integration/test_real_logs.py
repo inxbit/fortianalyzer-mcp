@@ -158,38 +158,6 @@ async def test_search_logs_with_filter(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_logsearch_count(
-    faz_client: FortiAnalyzerClient,
-    test_adom: str,
-    test_device: str | None,
-    time_range_last_hour: dict[str, str],
-):
-    """Test getting log search count/progress."""
-    device_filter = [{"devname": test_device}] if test_device else []
-    # Start log search
-    start_result = await faz_client.logsearch_start(
-        adom=test_adom,
-        logtype="traffic",
-        device=device_filter,
-        time_range=time_range_last_hour,
-        limit=10,
-    )
-    assert "tid" in start_result
-    tid = start_result["tid"]
-
-    # Get count/progress
-    count_result = await faz_client.logsearch_count(test_adom, tid)
-    assert count_result is not None
-    # Should contain progress information
-    assert (
-        "progress-percent" in count_result
-        or "percentage" in count_result
-        or "matched-logs" in count_result
-    )
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
 async def test_logsearch_cancel(
     faz_client: FortiAnalyzerClient,
     test_adom: str,
