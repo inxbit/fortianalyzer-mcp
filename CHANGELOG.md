@@ -5,6 +5,13 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-06-15
+
+New `list_report_templates` tool backed by FortiAnalyzer's dedicated `/template/list` endpoint. PR [#29](https://github.com/rstierli/fortianalyzer-mcp/pull/29). 535 unit tests pass.
+
+### Added
+- **`list_report_templates(adom)` tool.** Returns the list of report templates available in an ADOM via the spec-defined `/template/list` JSON-RPC endpoint, rather than scraping `list_report_layouts` and filtering by name. The dedicated endpoint returns templates with their canonical IDs / names / language / category, so callers building report-run workflows can pick a template by ID without first listing layouts.
+
 ## [2.2.1] - 2026-06-15
 
 Align logsearch poll-before-fetch with the FortiAnalyzer JSON-API spec — drop the non-spec `/logsearch/count/{tid}` endpoint and non-spec `progress-percent` field. PR [#28](https://github.com/rstierli/fortianalyzer-mcp/pull/28). Closes [#27](https://github.com/rstierli/fortianalyzer-mcp/issues/27). 589 unit tests pass; cross-verified against FAZ 7.6.7 and 8.0.0 (same MCP code, both hosts produce the same shape).
