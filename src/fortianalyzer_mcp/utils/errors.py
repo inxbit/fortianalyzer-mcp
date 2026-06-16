@@ -51,8 +51,14 @@ class TimeoutError(FortiAnalyzerError):
     pass
 
 
-class ValidationError(FortiAnalyzerError):
-    """Input validation failed."""
+class ValidationError(FortiAnalyzerError, ValueError):
+    """Input validation failed.
+
+    Single canonical class: raised by the input validators in
+    utils.validation (which re-exports it) and mapped from FAZ error
+    code -5. Subclasses ValueError so validator callers can treat it
+    as a plain bad-value error.
+    """
 
     pass
 

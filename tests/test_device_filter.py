@@ -23,6 +23,10 @@ class TestBuildDeviceFilter:
     def test_all_group_uses_devid(self) -> None:
         assert build_device_filter("All_FortiMail") == [{"devid": "All_FortiMail"}]
 
+    def test_fortivoice_serial_uses_devid(self) -> None:
+        """Regression: FV serials are valid (DEVICE_SERIAL_PATTERN) and must map to devid."""
+        assert build_device_filter("FVVM0000000001") == [{"devid": "FVVM0000000001"}]
+
     def test_plain_name_uses_devname(self) -> None:
         assert build_device_filter("myfw01") == [{"devname": "myfw01"}]
 
