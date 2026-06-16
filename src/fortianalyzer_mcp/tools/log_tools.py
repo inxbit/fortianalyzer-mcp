@@ -9,6 +9,7 @@ import logging
 import math
 from typing import Any
 
+from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.utils.log_clock import resolve_time_window
 from fortianalyzer_mcp.utils.responses import build_warnings, error_response, redact
@@ -297,7 +298,7 @@ async def _run_logsearch_page_unlocked(
     Returns ``{"timed_out": bool, "tid": int|None, "logs": list, "total": int|None}``.
     """
     await client.ensure_connected()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     timeout = _clamp_timeout(timeout)
     limit = _clamp_limit(limit)
     deadline = loop.time() + timeout
@@ -392,7 +393,7 @@ async def _run_logsearch_page_unlocked(
                     pass
 
 
-def _get_client():
+def _get_client() -> FortiAnalyzerClient:
     """Get the FortiAnalyzer client instance."""
     client = get_faz_client()
     if not client:
@@ -1198,7 +1199,7 @@ async def search_traffic_logs(
 
         filter_str = " and ".join(filters) if filters else None
 
-        result = await query_logs(
+        result: dict[str, Any] = await query_logs(
             adom=adom,
             logtype="traffic",
             device=device,
@@ -1291,7 +1292,7 @@ async def search_security_logs(
 
         filter_str = " and ".join(filters) if filters else None
 
-        result = await query_logs(
+        result: dict[str, Any] = await query_logs(
             adom=adom,
             logtype="attack",
             device=device,
@@ -1382,7 +1383,7 @@ async def search_event_logs(
 
         filter_str = " and ".join(filters) if filters else None
 
-        result = await query_logs(
+        result: dict[str, Any] = await query_logs(
             adom=adom,
             logtype="event",
             device=device,
