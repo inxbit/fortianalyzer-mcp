@@ -420,7 +420,14 @@ def _bounded_metadata(
     """Build common bounded-analysis response metadata."""
     authoritative = total_hits if (total_hits_is_known and total_hits is not None) else None
     if authoritative is not None:
-        resolved_total_hits = authoritative
+        # Defense against #30: the authoritative total comes from a limit=1
+        # logsearch whose `total-count` short-circuits unreliably on heavy
+        # traffic, sometimes reporting fewer hits than the breakdown actually
+        # observed. Clamp at the response boundary so the schema contract
+        # `total_hits >= observed_hits` always holds — otherwise a misleading
+        # tiny total breaks downstream audit decisions. Becomes a no-op once
+        # _query_policy_total_count is reworked to sum per-slice totals.
+        resolved_total_hits = max(authoritative, observed_hits)
         # "complete" must mean the breakdown covers exactly the authoritative
         # matching log count. Any mismatch keeps the result bounded.
         is_exact = truncated_slices == 0 and observed_hits == authoritative

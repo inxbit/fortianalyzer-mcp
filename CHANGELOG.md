@@ -5,6 +5,13 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-06-16
+
+Defensive clamp at the policy-port-analysis response boundary so `total_hits >= observed_hits` always holds. Closes the user-facing symptom of [#30](https://github.com/rstierli/fortianalyzer-mcp/issues/30) — under-reported totals were breaking policy-audit decisions on heavy-traffic policies. 552 unit tests pass.
+
+### Fixed
+- **`get_policy_port_analysis` (and the other bounded-policy tools) no longer return `total_hits` smaller than `observed_hits`.** The authoritative total comes from a `limit=1` logsearch whose `total-count` short-circuits unreliably on heavy traffic — on a 7-day window for a busy policy we observed `total_hits: 37` while the breakdown itself counted `observed_hits: 1149`. The response-assembly site at `_bounded_metadata` now clamps `resolved_total_hits = max(authoritative, observed_hits)` so the schema contract holds. `total_hit_source` continues to report `logsearch_total-count` since that is where the value came from; the clamp only defends against the under-report failure mode. This is a defensive shim and will become a no-op once `_query_policy_total_count` is reworked to sum per-slice totals (variant 2 in the [#30](https://github.com/rstierli/fortianalyzer-mcp/issues/30) issue body).
+
 ## [2.4.0] - 2026-06-16
 
 Security hardening + correctness fixes shipped together. PRs [#31](https://github.com/rstierli/fortianalyzer-mcp/pull/31) (security) and [#32](https://github.com/rstierli/fortianalyzer-mcp/pull/32) (correctness) by [@inxbit](https://github.com/inxbit). 552 unit tests pass.

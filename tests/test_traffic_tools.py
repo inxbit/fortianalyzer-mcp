@@ -1120,8 +1120,17 @@ class TestBoundedMetadata:
         assert md["analysis_mode"] == "complete"
         assert "recommendation" not in md
 
-    def test_total_below_observed_keeps_authoritative_total(self) -> None:
-        """A smaller authoritative total must not be relabeled as observed rows."""
+    def test_total_below_observed_is_clamped_to_observed(self) -> None:
+        """Schema contract: total_hits MUST be >= observed_hits.
+
+        The authoritative total comes from a limit=1 logsearch whose total-count
+        short-circuits unreliably under heavy traffic, sometimes under-reporting
+        below what the breakdown itself counted. Returning a total smaller than
+        observed_hits is a schema violation that breaks downstream audit
+        decisions (e.g. policy port analysis). Defended at the response
+        boundary: see issue #30. Becomes a no-op once _query_policy_total_count
+        is reworked to sum per-slice totals (variant 2 in the issue body).
+        """
         md = _bounded_metadata(
             observed_hits=5,
             slices_scanned=1,
@@ -1129,8 +1138,13 @@ class TestBoundedMetadata:
             total_hits=2,
             total_hits_is_known=True,
         )
-        assert md["total_hits"] == 2
+        # Clamped up to observed (was the broken authoritative value of 2).
+        assert md["total_hits"] == 5
+        # Source still reports the authoritative origin — the value was just
+        # defended against a known under-report failure mode.
         assert md["total_hit_source"] == "logsearch_total-count"
+        # Mismatch between authoritative (2) and observed (5) keeps the
+        # result bounded even though no slice was truncated.
         assert md["is_exact"] is False
         assert md["analysis_mode"] == "bounded_sample"
         assert "recommendation" in md
