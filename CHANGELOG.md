@@ -5,6 +5,20 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-06-16
+
+Type safety + internals refactor and a session-expired re-login signal. PRs [#33](https://github.com/rstierli/fortianalyzer-mcp/pull/33) and [#34](https://github.com/rstierli/fortianalyzer-mcp/pull/34) by [@inxbit](https://github.com/inxbit). 554 unit tests pass.
+
+### Changed
+- **Blocking `pyfmg` calls are off the asyncio event loop.** All FortiAnalyzer JSON-RPC calls (login, logout, raw POST, generic verbs) are wrapped in `asyncio.to_thread` and serialized by a per-client `asyncio.Lock`. The lock is required because `pyfmg` shares one `requests.Session` + req-id counter that is not thread-safe; one in-flight FAZ request per host matches the prior behavior, but the loop is no longer blocked. `connect()` re-checks `self._connected` inside the lock to avoid double-login on concurrent callers.
+- **`ValidationError` consolidated into a single class.** The canonical type now lives in `utils.errors`, subclasses both `FortiAnalyzerError` and `ValueError`, and is re-exported from `utils.validation` so every existing import (`from utils.validation import ValidationError`) keeps working. Tools doing `except ValidationError` still match (single class, MRO correct); tools doing `except ValueError` still match too (the new class is-a `ValueError`). The FAZ `-5` error path that maps to `utils.errors.ValidationError` is now catchable by tools that previously only caught the `validation.py` variant — a strict improvement.
+- **Client typing tightened.** The `_request_dict` / `_raw_request_dict` helpers add a single `cast(dict[str, Any], ...)` per shape — pure mypy hint, single cast point, no runtime assertion. Filter params widened from `list[str]` to `list[Any]` so callers can pass nested `[field, op, value]` triples that FAZ actually accepts — the prior annotation was wrong. One `# type: ignore[call-arg]` added in `config.py` for pydantic-settings env loading, commented.
+- **FAZ error code `-11` now reclassified as a session-expired signal.** Long-lived clients that hit `-11` ("No permission for the resource") on FortiAnalyzer 8.0.0 — which raises it when an established session goes stale — re-login exactly once via the existing serialized `_force_reconnect` path instead of retrying the dead session. The reconnect path inherits the v2.0.1 lock + generation counter, so concurrent callers don't race. Reconnect budget is hard-coded to a single retry per request; a second `-11` after re-login raises immediately. `ERROR_CODE_MAP[-11]` updated from `TimeoutError("Task timeout")` to `PermissionError("No permission for the resource")` so the raised exception class matches the new semantics.
+
+### Added
+- `FortiVoice` (`FV`) serial prefix added to `_DEVICE_SERIAL_PREFIXES` so FV serials route through the device-name filter path. Previously, `DEVICE_SERIAL_PATTERN` accepted FV serials but `_DEVICE_SERIAL_PREFIXES` did not list `FV`, silently building a filter that matched nothing. Fix bundled with the typing PR since it lives in the same `validation.py` reach.
+- `asyncio.get_event_loop()` → `asyncio.get_running_loop()` in the `log_tools` polling loop — correct for Python 3.12+.
+
 ## [2.4.1] - 2026-06-16
 
 Defensive clamp at the policy-port-analysis response boundary so `total_hits >= observed_hits` always holds. Closes the user-facing symptom of [#30](https://github.com/rstierli/fortianalyzer-mcp/issues/30) — under-reported totals were breaking policy-audit decisions on heavy-traffic policies. 552 unit tests pass.
