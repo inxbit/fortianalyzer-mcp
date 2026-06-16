@@ -5,6 +5,26 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-06-16
+
+Security hardening + correctness fixes shipped together. PRs [#31](https://github.com/rstierli/fortianalyzer-mcp/pull/31) (security) and [#32](https://github.com/rstierli/fortianalyzer-mcp/pull/32) (correctness) by [@inxbit](https://github.com/inxbit). 552 unit tests pass.
+
+### Security
+- **DVMDB credential blobs are masked on device reads.** `list_devices`, `get_device`, `search_devices`, and `get_device_info` now route through `sanitize_for_logging` so the `adm_pass` field returns `***REDACTED***` instead of the cleartext credential blob. The blob was a leak, not a documented field — agents that previously parsed `adm_pass` will see the redaction placeholder.
+- **PCAP ZIP extraction enforces a 50MB cap against crafted ZIP headers.** Decompression in `get_pcap_by_session`, `download_pcap_by_url`, and `search_and_download_pcaps` now reads with a hard `size+1` byte limit rather than trusting `ZipInfo.file_size` (which is attacker-controlled). Defends against ZIP-bomb / oversized-archive attacks at the FAZ-API boundary.
+- **HTTP transport bearer-token comparison uses SHA-256 + `hmac.compare_digest`.** The previous compare leaked token length via early-exit timing. Both tokens are now hashed to 32 bytes before constant-time compare, removing the length side-channel.
+- **Mutation tools validate `adom` / `device_name` / `severity` / `status` against allowlists** before reaching the FAZ. `add_device`, `delete_device`, `create_incident`, and `update_incident` reject malformed inputs at the tool boundary with a structured error envelope.
+
+### Fixed
+- **`acknowledge_ioc_events` was 100% broken** — the tool was passing `ioc_ids=` to the client method, whose signature is `event_ids=`. Every call raised `TypeError`. Corrected.
+- **`get_fortiview_data` no longer returns truncated top-N data.** The old completion guard exited on the first non-empty `data` payload, before polling reached `percentage=100`. The fetch now waits for full completion; older FAZ builds that don't emit `percentage` are treated as complete (back-compat preserved).
+- **`run_and_wait_report` verifies completion via `report_fetch` instead of assuming success.** Previously, any time the report tid disappeared from the running list, the wrapper returned success — including on report failure or a startup race where the tid hadn't appeared yet. Now confirms `state == "generated"` (success); `pending`/`running` keeps polling; anything else is an error.
+- **`run_ioc_rescan` passes the correctly-shaped device filter.** The tool was passing a raw string where the client expected `list[dict[str, str]]` — a guaranteed type mismatch. Now routes through the shared `build_device_filter()` helper.
+
+### Added
+- `tests/test_security_regressions.py` — pins each of the four security claims with fake clients that mirror real signatures so kwarg drift fails the test.
+- `tests/test_correctness_regressions.py` — pins the four correctness fixes; the IOC ack test would fail if `ioc_ids=` were reintroduced; the FortiView test explicitly asserts the fetch poll loop iterates more than once.
+
 ## [2.3.0] - 2026-06-15
 
 New `list_report_templates` tool backed by FortiAnalyzer's dedicated `/template/list` endpoint. PR [#29](https://github.com/rstierli/fortianalyzer-mcp/pull/29). 535 unit tests pass.
