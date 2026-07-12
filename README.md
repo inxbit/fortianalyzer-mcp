@@ -22,6 +22,8 @@ This MCP server provides a comprehensive interface to FortiAnalyzer's capabiliti
 - Manage security alerts and incidents
 - Perform IOC (Indicators of Compromise) analysis
 - Manage devices and ADOMs
+- Run higher-level SOC workflows via the skills layer (beta): incident correlation, triage, incident summaries
+- Optionally pseudonymize IOC/PII data before it reaches the model, reversibly (beta)
 
 ## Features
 
@@ -42,7 +44,7 @@ This MCP server provides a comprehensive interface to FortiAnalyzer's capabiliti
 ## Requirements
 
 - **Python**: 3.12 or higher
-- **FortiAnalyzer**: 7.x with JSON-RPC API access enabled
+- **FortiAnalyzer**: 7.x with JSON-RPC API access enabled (skills layer requires 7.6.7+)
 - **Authentication**: API token (recommended) or username/password
 - **Network**: HTTPS access to FortiAnalyzer management interface
 
@@ -667,6 +669,8 @@ Only discovery tools are loaded initially, reducing context usage by ~90%. Use `
 ```bash
 FAZ_TOOL_MODE=dynamic
 ```
+
+Note: the skills layer is not available in dynamic mode (beta limitation); `FAZ_SKILLS_ENABLED` is ignored there with a warning.
 
 ## Architecture
 
