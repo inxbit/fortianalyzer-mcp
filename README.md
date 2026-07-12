@@ -686,9 +686,22 @@ fortianalyzer-mcp/
 │   │   ├── report_tools.py    # Report generation tools
 │   │   ├── system_tools.py    # System and ADOM tools
 │   │   └── traffic_tools.py   # Policy traffic analysis tools
+│   ├── skills/                # Skills layer (beta, FAZ_SKILLS_ENABLED)
+│   │   ├── catalog.py         # Skill registry + machine-readable catalogue
+│   │   ├── dispatcher.py      # The faz_skill dispatcher tool
+│   │   ├── handlers.py        # Skill orchestrations over the raw tools
+│   │   └── models.py          # Pydantic parameter/output schemas (versioned)
+│   ├── masking/               # Reversible data masking (beta, MASKING_ENABLED)
+│   │   ├── fields.py          # Verified field allowlist + type tables
+│   │   ├── fpe_engine.py      # FF3-1 format-preserving token engine
+│   │   ├── unmask.py          # Tool-argument unmasking (tokens -> real values)
+│   │   └── wrapper.py         # Tool-boundary output masking
 │   ├── utils/
 │   │   ├── config.py          # Configuration management
 │   │   ├── errors.py          # Error handling
+│   │   ├── log_clock.py       # FAZ time-basis handling
+│   │   ├── responses.py       # Shared response helpers
+│   │   ├── time_range.py      # Time-range parsing (single source of truth)
 │   │   └── validation.py      # Input validation and log sanitization
 │   └── server.py              # MCP server implementation
 ├── tests/                     # Test suite
