@@ -5,7 +5,9 @@ All notable changes to FortiAnalyzer MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.8.0] - 2026-07-12
+
+Minor release: the skills layer, Wave 1 of RFC #44 — beta, behind `FAZ_SKILLS_ENABLED` (default **off**; no behavior change unless enabled). Live-validated on FAZ 7.6.7 and 8.0.0.
 
 ### Added
 - **Skills layer refinements from the #46 review.** The per-incident attachment lookups in `incidents` now run as a bounded concurrent fan-out (5 at a time) instead of serially, and the alert window scan is deferred until an incident actually needs the linkage-key fallback — `alerts_scanned` reports 0 when attachments correlated everything. `triage` resolves an alert subject filter-first (`alertid=="<id>"` over a 30-day window, live-verified on 7.6.7 and 8.0.0) before falling back to the context-window scan, removing the degraded no-severity path for day-after triage; and an alert's related incidents are now resolved authoritatively by checking each context incident's attachments for the alert (FAZ rejects a reverse `attachsrcid` query without `incid`, and ignores `attachsrcid` as a filter — both live-verified), replacing the noisy all-incidents-in-window fallback. The dispatcher's `skill="describe"` alias for `skill="list"` is now documented, and the `skill_output_invalid` / `skill_error` dispatcher error paths are covered by tests.
