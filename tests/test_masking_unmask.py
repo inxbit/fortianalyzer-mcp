@@ -123,6 +123,33 @@ class TestFilterExpressions:
 
         assert unmasker.unmask_filter(f'srcip !contain "{token}"') == 'srcip !contain "192.0.2.102"'
 
+    def test_like_operator_resolves_token_inside_wildcards(
+        self, unmasker: ArgUnmasker, engine: FPEEngine
+    ):
+        # `like` is the substring operator the server now emits; the masked
+        # token sits between % wildcards and must round-trip with them kept.
+        token = engine.mask_ip("192.0.2.102")
+
+        assert unmasker.unmask_filter(f'srcip like "%{token}%"') == 'srcip like "%192.0.2.102%"'
+        assert unmasker.unmask_filter(f'srcip like "{token}%"') == 'srcip like "192.0.2.102%"'
+
+    def test_uppercase_like_resolves_token(self, unmasker: ArgUnmasker, engine: FPEEngine):
+        # FortiAnalyzer accepts uppercase LIKE (live-confirmed on 7.6.7 + 8.0.0);
+        # the operator match is case-insensitive so a caller-authored LIKE still
+        # resolves, and the caller's casing is preserved in the output.
+        token = engine.mask_ip("192.0.2.102")
+
+        assert unmasker.unmask_filter(f'srcip LIKE "%{token}%"') == 'srcip LIKE "%192.0.2.102%"'
+
+    def test_like_complement_form_resolves_token(self, unmasker: ArgUnmasker, engine: FPEEngine):
+        # `!(field like "%x%")` is the negation FAZ actually accepts (not like
+        # is rejected), so it is the shape callers send; the parens survive.
+        token = engine.mask_ip("192.0.2.102")
+
+        assert (
+            unmasker.unmask_filter(f'!(srcip like "%{token}%")') == '!(srcip like "%192.0.2.102%")'
+        )
+
     @pytest.mark.parametrize(
         "expression",
         [
