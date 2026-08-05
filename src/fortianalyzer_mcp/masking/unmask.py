@@ -74,13 +74,14 @@ logger = logging.getLogger(__name__)
 # transformed (#73 7a). It is an allowlist of the places a clause can
 # legitimately begin, measured against live 7.6.7 and 8.0.0: start of
 # string, after whitespace, after "(" (grouping and the !(...) complement),
-# after "&" ("a&&b" parses identically to "a and b"; single "&", "|", "||"
-# and "," are all rejected by the appliance), and after "!" (bare "!f==v"
-# negation is served). The cost is that a dotted spelling ("foo.srcip") no
+# after ")" ("(a==b)c==d" parses identically to "a==b and c==d", so a clause
+# does begin there), after "&" ("a&&b" parses identically to "a and b";
+# single "&", "|", "||", "," and "[" are all rejected by the appliance), and
+# after "!" (bare "!f==v" negation is served). The cost is that a dotted spelling ("foo.srcip") no
 # longer resolves as srcip, which prices at zero: a dotted field matches
 # nothing at the appliance, so such a clause only ever produced zero rows.
 _FILTER_CLAUSE_RE = re.compile(
-    r"(?<![^\s(!&])"
+    r"(?<![^\s()!&])"
     r"(?P<field>[A-Za-z_][A-Za-z0-9_]*)"
     r"\s*(?P<op>==|!=|<=|>=|=~|!~|<|>|=(?![=~])|~|!contain\b|\bcontain\b|\b(?ai:like)\b)\s*"
     r"(?P<quote>[\"']?)(?P<value>[^\"'\s()]+)(?P=quote)"

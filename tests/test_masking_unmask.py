@@ -178,6 +178,18 @@ class TestFilterExpressions:
 
         assert out == 'srcip=="192.0.2.102"&&dstip=="198.51.100.7"'
 
+    def test_clause_after_close_paren_resolves(self, unmasker: ArgUnmasker, engine: FPEEngine):
+        # "(a==b)c==d" is a working filter on live 7.6.7 and 8.0.0, with the
+        # same row count as "a==b and c==d", so a clause legitimately begins
+        # after ")". Without ")" in the class the second token reached the
+        # appliance unresolved and the query silently matched nothing.
+        t1 = engine.mask_ip("192.0.2.102")
+        t2 = engine.mask_ip("198.51.100.7")
+
+        out = unmasker.unmask_filter(f'(srcip=="{t1}")dstip=="{t2}"')
+
+        assert out == '(srcip=="192.0.2.102")dstip=="198.51.100.7"'
+
     def test_bare_negation_resolves(self, unmasker: ArgUnmasker, engine: FPEEngine):
         # "!f==v" (no parens) is served by the appliance, so a clause
         # legitimately begins after "!".
