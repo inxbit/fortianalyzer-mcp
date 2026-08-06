@@ -920,3 +920,94 @@ class TestMutatingToolGate:
 
         assert calls == []
         assert result["error"] == "masked_token_in_mutating_args"
+
+
+class TestFailClosedValuesInProse:
+    """#73 item 4: a value that fails closed under a typed key was not
+    recorded, so pass 2 had nothing to substitute and the raw form of the
+    same value rode out in the prose beside it."""
+
+    def test_burned_value_does_not_survive_in_prose(self, masker: OutputMasker):
+        raw = "DOMAIN\\alice"
+        masked = masker.mask_result({"user": raw, "msg": f"login failure for {raw} at the console"})
+
+        assert raw not in masked["msg"]
+        # the prose carries the same placeholder the typed key got, so the
+        # two references stay recognisable as one identifier
+        assert masked["msg"] == f"login failure for {masked['user']} at the console"
+        assert masked["user"].startswith("masked-unrepresentable-")
+
+    def test_reversible_values_still_map_to_their_token(self, masker: OutputMasker):
+        # the ordinary path is unchanged: a maskable value still substitutes
+        # to its reversible token, not to a placeholder
+        masked = masker.mask_result(
+            {"hostname": "fw-branch.example.com", "msg": "seen on fw-branch.example.com"}
+        )
+
+        assert masked["msg"] == f"seen on {masked['hostname']}"
+        assert not masked["hostname"].startswith("masked-unrepresentable-")
+
+
+class TestKeepSetAcrossBothPasses:
+    """#73 item 5: with device identity left clear, the same name masked
+    under another typed key and was then substituted into prose, so a
+    reader saw the name and a token for it in one record."""
+
+    def test_kept_name_stays_clear_under_another_typed_key(self, masker: OutputMasker):
+        name = "fgt-branch-01"
+        masked = masker.mask_result({"devname": name, "hostname": name})
+
+        assert masked["devname"] == name
+        assert masked["hostname"] == name
+
+    def test_kept_name_stays_clear_in_prose(self, masker: OutputMasker):
+        name = "fgt-branch-01"
+        masked = masker.mask_result(
+            {"devname": name, "hostname": name, "msg": f"seen on {name} overnight"}
+        )
+
+        assert masked["msg"] == f"seen on {name} overnight"
+
+    def test_flag_on_masks_every_occurrence(
+        self, engine: FPEEngine, monkeypatch: pytest.MonkeyPatch
+    ):
+        # With the flag set there is no keep set, so the same record masks
+        # everywhere and the prose token matches the structured one.
+        monkeypatch.setenv("FAZ_MASKING_KEY", KEY)
+        flagged = OutputMasker(engine, mask_device_identity=True)
+        name = "fgt-branch-01"
+        masked = flagged.mask_result(
+            {"devname": name, "hostname": name, "msg": f"seen on {name} overnight"}
+        )
+
+        assert name not in str(masked)
+        assert masked["msg"] == f"seen on {masked['devname']} overnight"
+
+    def test_kept_name_stays_clear_in_prose_even_when_a_composite_masked_it(
+        self, masker: OutputMasker
+    ):
+        # A URL host reaches the masker through the composite path, which does
+        # not consult the keep set, so the name can still land in the mapping.
+        # Pass 2 must refuse it anyway, or the prose prints a token for a name
+        # the response shows in clear.
+        name = "fgt-branch-01"
+        masked = masker.mask_result(
+            {"devname": name, "url": f"https://{name}/admin", "msg": f"seen on {name}"}
+        )
+
+        assert masked["devname"] == name
+        assert masked["msg"] == f"seen on {name}"
+
+    def test_unrelated_identifier_still_masks_when_keep_set_is_present(self, masker: OutputMasker):
+        # The keep set must not become a blanket exemption: a different
+        # identifier in the same response still masks normally.
+        masked = masker.mask_result(
+            {
+                "devname": "fgt-branch-01",
+                "hostname": "nas-branch.example.com",
+                "msg": "seen on nas-branch.example.com",
+            }
+        )
+
+        assert "nas-branch.example.com" not in str(masked)
+        assert masked["msg"] == f"seen on {masked['hostname']}"

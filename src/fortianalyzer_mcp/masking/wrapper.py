@@ -190,7 +190,14 @@ class OutputMasker:
                 for part in value.split(",")
             )
         token = self._mask_one(vtype, value)
-        if mapping is not None and token != value and _PLACEHOLDER_MARK not in token:
+        if mapping is not None and token != value:
+            # Fail-closed placeholders are recorded too (#73 item 4). Pass 2
+            # substitutes only what pass 1 recorded, so excluding them left
+            # the raw value in the prose beside its own burned key, which is
+            # the "masked here, cleartext two keys away" failure the second
+            # pass exists to close. A placeholder stays self-identifying by
+            # its marker, so a consumer that must tell the two apart still
+            # can, exactly as this method does above.
             mapping[value] = token
         return token
 
@@ -355,7 +362,12 @@ class OutputMasker:
 
     # -- free-text IOC scan --------------------------------------------- #
 
-    def mask_text(self, text: str, mapping: dict[str, str] | None = None) -> str:
+    def mask_text(
+        self,
+        text: str,
+        mapping: dict[str, str] | None = None,
+        keep: frozenset[str] = frozenset(),
+    ) -> str:
         """Mask embedded IPv4/MAC/email IOCs, then any known raw value."""
 
         def ip_sub(m: re.Match[str]) -> str:
@@ -384,9 +396,14 @@ class OutputMasker:
         out = _IPV4_RE.sub(ip_sub, text)
         out = _MAC_RE.sub(mac_sub, out)
         out = _EMAIL_RE.sub(email_sub, out)
-        return self._substitute_known(out, mapping)
+        return self._substitute_known(out, mapping, keep)
 
-    def _substitute_known(self, text: str, mapping: dict[str, str] | None) -> str:
+    def _substitute_known(
+        self,
+        text: str,
+        mapping: dict[str, str] | None,
+        keep: frozenset[str] = frozenset(),
+    ) -> str:
         """Replace values that were masked elsewhere in this response.
 
         Hostnames and domains cannot be recognized by pattern, but they can
@@ -407,7 +424,12 @@ class OutputMasker:
         raws = [
             raw
             for raw in sorted(mapping, key=len, reverse=True)
-            if len(raw) >= _MIN_SUBSTITUTION_LEN
+            # A value the deployment chose to leave readable stays readable in
+            # prose too (#73 item 5). Some composite key may still have masked
+            # it into ``mapping`` on the way past; substituting it here would
+            # print a token for a name shown in clear two keys away, which is
+            # the pairing the keep set exists to withhold.
+            if len(raw) >= _MIN_SUBSTITUTION_LEN and raw not in keep
         ]
         if not raws:
             return text
@@ -458,7 +480,7 @@ class OutputMasker:
         mapping: dict[str, str] = {}
         keep = frozenset() if self._mask_device_identity else self._device_identity_values(obj)
         staged = self._mask_structured(obj, mapping, keep)
-        return self._mask_free_text(staged, mapping)
+        return self._mask_free_text(staged, mapping, keep)
 
     def _device_identity_values(self, obj: Any) -> frozenset[str]:
         """Device-identity values present in this response, pre-collected.
@@ -812,6 +834,14 @@ class OutputMasker:
         vtype = self._field_types.get(lowered)
         if vtype is not None and vtype != TEXT:
             if isinstance(value, str):
+                # A value the deployment chose to leave readable (device
+                # identity with the flag off) must stay readable under every
+                # key, not just the device-identity ones (#73 item 5).
+                # Masking it here while ``devname`` shows it two keys away
+                # hands over the token-to-name pairing the keep set exists
+                # to withhold.
+                if value in keep:
+                    return value
                 return self._mask_scalar(vtype, value, mapping)
             if isinstance(value, list):
                 # e.g. dns "ipaddr" is a list of resolved addresses
@@ -825,23 +855,27 @@ class OutputMasker:
             return self._mask_structured(value, mapping, keep)
         return value  # TEXT values are deliberately left for pass 2
 
-    def _mask_free_text(self, obj: Any, mapping: dict[str, str]) -> Any:
+    def _mask_free_text(
+        self, obj: Any, mapping: dict[str, str], keep: frozenset[str] = frozenset()
+    ) -> Any:
         """Pass 2: mask TEXT fields, now that the raw -> token map is known."""
         if isinstance(obj, dict):
             out: dict[str, Any] = {}
             for key, value in obj.items():
                 if key.lower() in COMPOSITE_FILTER_ENTRIES and isinstance(value, list):
-                    out[key] = self._mask_filter_entries(value, mapping)
+                    out[key] = self._mask_filter_entries(value, mapping, keep)
                 elif self._field_types.get(key.lower()) == TEXT:
-                    out[key] = self._mask_text_tree(value, mapping)
+                    out[key] = self._mask_text_tree(value, mapping, keep)
                 else:
-                    out[key] = self._mask_free_text(value, mapping)
+                    out[key] = self._mask_free_text(value, mapping, keep)
             return out
         if isinstance(obj, list):
-            return [self._mask_free_text(item, mapping) for item in obj]
+            return [self._mask_free_text(item, mapping, keep) for item in obj]
         return obj
 
-    def _mask_filter_entries(self, value: Any, mapping: dict[str, str]) -> Any:
+    def _mask_filter_entries(
+        self, value: Any, mapping: dict[str, str], keep: frozenset[str] = frozenset()
+    ) -> Any:
         """``filter_applied`` as compiled ``[field, op, value]`` entries.
 
         A tool that compiles a structured filter echoes what it actually sent,
@@ -871,33 +905,37 @@ class OutputMasker:
         out: list[Any] = []
         for entry in value:
             if not isinstance(entry, list | tuple) or len(entry) != 3:
-                out.append(self._mask_text_tree(entry, mapping))
+                out.append(self._mask_text_tree(entry, mapping, keep))
                 continue
             field, op, raw = entry
             vtype = self._field_types.get(field.lower()) if isinstance(field, str) else None
             if vtype is None or vtype == TEXT or not isinstance(raw, str):
-                out.append(self._mask_text_tree(list(entry), mapping))
+                out.append(self._mask_text_tree(list(entry), mapping, keep))
                 continue
             masked = self._mask_scalar(vtype, raw, mapping)
             out.append([field, op, masked] if isinstance(entry, list) else (field, op, masked))
         return out
 
-    def _mask_text_tree(self, value: Any, mapping: dict[str, str]) -> Any:
+    def _mask_text_tree(
+        self, value: Any, mapping: dict[str, str], keep: frozenset[str] = frozenset()
+    ) -> Any:
         if isinstance(value, str):
-            return self._mask_scalar_text(value, mapping)
+            return self._mask_scalar_text(value, mapping, keep)
         if isinstance(value, list):
             # Free-text lines; each string leaf gets the IOC scan. Nested dicts
             # in a list were already masked in pass 1, so recursion leaves them be.
-            return [self._mask_text_tree(item, mapping) for item in value]
+            return [self._mask_text_tree(item, mapping, keep) for item in value]
         # A dict under a TEXT key is a structured object already masked key-by-key
         # in pass 1; scanning it here would double-mask its tokens. Leave it.
         return value
 
-    def _mask_scalar_text(self, value: str, mapping: dict[str, str]) -> str:
+    def _mask_scalar_text(
+        self, value: str, mapping: dict[str, str], keep: frozenset[str] = frozenset()
+    ) -> str:
         if value.strip() in SKIP_VALUES:
             return value
         try:
-            return self.mask_text(value, mapping)
+            return self.mask_text(value, mapping, keep)
         except Exception:
             logger.exception("unexpected error masking free text; placeholder used")
             return self.placeholder(value)
