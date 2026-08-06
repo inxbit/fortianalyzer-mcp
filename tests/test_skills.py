@@ -11,6 +11,8 @@ Every assertion runs against the validated pydantic output models — the
 same contract the dispatcher enforces.
 """
 
+import ast
+import inspect
 from typing import Any
 from unittest.mock import patch
 
@@ -19,7 +21,6 @@ from pydantic import ValidationError
 
 from fortianalyzer_mcp.skills import handlers
 from fortianalyzer_mcp.skills.catalog import SKILLS, catalogue
-from fortianalyzer_mcp.skills.dispatcher import _redact_warnings, faz_skill
 from fortianalyzer_mcp.skills.models import (
     SCHEMA_VERSION,
     FeatureGap,
@@ -29,6 +30,9 @@ from fortianalyzer_mcp.skills.models import (
     ReportsParams,
     TriageParams,
 )
+from tests.conftest import import_dispatcher_isolated
+
+_redact_warnings, faz_skill = import_dispatcher_isolated("_redact_warnings", "faz_skill")
 
 WAVE1_SKILL_IDS = {"incidents", "reports", "log_search", "triage", "incident_summary"}
 WAVE2_DATA_ACCESS_IDS = {"asset_lookup", "identity_lookup", "alert_rules"}
@@ -58,7 +62,7 @@ GET_ALERT_INCIDENT_STATS = "fortianalyzer_mcp.tools.event_tools.get_alert_incide
 GET_REPORT_HISTORY = "fortianalyzer_mcp.tools.report_tools.get_report_history"
 GET_REPORT_DATA = "fortianalyzer_mcp.tools.report_tools.get_report_data"
 QUERY_LOGS = "fortianalyzer_mcp.tools.log_tools.query_logs"
-GET_TOP_THREATS = "fortianalyzer_mcp.tools.fortiview_tools.get_top_threats"
+GET_FORTIVIEW_DATA = "fortianalyzer_mcp.tools.fortiview_tools.get_fortiview_data"
 
 
 def t(target: str, **kwargs: Any) -> Any:
@@ -400,7 +404,7 @@ class TestReportsSkill:
         assert result.action == "list"
         assert result.report_count == 2
         assert result.reports == history
-        mock.assert_awaited_once_with(adom=None, time_range="7-day", title=None)
+        mock.assert_awaited_once_with(adom=None, time_range="7-day", title=None, fields=["*"])
 
     async def test_list_applies_client_side_limit(self):
         history = [{"tid": f"t-{i}"} for i in range(5)]
@@ -479,7 +483,7 @@ class TestTriageSkill:
         ):
             result = await handlers.run_triage(TriageParams(alert_id="alert-001"))
         details_mock.assert_awaited_once_with(alert_ids=["alert-001"], adom=None)
-        logs_mock.assert_awaited_once_with(alert_ids=["alert-001"], adom=None)
+        logs_mock.assert_awaited_once_with(alert_ids=["alert-001"], adom=None, fields=["*"])
         assert result.subject_type == "alert"
         assert result.subject == ALERT_LINKED  # full row from the window scan
         assert result.subject_details == self.DETAILS["data"]["data"][0]
@@ -662,12 +666,15 @@ class TestIncidentSummarySkill:
             t(
                 GET_ALERT_LOGS, return_value=ok(data=[{"logid": "l-1"}, {"logid": "l-2"}])
             ) as logs_mock,
-            t(GET_TOP_THREATS, return_value=ok(data=threats)),
+            t(GET_FORTIVIEW_DATA, return_value=ok(data=threats)) as threats_mock,
         ):
             result = await handlers.run_incident_summary(
                 IncidentSummaryParams(incident_id="inc-001")
             )
-        logs_mock.assert_awaited_once_with(alert_ids=["alert-001"], adom=None, limit=20)
+        logs_mock.assert_awaited_once_with(
+            alert_ids=["alert-001"], adom=None, limit=20, fields=["*"]
+        )
+        assert threats_mock.call_args.kwargs["view_name"] == "top-threats"
         assert result.incident == INCIDENT
         assert len(result.alerts) == 1
         assert result.alerts[0].alert == ALERT_LINKED
@@ -681,7 +688,7 @@ class TestIncidentSummarySkill:
         with (
             t(GET_INCIDENT, return_value=ok(data=INCIDENT)),
             t(GET_ALERTS, return_value=ok(data=[])),
-            t(GET_TOP_THREATS, side_effect=RuntimeError("fortiview down")),
+            t(GET_FORTIVIEW_DATA, side_effect=RuntimeError("fortiview down")),
         ):
             result = await handlers.run_incident_summary(
                 IncidentSummaryParams(incident_id="inc-001")
@@ -926,3 +933,99 @@ class TestNestedWarningRedaction:
 
         assert result["status"] == "success"
         assert "SECRET123" not in str(result)
+
+
+# --------------------------------------------------------------------- #
+# call-site discipline: curating readers must not default in handlers.py #
+# --------------------------------------------------------------------- #
+
+#: Every tool that routes its ``fields`` argument through
+#: ``query.shape.resolve_projection``.
+#:
+#: Deliberately *not* "the readers that curate today". The first version of
+#: this list was the curating subset and it omitted ``query_logs``, so the
+#: guard reported a clean audit while six handler call sites took the curated
+#: traffic/event/attack default and quietly dropped srcintf, hostname, msg,
+#: logid and a dozen more from output models documented as verbatim. A
+#: vocabulary can also *gain* a curated set later (report and fortiview are
+#: uncurated today), which would turn a currently-harmless call site into the
+#: same silent truncation with no code change here to notice it. Membership is
+#: therefore "resolver-backed", which is a property of the tool signature and
+#: does not move when a curation lands.
+#:
+#: ``list_adoms``/``list_devices`` are excluded on purpose: they forward
+#: ``fields`` straight to the appliance without the resolver, and omitting it
+#: means "no projection", not "the curated one".
+_PROJECTING_READERS = frozenset(
+    {
+        "get_endpoints",
+        "get_endusers",
+        "get_alerts",
+        "get_alert_logs",
+        "get_incidents",
+        "get_report_history",
+        "get_fortiview_data",
+        "query_logs",
+        "fetch_more_logs",
+        "search_devices",
+    }
+)
+
+
+def _call_sites_missing_fields() -> list[tuple[int, str]]:
+    """``(lineno, reader)`` for every ``_call(<reader>, ...)`` that omits ``fields``.
+
+    Parses handlers.py with ``ast`` rather than the running module, so it
+    catches every call site regardless of how the surrounding code wraps
+    across lines -- and, more importantly, regardless of which specific
+    fields a future skill reads. A regex or line-count check would need
+    updating every time handlers.py is reformatted; walking the parsed
+    ``_call(...)`` nodes for a ``fields=`` keyword does not.
+    """
+    tree = ast.parse(inspect.getsource(handlers))
+    missing: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Name) and node.func.id == "_call"):
+            continue
+        if not node.args:
+            continue
+        reader = node.args[0]
+        if not (isinstance(reader, ast.Name) and reader.id in _PROJECTING_READERS):
+            continue
+        if not any(kw.arg == "fields" for kw in node.keywords):
+            missing.append((node.lineno, reader.id))
+    return missing
+
+
+class TestSkillCallSitesRequestFullRows:
+    """A curated default is for direct MCP callers, not a composing skill.
+
+    ``get_endpoints``/``get_endusers``/``get_alerts``/``get_alert_logs``/
+    ``get_incidents``/``get_report_history`` all curate their response by
+    default as of the query-engine-projection plan. Skills compose raw
+    tools and mask once at the ``faz_skill`` boundary, and several
+    ``skills/models.py`` fields are documented as verbatim FAZ objects
+    (``TriageResult.subject``, ``IncidentRecord.incident``,
+    ``EntityBehavior.record``, ...) -- a curated default would silently
+    strip keys those skills read (``risk_score``, ``importance``,
+    ``vuln-stats``, and others) with no error surfaced.
+
+    Every other test in this module (and the rest of the skills suite)
+    patches the reader *function* itself, which makes it structurally
+    blind to a call site that forgot ``fields=`` -- the mock does not care
+    what kwargs it was given unless a test asserts on them individually,
+    and most do not. This test reads handlers.py's source instead, which
+    is the one place that blind spot is visible: a call site is either
+    passing ``fields`` or it is not, independent of what any mock returns.
+    """
+
+    def test_every_projecting_reader_call_passes_fields(self) -> None:
+        missing = _call_sites_missing_fields()
+        assert not missing, (
+            "handlers.py calls a curating reader without fields= at these "
+            f'(line, reader) pairs: {missing}. Pass fields=["*"] there -- '
+            "a composing skill wants the full row, not the curated MCP "
+            "default; see the comment at the top of run_incidents for why."
+        )

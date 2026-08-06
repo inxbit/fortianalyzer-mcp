@@ -6,6 +6,7 @@ Follows the same pattern as test_system_tools.py to avoid server initialization.
 
 import pytest
 
+import fortianalyzer_mcp.tools.event_tools as event_tools
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 
 
@@ -268,3 +269,191 @@ class TestAlertHandlers:
         paths = [c.args[1] for c in req.await_args_list]
         assert "/eventmgmt/adom/root/config/basic-handler" in paths
         assert "/eventmgmt/adom/root/config/correlation-handler" in paths
+
+
+class TestGetAlertsProjection:
+    """Alerts project under the alert vocabulary."""
+
+    ROW = {
+        "alertid": "A-1",
+        "severity": "high",
+        "status": "open",
+        "epid": 12,
+        "euid": 34,
+        "extrainfo": "verbose",
+        "subject_details": {"nested": "kept whole"},
+    }
+
+    def _install(self, monkeypatch: pytest.MonkeyPatch, rows: object) -> None:
+        class FakeClient:
+            async def ensure_connected(self) -> None:
+                return None
+
+            async def get_system_timezone(self) -> None:
+                return None
+
+            async def get_alerts(self, **kwargs: object) -> object:
+                return rows
+
+        monkeypatch.setattr(event_tools, "_get_client", lambda: FakeClient())
+
+    async def test_default_projection_trims_and_keeps_join_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install(monkeypatch, [dict(self.ROW)])
+
+        result = await event_tools.get_alerts()
+
+        row = result["data"][0]
+        assert "extrainfo" not in row
+        assert row["alertid"] == "A-1"
+        assert row["epid"] == 12 and row["euid"] == 34
+
+    async def test_star_returns_the_full_alert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._install(monkeypatch, [dict(self.ROW)])
+
+        result = await event_tools.get_alerts(fields=["*"])
+
+        assert result["data"][0]["extrainfo"] == "verbose"
+
+    async def test_selecting_a_nested_key_keeps_it_whole(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install(monkeypatch, [dict(self.ROW)])
+
+        result = await event_tools.get_alerts(fields=["alertid", "subject_details"])
+
+        assert result["data"][0]["subject_details"] == {"nested": "kept whole"}
+
+    async def test_fields_returned_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._install(monkeypatch, [dict(self.ROW)])
+
+        result = await event_tools.get_alerts(fields=["alertid", "severity"])
+
+        assert result["fields_returned"] == ["alertid", "severity"]
+
+    async def test_a_non_list_data_value_is_wrapped_into_a_single_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A "data" value that isn't a list is still coerced into a one-row list.
+
+        Some FAZ responses collapse a singleton result to a bare object rather
+        than a one-item list. The skills layer (handlers.py) relies on
+        get_alerts always handing back a list under "data" -- iterating a
+        bare dict would walk its keys, not rows.
+        """
+        self._install(monkeypatch, {"data": dict(self.ROW)})
+
+        result = await event_tools.get_alerts(fields=["*"])
+
+        assert result["data"] == [self.ROW]
+
+    async def test_an_empty_fields_list_is_a_typed_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bad projection must carry a machine code, not just a message.
+
+        event_tools has no error_response handler of its own, so without the
+        targeted ValidationError handler this returns an untyped
+        {"status": "error", "message": ...} and the caller cannot branch on it.
+        """
+        self._install(monkeypatch, [dict(self.ROW)])
+
+        result = await event_tools.get_alerts(fields=[])
+
+        assert result["status"] == "error"
+        assert result["error"] == "validation_error"
+
+    async def test_an_unknown_alert_field_warns_rather_than_erroring(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The alert vocabulary is complete=False, so it cannot reject a name.
+
+        This is why the handler above emits validation_error rather than
+        unknown_field: on this tool, an unknown name is not an error at all.
+        """
+        self._install(monkeypatch, [dict(self.ROW)])
+
+        result = await event_tools.get_alerts(fields=["alertid", "mystery_field"])
+
+        assert result["status"] == "success"
+        assert "mystery_field" in result["fields_returned"]
+        assert result["warnings"]
+
+
+class TestGetAlertLogsProjection:
+    """Alert logs project under the event vocabulary -- they're the logs that
+    triggered the alert, not the alerts themselves.
+
+    The endpoint (eventmgmt/.../alertlogs) answers with an envelope dict
+    (a "data" list plus "percentage" and friends), not a bare row list --
+    see api.client.get_alert_logs / _raw_request_once. Every test here uses
+    that envelope shape deliberately: a fake that returned a bare list would
+    hide a projection that never reaches the inner rows.
+    """
+
+    ROW = {
+        "date": "2026-07-28",
+        "time": "10:00:00",
+        "devname": "FAZ-TEST",
+        "level": "warning",
+        "subtype": "system",
+        "action": "login",
+        "user": "admin",
+        "msg": "User admin logged in",
+        "cfgattr": "verbose config diff blob",
+    }
+
+    def _install(self, monkeypatch: pytest.MonkeyPatch, payload: object) -> None:
+        class FakeClient:
+            async def get_alert_logs(self, **kwargs: object) -> object:
+                return payload
+
+        monkeypatch.setattr(event_tools, "_get_client", lambda: FakeClient())
+
+    async def test_default_projection_trims_and_keeps_event_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install(monkeypatch, {"data": [dict(self.ROW)], "percentage": 100})
+
+        result = await event_tools.get_alert_logs(alert_ids=["A-1"])
+
+        row = result["data"]["data"][0]
+        assert "cfgattr" not in row
+        assert row["action"] == "login"
+        # Every other envelope key survives untouched alongside the
+        # projected inner list.
+        assert result["data"]["percentage"] == 100
+
+    async def test_star_returns_the_full_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._install(monkeypatch, {"data": [dict(self.ROW)], "percentage": 100})
+
+        result = await event_tools.get_alert_logs(alert_ids=["A-1"], fields=["*"])
+
+        assert result["data"]["data"][0]["cfgattr"] == "verbose config diff blob"
+
+    async def test_explicit_fields_select_exactly_those_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install(monkeypatch, {"data": [dict(self.ROW)], "percentage": 100})
+
+        result = await event_tools.get_alert_logs(alert_ids=["A-1"], fields=["action", "user"])
+
+        row = result["data"]["data"][0]
+        # Keys, not values: `user` is a masked type, so its value is rewritten
+        # by the arg unmasker when MASKING_ENABLED is on and asserting on it
+        # makes the test depend on a deployment flag. `action` is not a masked
+        # type, so it pins that a real value survived the projection.
+        assert row.keys() == {"action", "user"}
+        assert row["action"] == "login"
+        assert result["fields_returned"] == ["action", "user"]
+
+    async def test_an_empty_fields_list_is_a_typed_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install(monkeypatch, {"data": [dict(self.ROW)], "percentage": 100})
+
+        result = await event_tools.get_alert_logs(alert_ids=["A-1"], fields=[])
+
+        assert result["status"] == "error"
+        assert result["error"] == "validation_error"

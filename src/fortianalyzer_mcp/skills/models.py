@@ -53,7 +53,7 @@ class IncidentsParams(BaseModel):
         default="7-day",
         description='Preset ("1-hour".."90-day") or custom "start|end"',
     )
-    filter: str | None = Field(default=None, description='e.g. "severity==critical"')
+    filter: str | None = Field(default=None, description='e.g. "severity==high"')
     limit: int = Field(default=50, ge=1, le=200, description="Max incidents returned")
     include_alerts: bool = Field(
         default=True, description="Correlate alerts from the same window to each incident"

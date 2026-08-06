@@ -55,6 +55,7 @@ from pydantic import BaseModel
 from fortianalyzer_mcp.masking.fields import (
     COMPOSITE_PREFIXED,
     COMPOSITE_URL_FULL,
+    FIELD_NAME_ARGS,
     FIELD_TYPES,
     IP,
     IP_OR_HOST,
@@ -339,6 +340,12 @@ class ArgUnmasker:
 
     def _unmask_entry(self, key: str, value: Any) -> Any:
         lowered = key.lower()
+        if lowered in FIELD_NAME_ARGS:
+            # Names a field, column or view -- not a value. Resolving a token
+            # here turned every echo of the argument (fields_returned, an
+            # echoed group_by/sample_by, a refusal message quoting the
+            # dimension) into a token -> plaintext oracle; see FIELD_NAME_ARGS.
+            return value
         if isinstance(value, str):
             if lowered in ("filter", "filter_applied"):
                 return self.unmask_filter(value)

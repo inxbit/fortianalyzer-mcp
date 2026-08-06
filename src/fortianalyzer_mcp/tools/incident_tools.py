@@ -8,9 +8,10 @@ import logging
 from typing import Any
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
+from fortianalyzer_mcp.query.shape import project_payload
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tool_annotations import CREATES, DESTRUCTIVE, READ_ONLY
-from fortianalyzer_mcp.utils.responses import redact
+from fortianalyzer_mcp.utils.responses import error_response, redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
@@ -62,11 +63,19 @@ async def get_incidents(
     filter: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Get security incidents from FortiAnalyzer.
 
     Retrieves incidents from the incident management module.
     Incidents can be created manually or automatically from alerts.
+
+    The time window IS applied, though FortiAnalyzer does not document
+    ``time-range`` on this endpoint. Verified on 7.6.6: a window covering an
+    incident's createtime returns it, windows in 2000 and 2099 return
+    nothing, and omitting the window returns everything — the same pattern
+    the documented ``/incident/stats`` gives. Each record also carries
+    ``createtime`` and ``lastupdate``.
 
     Args:
         adom: ADOM name (default: from config DEFAULT_ADOM)
@@ -74,9 +83,16 @@ async def get_incidents(
             - "1-hour", "6-hour", "12-hour", "24-hour"
             - "1-day", "7-day", "30-day", "90-day"
             - Custom: "2024-01-01 00:00:00|2024-01-02 00:00:00"
-        filter: Filter expression (e.g., "severity==critical")
+        filter: Filter expression (e.g., "severity==high")
         limit: Maximum number of incidents to return (1-2000)
         offset: Record offset for pagination
+        fields: Which keys each incident carries. Omit for a curated default
+            (incid/epid/euid/alertid join keys, name, severity, status,
+            category, timing, the `endpoint` the incident is about, and the
+            reporter/lastuser/assigned_to workflow slots), ["*"] for the full
+            object, or name the fields you want. The record spells the title
+            `name` and the owner `assigned_to`; `title`, `banner`, `owner` and
+            `assignee` are accepted as aliases for them.
 
     Returns:
         dict with incidents data
@@ -107,13 +123,24 @@ async def get_incidents(
         if not isinstance(data, list):
             data = [data] if data else []
 
+        data, returned, projection_warnings = project_payload("incident", data, fields)
+
         return {
             "status": "success",
             "adom": adom,
             "time_range": tr,
             "count": len(data),
             "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
         }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_incidents",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to get incidents: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -169,6 +196,9 @@ async def get_incident_count(
     filter: str | None = None,
 ) -> dict[str, Any]:
     """Get count of incidents matching criteria.
+
+    The time window is applied even though FortiAnalyzer does not document
+    it on this endpoint — see ``get_incidents`` for the measurement.
 
     Args:
         adom: ADOM name (default: from config DEFAULT_ADOM)
@@ -312,11 +342,17 @@ async def update_incident(
     adom: str | None = None,
     status: str | None = None,
     severity: str | None = None,
-    assignee: str | None = None,
+    last_user: str | None = None,
 ) -> dict[str, Any]:
     """Update an existing incident.
 
     Modifies incident properties for SOC workflow management.
+
+    There is no assignment/ownership field on this API. This tool used to
+    take an ``assignee``; no such field exists on 7.6.6 or 8.0.0, so it was
+    dropped by the appliance while the call reported success. ``last_user``
+    records who last touched the record, which is the nearest real field --
+    it is an audit stamp, not an assignment.
 
     Args:
         incident_id: Incident ID to update
@@ -328,7 +364,7 @@ async def update_incident(
             - "closed": Incident closed
             - "cancelled": Incident cancelled
         severity: New severity (optional)
-        assignee: Assign to user (optional)
+        last_user: Username to stamp on the record as last editor (optional)
 
     Returns:
         dict with update result
@@ -337,7 +373,7 @@ async def update_incident(
         >>> result = await update_incident(
         ...     incident_id="INC-001",
         ...     status="analysis",
-        ...     assignee="analyst1"
+        ...     last_user="analyst1"
         ... )
     """
     try:
@@ -360,7 +396,7 @@ async def update_incident(
             incident_id=incident_id,
             status=status,
             severity=severity,
-            assignee=assignee,
+            last_user=last_user,
         )
 
         return {

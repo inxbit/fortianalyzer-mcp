@@ -117,6 +117,41 @@ def _clear_reloadable() -> None:
         del sys.modules[name]
 
 
+def _restore_reloadable(saved_modules: dict[str, Any]) -> None:
+    """Put every reloaded module back, ``sys.modules`` *and* its parent attribute.
+
+    ``import fortianalyzer_mcp.server`` (elsewhere in the process, including
+    other test modules collected after this one) resolves through
+    ``sys.modules['fortianalyzer_mcp'].server`` -- an attribute set once by
+    the first-ever import and left untouched by a later cache hit -- not
+    through a fresh ``sys.modules['fortianalyzer_mcp.server']`` lookup.
+    Restoring the dict alone therefore leaves that attribute pointing at
+    whichever mode ``_load_tools`` reloaded last (``dynamic``), and any code
+    using a plain dotted ``import`` -- as opposed to
+    ``importlib.import_module``, which does re-check ``sys.modules`` -- would
+    silently see that stale module for the rest of the test session. Fix the
+    attribute in both directions: present in the snapshot means set back;
+    absent means the module was never imported before this fixture touched
+    it, so drop the attribute rather than leave the last reload dangling off
+    the parent package.
+    """
+    current = [name for name in sys.modules if _is_reloadable(name)]
+    for name in current:
+        del sys.modules[name]
+
+    for name in {*current, *saved_modules}:
+        parent_name, _, attr = name.rpartition(".")
+        parent = saved_modules.get(parent_name) or sys.modules.get(parent_name)
+        if parent is None:
+            continue
+        if name in saved_modules:
+            setattr(parent, attr, saved_modules[name])
+        elif getattr(parent, attr, None) is not None:
+            delattr(parent, attr)
+
+    sys.modules.update(saved_modules)
+
+
 def _load_tools(mode: str) -> dict[str, Any]:
     """Re-import the server in ``mode`` and return ``{name: Tool}``.
 
@@ -161,8 +196,7 @@ def registries() -> Iterator[dict[str, dict[str, Any]]]:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        _clear_reloadable()
-        sys.modules.update(saved_modules)
+        _restore_reloadable(saved_modules)
         config.get_settings.cache_clear()
 
 
@@ -235,11 +269,18 @@ def test_full_mode_registers_the_whole_surface(full_tools: dict[str, Any]) -> No
     """Guard the premise of the frozen-set tests below.
 
     Every assertion about the write surface is vacuous if the tools never
-    registered, so pin the count: 85 raw tools plus the ``faz_skill``
-    dispatcher. A tool added or removed is expected to update this number
-    together with the lists above.
+    registered, so pin the count: 84 minus the seven retired FortiView
+    wrappers (``get_top_sources``, ``get_top_destinations``,
+    ``get_top_applications``, ``get_top_threats``, ``get_top_websites``,
+    ``get_top_cloud_applications``, ``get_policy_hits``), each a fixed
+    ``view_name`` call to ``get_fortiview_data`` and nothing else, minus the
+    three retired log-search wrappers (``search_traffic_logs``,
+    ``search_security_logs``, ``search_event_logs``), each a hand-built
+    filter string now expressed as ``filters`` on ``query_logs``. A tool
+    added or removed is expected to update this number together with the
+    lists above.
     """
-    assert len(full_tools) == 86, f"full mode registered {len(full_tools)} tools"
+    assert len(full_tools) == 74, f"full mode registered {len(full_tools)} tools"
     assert "faz_skill" in full_tools, "skills dispatcher did not register"
 
 

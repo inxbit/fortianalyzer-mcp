@@ -17,7 +17,6 @@ from pydantic import ValidationError
 
 from fortianalyzer_mcp.skills import handlers
 from fortianalyzer_mcp.skills.catalog import SKILLS
-from fortianalyzer_mcp.skills.dispatcher import faz_skill
 from fortianalyzer_mcp.skills.models import (
     SCHEMA_VERSION,
     DeepInvestigateParams,
@@ -26,13 +25,16 @@ from fortianalyzer_mcp.skills.models import (
     Investigation,
     RootCause,
 )
+from tests.conftest import import_dispatcher_isolated
+
+(faz_skill,) = import_dispatcher_isolated("faz_skill")
 
 GET_INCIDENT = "fortianalyzer_mcp.tools.incident_tools.get_incident"
 GET_ALERTS = "fortianalyzer_mcp.tools.event_tools.get_alerts"
 GET_ALERT_DETAILS = "fortianalyzer_mcp.tools.event_tools.get_alert_details"
 GET_ALERT_LOGS = "fortianalyzer_mcp.tools.event_tools.get_alert_logs"
 GET_ALERT_INCIDENT_STATS = "fortianalyzer_mcp.tools.event_tools.get_alert_incident_stats"
-GET_TOP_THREATS = "fortianalyzer_mcp.tools.fortiview_tools.get_top_threats"
+GET_FORTIVIEW_DATA = "fortianalyzer_mcp.tools.fortiview_tools.get_fortiview_data"
 GET_LINKED = "fortianalyzer_mcp.tools.soar_tools.get_linked_indicators"
 GET_ENRICH = "fortianalyzer_mcp.tools.soar_tools.get_indicator_enrichment"
 GET_ENDPOINTS = "fortianalyzer_mcp.tools.ueba_tools.get_endpoints"
@@ -105,7 +107,7 @@ class TestDeepReactive:
             t(GET_ALERT_LOGS, return_value=ok(data=[TRIG_LOG])),
             t(GET_ALERT_INCIDENT_STATS, return_value=ok(data={"alerts": 5})),
             t(GET_LINKED, return_value=ok(data=[])),
-            t(GET_TOP_THREATS, return_value=ok(data=THREATS)),
+            t(GET_FORTIVIEW_DATA, return_value=ok(data=THREATS)),
             t(GET_ENDPOINTS, return_value=ok(data=[ENDPOINT])),
             t(GET_VULNS, return_value=ok(data=[])),
             t(GET_ENDUSERS, return_value=ok(data=[ENDUSER])),
@@ -150,7 +152,7 @@ class TestDeepReactive:
             t(GET_INCIDENT, return_value=ok(data=INCIDENT)),
             t(GET_ALERT_INCIDENT_STATS, return_value=ok(data={})),
             t(GET_LINKED, return_value=ok(data=[])),
-            t(GET_TOP_THREATS, return_value=ok(data=THREATS)),
+            t(GET_FORTIVIEW_DATA, return_value=ok(data=THREATS)),
             t(GET_ENDPOINTS, return_value=ok(data=[])),
             t(GET_ENDUSERS, return_value=ok(data=[])),
             t(QUERY_LOGS, return_value=logs_ok([])),
@@ -171,7 +173,7 @@ class TestDeepReactive:
             t(GET_ALERTS, return_value=ok(data=[])),
             t(GET_ALERT_INCIDENT_STATS, return_value=ok(data={})),
             t(GET_LINKED, return_value=ok(data=[])),
-            t(GET_TOP_THREATS, return_value=ok(data=THREATS)),
+            t(GET_FORTIVIEW_DATA, return_value=ok(data=THREATS)),
             t(GET_ENDPOINTS, return_value=ok(data=[ENDPOINT])),
             t(GET_VULNS, return_value=ok(data=[])),
             t(GET_ENDUSERS, return_value=ok(data=[ENDUSER])),
@@ -287,7 +289,7 @@ class TestDeepDegradation:
             t(GET_ALERTS, return_value=ok(data=[])),
             t(GET_ALERT_INCIDENT_STATS, return_value=ok(data={})),
             t(GET_LINKED, return_value=ok(data=[])),
-            t(GET_TOP_THREATS, return_value=ok(data=THREATS)),
+            t(GET_FORTIVIEW_DATA, return_value=ok(data=THREATS)),
             t(QUERY_LOGS) as ql,
         ):
             result = await handlers.run_investigate_deep(

@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from fortianalyzer_mcp.masking.fpe_engine import FPEEngine
+from fortianalyzer_mcp.masking.unmask import ArgUnmasker
 from fortianalyzer_mcp.masking.wrapper import OutputMasker
 
 KEY = "2DE79D232DF5585D68CE47882AE256D6"
@@ -1174,6 +1175,73 @@ class TestDeviceListAndSourceLink:
         assert BAD_DOMAIN not in str(masked)
         assert "url-" in out  # sealed, not burned: it resolves back
 
+    def test_dvmdb_device_name_masks_under_the_flag(self, full_masker: OutputMasker):
+        """``name`` is dvmdb's device-name key, and it is in neither
+        FIELD_TYPES nor DEVICE_IDENTITY_TYPES, so with the flag on a clear
+        ``name`` sat beside its own ``devname`` token -- the flag defeated
+        rather than followed, the same shape as ``devs`` (#79) and
+        ``dev_name`` (#83), and made routine by this branch's curated
+        ``_DEVICE_PROJECTION`` putting ``name`` in every default
+        ``search_devices`` row (#109 review).
+
+        It cannot be typed key-name-globally: ``name`` is also the ADOM key,
+        the report-layout key and the device-group key, and a blanket entry
+        burns "Monthly Security Report" to an irreversible placeholder.
+        The record decides, exactly as ``incident_reporter`` does.
+        """
+        device = {"name": DEV_NAME, "devname": DEV_NAME, "sn": DEV_SERIAL, "os_ver": "7.4"}
+
+        masked = full_masker.mask_result(device)
+
+        assert DEV_NAME not in str(masked)
+        assert masked["name"] == masked["devname"]
+
+    def test_dvmdb_device_name_stays_clear_by_default(self, masker: OutputMasker):
+        device = {"name": DEV_NAME, "sn": DEV_SERIAL, "os_ver": "7.4"}
+
+        assert masker.mask_result(device)["name"] == DEV_NAME
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            {"name": "root", "desc": "default adom"},
+            {"name": "Monthly Security Report", "layout-id": 7},
+            {"name": "Branch-Group", "member": ["fgt-a"]},
+        ],
+        ids=["adom", "report-layout", "device-group"],
+    )
+    def test_a_name_with_no_device_siblings_is_untouched(
+        self, full_masker: OutputMasker, record: dict[str, Any]
+    ):
+        """The blast radius the shape check exists to avoid. A report layout
+        name is the sharp case: it is not a valid hostname, so a blanket
+        entry would not tokenise it but burn it, with no way back."""
+        assert full_masker.mask_result(dict(record)) == record
+
+    def test_a_device_name_joins_the_keep_set_with_the_flag_off(self, masker: OutputMasker):
+        """Flag off, the pairing runs the other way: the name must stay clear
+        everywhere, including where another handler would have masked it."""
+        payload = {
+            "device": {"name": DEV_NAME, "sn": DEV_SERIAL},
+            "target": [{"name": "srcname", "value": DEV_NAME}],
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert masked["target"][0]["value"] == DEV_NAME
+
+    def test_a_non_device_name_does_not_join_the_keep_set(self, masker: OutputMasker):
+        """The other half of the shape check: an ADOM or report name must not
+        exempt an arbitrary string from masking elsewhere in the response."""
+        payload = {
+            "adom": {"name": SRC_NAME, "desc": "an adom that happens to be named this"},
+            "target": [{"name": "srcname", "value": SRC_NAME}],
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert masked["target"][0]["value"] != SRC_NAME
+
     def test_source_link_round_trips(self, masker: OutputMasker):
         from fortianalyzer_mcp.masking.unmask import ArgUnmasker
 
@@ -1439,3 +1507,622 @@ class TestCompiledFilterEntries:
         masked = masker.mask_result({"filter_applied": ["a note", ["only", "two"]]})
 
         assert masked["filter_applied"] == ["a note", ["only", "two"]]
+
+
+class TestProjectionEchoIsNotAnOracle:
+    """``fields_returned`` echoes what ``fields`` resolved to.
+
+    The round trip the projection feature opened, verified end to end rather
+    than argued about:
+
+    1. the model holds ``host-<...>``, a token this server issued;
+    2. it passes that token in ``fields``;
+    3. ``ArgUnmasker.resolve_scalar`` resolves any *self-identifying* token
+       wherever it appears, so the token became the plaintext;
+    4. ``query.fields.resolve_field`` passes an unknown-but-well-shaped name
+       through, and a token is well shaped, so it survived as a projection
+       key;
+    5. the tool echoed it under ``fields_returned``, which no allowlist
+       mentioned -- handing back plaintext unlocked by the model's own token.
+
+    Structurally the ``filter_applied`` bug (#95) again, and the same lesson:
+    a response key that reflects a caller argument needs a decision, and the
+    absence of one defaults to leaking. Here the decision is that ``fields``
+    names response KEYS, so there is nothing for unmasking to be right about.
+    """
+
+    @pytest.fixture
+    def unmasker(self, monkeypatch: pytest.MonkeyPatch) -> ArgUnmasker:
+        monkeypatch.setenv("FAZ_MASKING_KEY", KEY)
+        return ArgUnmasker(FPEEngine(KEY))
+
+    def test_a_token_in_fields_is_not_resolved_to_plaintext(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ) -> None:
+        """Step 3, closed: the projection key stays the token it arrived as."""
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+        assert token != SRC_NAME, "fixture precondition: the value must mask"
+
+        resolved = unmasker.unmask_args({"fields": [token]})
+
+        assert resolved == {"fields": [token]}
+        assert SRC_NAME not in str(resolved)
+
+    def test_a_bare_token_argument_is_still_resolved(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ) -> None:
+        """The skip is scoped to the field-NAME args, not to tokens in general.
+
+        ``device`` carries a value, so a token there must still resolve --
+        that is the whole point of argument unmasking. Without this, the tests
+        either side would pass just as well if argument unmasking had been
+        switched off wholesale, or if ``FIELD_NAME_ARGS`` had grown to swallow
+        a value-carrying key.
+        """
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+
+        assert unmasker.unmask_args({"device": token}) == {"device": SRC_NAME}
+
+    def test_nested_params_fields_are_skipped_too(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ) -> None:
+        """faz_skill nests every tool argument under ``params``."""
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+
+        resolved = unmasker.unmask_args({"skill": "log_search", "params": {"fields": [token]}})
+
+        assert SRC_NAME not in str(resolved)
+
+    def test_the_echo_is_masked_when_it_carries_a_mapped_value(self, masker: OutputMasker) -> None:
+        """Step 5, closed independently: the echo is allowlisted as TEXT.
+
+        Belt to the braces above -- any other route by which a real value
+        reaches this key gets the same pass-2 treatment ``filter_applied`` and
+        ``warnings`` already get, rather than no treatment at all.
+        """
+        masked = masker.mask_result(
+            {"logs": [{"srcname": SRC_NAME}], "fields_returned": [f"srcname of {SRC_NAME}"]}
+        )
+
+        assert SRC_NAME not in str(masked["fields_returned"])
+
+    def test_the_echo_scans_for_bare_indicators(self, masker: OutputMasker) -> None:
+        masked = masker.mask_result({"count": 0, "fields_returned": [f"srcip {PEER_IP}"]})
+
+        assert PEER_IP not in str(masked["fields_returned"])
+
+    def test_ordinary_field_names_pass_through_unharmed(self, masker: OutputMasker) -> None:
+        """The echo is the normal case; masking must not corrupt it."""
+        names = ["action", "dstport", "policyid", "srcip", "user"]
+
+        assert (
+            masker.mask_result({"count": 0, "fields_returned": names})["fields_returned"] == names
+        )
+
+
+class TestAggregationArgEchoIsNotAnOracle:
+    """``group_by``/``sample_by`` are the projection oracle again, worse.
+
+    ``fields`` needed a *valid* field name to reach ``fields_returned``. The
+    aggregation arguments do not: an unmapped ``group_by`` is refused, and the
+    refusal quotes the dimension back verbatim. So resolving a token there
+    would hand the plaintext to any caller who supplies a token that cannot
+    possibly be a dimension -- which every token is. Measured on the previous
+    code: ``group_by='host-2a85-...'`` came back as
+    ``secret-internal.corp.example`` inside the refusal message.
+
+    Both echoes are covered here, because both exist: ``sample_by`` is echoed
+    on the *success* path (and again as every ``breakdowns`` key), ``group_by``
+    on both.
+    """
+
+    @pytest.fixture
+    def unmasker(self, monkeypatch: pytest.MonkeyPatch) -> ArgUnmasker:
+        monkeypatch.setenv("FAZ_MASKING_KEY", KEY)
+        return ArgUnmasker(FPEEngine(KEY))
+
+    @pytest.mark.parametrize("arg", ["group_by", "sort_by", "view_name"])
+    def test_a_token_in_a_name_argument_is_not_resolved(
+        self, masker: OutputMasker, unmasker: ArgUnmasker, arg: str
+    ) -> None:
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+        assert token != SRC_NAME, "fixture precondition: the value must mask"
+
+        resolved = unmasker.unmask_args({arg: token})
+
+        assert resolved == {arg: token}
+        assert SRC_NAME not in str(resolved)
+
+    def test_a_token_in_sample_by_is_not_resolved(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ) -> None:
+        """sample_by takes a list, so the skip must survive the list walk."""
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+
+        resolved = unmasker.unmask_args({"sample_by": [token, "app"]})
+
+        assert resolved == {"sample_by": [token, "app"]}
+        assert SRC_NAME not in str(resolved)
+
+    def test_nested_params_aggregation_args_are_skipped_too(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ) -> None:
+        """faz_skill nests every tool argument under ``params``."""
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+
+        resolved = unmasker.unmask_args(
+            {"skill": "log_search", "params": {"group_by": token, "sample_by": [token]}}
+        )
+
+        assert SRC_NAME not in str(resolved)
+
+    async def test_the_refusal_path_hands_back_the_token_not_the_value(
+        self, masker: OutputMasker, unmasker: ArgUnmasker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end in the wrapper's own order: unmask args, run the tool,
+        mask the result. A token in group_by can only ever be refused, so the
+        refusal message is the echo that matters."""
+        import fortianalyzer_mcp.tools.log_tools as log_tools
+
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+        args = unmasker.unmask_args({"logtype": "traffic", "group_by": token})
+
+        result = masker.mask_result(await log_tools.query_logs(**args))
+
+        assert result["status"] == "error"
+        assert SRC_NAME not in str(result)
+        assert token in result["message"]
+
+    async def test_the_success_echo_hands_back_the_token_not_the_value(
+        self, masker: OutputMasker, unmasker: ArgUnmasker, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """sample_by *can* be a passthrough dimension, so it reaches the
+        success path and is echoed there and under ``breakdowns``."""
+        import fortianalyzer_mcp.tools.log_tools as log_tools
+
+        class _Faz:
+            async def ensure_connected(self) -> None:
+                return None
+
+            async def get_system_timezone(self) -> None:
+                return None
+
+        async def fake_page(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {"logs": [], "total": 0, "tid": 1, "timed_out": False, "percentage": 100}
+
+        monkeypatch.setattr(log_tools, "get_faz_client", lambda: _Faz())
+        monkeypatch.setattr(log_tools, "_run_logsearch_page", fake_page)
+
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+        args = unmasker.unmask_args(
+            {
+                "logtype": "traffic",
+                "time_range": "2024-01-01 00:00:00|2024-01-02 00:00:00",
+                "sample_by": [token],
+            }
+        )
+
+        result = masker.mask_result(await log_tools.query_logs(**args))
+
+        assert result["status"] == "success"
+        assert SRC_NAME not in str(result)
+        assert result["sample_by"] == [token]
+        assert token in result["breakdowns"]
+
+
+class TestBreakdownsComposite:
+    """``analyze_policy_traffic`` and ``query_logs(sample_by=...)`` both
+    return ``{dimension: [{"value": ..., "hits": N}, ...]}``, and the raw
+    value survived masking whole (#98): pass 1 only masks a bare ``"value"``
+    key when a sibling ``"type"`` key exists (SOAR's ``_mask_indicator_pair``),
+    and pass 2 only scans keys typed TEXT, which a plain ``"value"`` key never
+    is. The dimension name -- the dict key one level up -- now decides the
+    type of each bucket's ``"value"``.
+
+    ``sample_by``/``group_by`` are not restricted to a safe subset: grouping
+    by source or user is legitimate SOC functionality, so the fix lives
+    entirely in the masking layer.
+    """
+
+    def test_the_reviewers_synthetic_payload_no_longer_survives(self, masker: OutputMasker) -> None:
+        """The exact shape the review found leaking, reproduced verbatim."""
+        masked = masker.mask_result({"breakdowns": {"srcip": [{"value": ENDPOINT_IP, "hits": 5}]}})
+
+        assert ENDPOINT_IP not in str(masked)
+
+    def test_a_typed_sibling_key_in_a_bucket_still_masks(self, masker: OutputMasker) -> None:
+        """Before this handler existed, a bucket's sibling keys went through
+        the allowlist walk; the handler must not trade the ``value`` leak it
+        closes for a sibling leak it opens (#83's list-shape lesson). No
+        shipped producer emits a typed sibling today -- this pins the walk
+        so one can appear without re-opening it."""
+        payload = {
+            "breakdowns": {
+                "srcip": [{"value": ENDPOINT_IP, "hits": 5, "hostname": SRC_NAME}],
+            }
+        }
+
+        masked = masker.mask_result(payload)
+        bucket = masked["breakdowns"]["srcip"][0]
+
+        assert ENDPOINT_IP not in str(masked)
+        assert SRC_NAME not in str(masked)
+        assert bucket["hits"] == 5
+
+    def test_analyze_policy_traffic_shape_masks_sensitive_dimensions(
+        self, masker: OutputMasker
+    ) -> None:
+        """``analyze_policy_traffic``'s per-policy ``results[].breakdowns``."""
+        payload = {
+            "status": "success",
+            "results": [
+                {
+                    "policy_id": 7,
+                    "breakdowns": {
+                        "srcip": [{"value": ENDPOINT_IP, "hits": 5}],
+                        "user": [{"value": ANALYST, "hits": 3}],
+                        "hostname": [{"value": SRC_NAME, "hits": 2}],
+                        "port": [{"value": "6/443", "hits": 10}],
+                        "app": [{"value": "HTTPS", "hits": 10}],
+                    },
+                    "is_exact": True,
+                }
+            ],
+        }
+
+        masked = masker.mask_result(payload)
+        breakdowns = masked["results"][0]["breakdowns"]
+
+        assert ENDPOINT_IP not in str(masked)
+        assert ANALYST not in str(masked)
+        assert SRC_NAME not in str(masked)
+        # Non-sensitive dimensions are ordinary log fields with no type in
+        # the allowlist, and must not be burned to a placeholder just
+        # because sample_by can point at almost anything.
+        assert breakdowns["port"] == [{"value": "6/443", "hits": 10}]
+        assert breakdowns["app"] == [{"value": "HTTPS", "hits": 10}]
+
+    def test_query_logs_sample_by_shape_masks_the_same_way(self, masker: OutputMasker) -> None:
+        """``query_logs(sample_by=...)`` returns the identical shape (Task 4)."""
+        payload = {
+            "status": "success",
+            "sample_by": ["srcip", "app"],
+            "breakdowns": {
+                "srcip": [{"value": PEER_IP, "hits": 12}],
+                "app": [{"value": "SSL", "hits": 12}],
+            },
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert PEER_IP not in str(masked)
+        assert masked["breakdowns"]["app"] == [{"value": "SSL", "hits": 12}]
+
+    def test_derived_dimensions_have_no_type_and_are_never_masked(
+        self, masker: OutputMasker
+    ) -> None:
+        """``port``/``icmp_type_code`` are computed, not stored fields."""
+        payload = {
+            "breakdowns": {
+                "port": [{"value": "6/443", "hits": 4}],
+                "icmp_type_code": [{"value": "type=8/code=0", "hits": 1}],
+            }
+        }
+
+        assert masker.mask_result(payload) == payload
+
+    def test_device_identity_dimension_stays_clear_by_default(self, masker: OutputMasker) -> None:
+        """A dimension named after a device-identity field follows the same
+        keep-set as a flat field: clear unless the deployment opts in."""
+        payload = {"breakdowns": {"fortigate": [{"value": DEV_NAME, "hits": 5}]}}
+
+        masked = masker.mask_result(payload)
+
+        assert masked["breakdowns"]["fortigate"][0]["value"] == DEV_NAME
+
+    def test_device_identity_dimension_masks_when_flag_is_on(
+        self, full_masker: OutputMasker
+    ) -> None:
+        payload = {"breakdowns": {"fortigate": [{"value": DEV_NAME, "hits": 5}]}}
+
+        masked = full_masker.mask_result(payload)
+
+        assert masked["breakdowns"]["fortigate"][0]["value"] != DEV_NAME
+
+    def test_multiple_hits_all_mask_to_the_same_token(self, masker: OutputMasker) -> None:
+        """Deterministic FPE: the same raw value in two buckets of the same
+        breakdown (unlikely given aggregate_breakdowns's dedup, but not
+        structurally impossible) still gets one consistent token."""
+        payload = {
+            "breakdowns": {
+                "srcip": [
+                    {"value": ENDPOINT_IP, "hits": 3},
+                    {"value": PEER_IP, "hits": 1},
+                ]
+            }
+        }
+
+        masked = masker.mask_result(payload)["breakdowns"]["srcip"]
+
+        assert masked[0]["value"] != ENDPOINT_IP
+        assert masked[1]["value"] != PEER_IP
+        assert masked[0]["value"] != masked[1]["value"]
+
+
+BREAKDOWN_URL = "https://intranet.example.org/hr/salary?user=jdoe"
+
+
+class TestBreakdownsCompositeDimensions:
+    """A dimension whose flat key is handled by a COMPOSITE table, not by
+    ``FIELD_TYPES`` (#109 review).
+
+    The first cut of ``_mask_breakdowns`` typed a bucket from
+    ``FIELD_TYPES`` alone, but ``url``/``referralurl``/``http_url``/``link``
+    and ``devvds`` carry no entry there -- their flat keys are served by
+    ``COMPOSITE_URL_FULL``/``COMPOSITE_URL_HOST``/``COMPOSITE_DEVICE_VDOM``.
+    An untyped dimension passes through by design, so those rode out whole,
+    beside the token the same host carried under a flat key in the same
+    response: ``hits`` is the join key that pairs them.
+
+    The fix is the rule the handler's docstring already stated -- a bucket
+    value gets exactly what the same value gets under a flat key of the
+    dimension's name -- so the walk now goes through :meth:`_mask_entry`
+    rather than a ``FIELD_TYPES`` lookup.
+    """
+
+    @pytest.mark.parametrize("dimension", ["url", "referralurl", "http_url", "link"])
+    def test_a_url_dimension_masks_like_its_flat_key(
+        self, masker: OutputMasker, dimension: str
+    ) -> None:
+        payload = {"breakdowns": {dimension: [{"value": BREAKDOWN_URL, "hits": 2}]}}
+
+        masked = masker.mask_result(payload)
+        bucket = masked["breakdowns"][dimension][0]
+
+        assert BREAKDOWN_URL not in str(masked)
+        assert "intranet.example.org" not in str(masked)
+        assert bucket["hits"] == 2
+
+    def test_a_url_bucket_gets_the_same_token_as_the_flat_key(self, masker: OutputMasker) -> None:
+        """The pairing that made this a correlation gift, pinned both ways:
+        the bucket and the flat key must agree, not merely both be masked."""
+        payload = {
+            "url": BREAKDOWN_URL,
+            "breakdowns": {"url": [{"value": BREAKDOWN_URL, "hits": 1}]},
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert masked["breakdowns"]["url"][0]["value"] == masked["url"]
+
+    def test_a_devvds_dimension_follows_the_device_flag(
+        self, masker: OutputMasker, full_masker: OutputMasker
+    ) -> None:
+        """``devvds`` is ``"<devname>[<vdom>]"`` -- composite, and device
+        identity, so it must follow the flag exactly as the flat key does."""
+        payload = {"breakdowns": {"devvds": [{"value": f"{DEV_NAME}[{VDOM}]", "hits": 3}]}}
+
+        assert masker.mask_result(payload)["breakdowns"]["devvds"][0]["value"] == (
+            f"{DEV_NAME}[{VDOM}]"
+        )
+        assert DEV_NAME not in str(full_masker.mask_result(payload))
+
+    def test_an_untyped_dimension_still_passes_through(self, masker: OutputMasker) -> None:
+        """The deliberate passthrough the handler's docstring argues for must
+        survive the switch to _mask_entry: sample_by accepts almost any field
+        and most of them (port, service, app, proto) are not identifiers."""
+        payload = {"breakdowns": {"service": [{"value": "HTTPS", "hits": 9}]}}
+
+        assert masker.mask_result(payload) == payload
+
+
+class TestBreakdownsMalformedShapes:
+    """An unrecognised bucket shape under a dimension we know is an
+    identifier field (#109 review).
+
+    ``_mask_target`` and the URL-dict branch both burn a shape they cannot
+    type rather than trust the allowlist walk to cover it (#104). The
+    breakdown handler failed open instead, so a bucket list holding bare
+    strings rode out in clear under a dimension positively typed as an IP.
+    No shipped producer emits either shape -- ``aggregate_breakdowns`` always
+    emits ``[{"value", "hits"}]`` -- so this pins the policy, not a live bug.
+
+    An *untyped* dimension keeps its passthrough: burning there would
+    placeholder every legitimate non-identifier breakdown.
+    """
+
+    def test_a_bare_string_bucket_under_a_typed_dimension_burns(self, masker: OutputMasker) -> None:
+        payload = {"breakdowns": {"srcip": [ENDPOINT_IP, 42, None]}}
+
+        masked = masker.mask_result(payload)
+
+        assert ENDPOINT_IP not in str(masked)
+        assert masked["breakdowns"]["srcip"][1] == 42
+        assert masked["breakdowns"]["srcip"][2] is None
+
+    def test_a_non_list_bucket_container_under_a_typed_dimension_burns(
+        self, masker: OutputMasker
+    ) -> None:
+        payload = {"breakdowns": {"srcip": {"value": ENDPOINT_IP}}}
+
+        assert ENDPOINT_IP not in str(masker.mask_result(payload))
+
+    def test_a_malformed_shape_under_an_untyped_dimension_passes_through(
+        self, masker: OutputMasker
+    ) -> None:
+        payload = {"breakdowns": {"service": ["HTTPS", "DNS"]}}
+
+        assert masker.mask_result(payload) == payload
+
+
+class TestBreakdownsTextDimensions:
+    """A TEXT dimension's bucket values, raised on review of #109.
+
+    Pass 1 types a bucket's ``"value"`` from the dimension name, which covers
+    every dimension whose values ARE identifiers. A TEXT dimension has no
+    scalar type to mask by: its values are prose that may embed an identifier
+    anywhere, which is what pass 2's free-text scan exists for. Under a flat
+    ``msg``/``ui``/``subject`` key that scan fires because the KEY is typed
+    TEXT; inside a bucket the key is a generic ``"value"``, so pass 2 never
+    reached it and the free text rode out in clear.
+
+    ``sample_by`` is not validated against a vocabulary -- deliberately, since
+    a caller may break down on any field the rows carry -- so
+    ``query_logs(logtype="event", sample_by=["msg"])`` is an ordinary call,
+    not a contrived one.
+
+    The invariant asserted here is parity: a bucket value gets exactly what
+    the same string gets under its own flat key. That is one rule for all
+    three classes of dimension (TEXT scanned, identifier tokenised, untyped
+    passed through) instead of three, and it is what the review asked for.
+    """
+
+    # (dimension, bucket text). The last two are the deliberate passthroughs
+    # a flat key of the same name also gets, kept here so the boundary is
+    # asserted rather than assumed.
+    TEXT_CASES = [
+        ("msg", f"Admin login from {ENDPOINT_IP} failed"),
+        ("ui", f"GUI({ENDPOINT_IP})"),
+        ("subject", f"Report delivery to {SOC_EMAIL} deferred"),
+        ("extrainfo", "client mac 00:11:22:33:44:55 not on the allow list"),
+        ("logdesc", f"Traffic from {PEER_IP} denied by policy"),
+        ("prompt", f"summarise the credentials for {SRC_NAME}"),
+        ("srcip", ENDPOINT_IP),
+        ("user", ANALYST),
+        ("port", "6/443"),
+        ("app", "HTTPS"),
+    ]
+
+    @pytest.mark.parametrize("dimension,text", TEXT_CASES, ids=[case[0] for case in TEXT_CASES])
+    def test_a_bucket_value_gets_what_the_flat_field_gets(
+        self, masker: OutputMasker, dimension: str, text: str
+    ) -> None:
+        flat = masker.mask_result({"rows": [{dimension: text}]})["rows"][0][dimension]
+        bucket = masker.mask_result({"breakdowns": {dimension: [{"value": text, "hits": 3}]}})
+
+        assert bucket["breakdowns"][dimension][0]["value"] == flat
+
+    def test_embedded_iocs_do_not_survive_a_text_bucket(self, masker: OutputMasker) -> None:
+        """The whole point, stated as identity comparison rather than parity."""
+        payload = {
+            "status": "success",
+            "sample_by": ["msg", "subject", "extrainfo"],
+            "breakdowns": {
+                "msg": [{"value": f"Admin login from {ENDPOINT_IP} failed", "hits": 4}],
+                "subject": [{"value": f"mail to {SOC_EMAIL}", "hits": 2}],
+                "extrainfo": [{"value": "client mac 00:11:22:33:44:55", "hits": 1}],
+            },
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert ENDPOINT_IP not in str(masked)
+        assert SOC_EMAIL not in str(masked)
+        assert "00:11:22:33:44:55" not in str(masked)
+        # Counts are not identifiers and must survive the scan intact.
+        assert [b["hits"] for b in masked["breakdowns"]["msg"]] == [4]
+
+    def test_a_value_masked_elsewhere_is_resolved_inside_a_text_bucket(
+        self, masker: OutputMasker
+    ) -> None:
+        """The sharp case: a hostname cannot be recognised by pattern, so it
+        survives a bucket unless pass 2 substitutes what this response already
+        mapped. Leaving it clear beside its own token in a sibling row is the
+        token-to-plaintext pairing the layer exists to withhold."""
+        payload = {
+            "rows": [{"hostname": SRC_NAME}],
+            "breakdowns": {"msg": [{"value": f"session from {SRC_NAME} blocked", "hits": 2}]},
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert SRC_NAME not in str(masked)
+        assert masked["rows"][0]["hostname"] in masked["breakdowns"]["msg"][0]["value"]
+
+    def test_an_identifier_dimension_is_not_masked_twice(self, masker: OutputMasker) -> None:
+        """Pass 1 already tokenised this bucket, and a masked IPv4 is itself a
+        valid IPv4, so a pass-2 scan over the same value would mask it again
+        and hand back a token that matches nothing else in the response. Same
+        hazard ``_mask_filter_entries`` documents."""
+        payload = {
+            "rows": [{"srcip": ENDPOINT_IP}],
+            "breakdowns": {"srcip": [{"value": ENDPOINT_IP, "hits": 6}]},
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert masked["breakdowns"]["srcip"][0]["value"] == masked["rows"][0]["srcip"]
+
+    def test_odd_bucket_shapes_do_not_crash_the_scan(self, masker: OutputMasker) -> None:
+        """``aggregate_breakdowns`` always emits ``[{"value", "hits"}]``, but
+        masking runs on whatever the appliance and the tools actually returned,
+        so the handler must survive a shape it did not write."""
+        payload = {
+            "breakdowns": {
+                "msg": [f"bare string from {ENDPOINT_IP}", {"value": None, "hits": 1}, None],
+                "subject": {"not": "a list"},
+            }
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert ENDPOINT_IP not in str(masked["breakdowns"]["msg"])
+        assert masked["breakdowns"]["msg"][1] == {"value": None, "hits": 1}
+        assert masked["breakdowns"]["subject"] == {"not": "a list"}
+
+
+class TestGroupByGroupsRowsAlreadyCovered:
+    """Third leak surface, checked per the review: ``query_logs(group_by=...)``
+    returns ``groups: [<native FortiView row>, ...]``. Unlike ``breakdowns``,
+    these rows carry the view's OWN field names (``srcip``, ``srcip_hostname``,
+    ``threat``/``obf_url``, ``fortigate``) directly as dict keys -- the same
+    keys ``FIELD_TYPES`` already documents as fortiview-sourced -- so the
+    ordinary per-key allowlist already reaches them with no composite handler
+    needed. These tests lock that finding in as a regression guard rather
+    than leaving it as an unverified claim.
+    """
+
+    def test_top_sources_style_groups_are_masked_by_the_ordinary_allowlist(
+        self, masker: OutputMasker
+    ) -> None:
+        payload = {
+            "status": "success",
+            "group_by": "srcip",
+            "groups": [
+                {"srcip": ENDPOINT_IP, "srcip_hostname": SRC_NAME, "hits": 42},
+                {"srcip": PEER_IP, "hits": 7},
+            ],
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert ENDPOINT_IP not in str(masked)
+        assert PEER_IP not in str(masked)
+        assert SRC_NAME not in str(masked)
+
+    def test_top_threats_style_groups_use_the_existing_pair_handler(
+        self, masker: OutputMasker
+    ) -> None:
+        payload = {
+            "group_by": "attack",
+            "groups": [
+                {"threat": THREAT_DOMAIN, "obf_url": OBF_URL, "hits": 3},
+                {"threat": THREAT_SIGNATURE, "obf_url": "", "hits": 1},
+            ],
+        }
+
+        masked = masker.mask_result(payload)
+
+        assert THREAT_DOMAIN not in str(masked)
+        assert masked["groups"][1]["threat"] == THREAT_SIGNATURE
+
+    def test_device_identity_in_groups_follows_the_same_flag(
+        self, masker: OutputMasker, full_masker: OutputMasker
+    ) -> None:
+        payload = {"group_by": "srcip", "groups": [{"srcip": ENDPOINT_IP, "fortigate": DEV_NAME}]}
+
+        default = masker.mask_result(payload)
+        assert default["groups"][0]["fortigate"] == DEV_NAME
+
+        flagged = full_masker.mask_result(payload)
+        assert flagged["groups"][0]["fortigate"] != DEV_NAME

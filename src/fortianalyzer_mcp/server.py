@@ -3,11 +3,12 @@
 import hashlib
 import hmac
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
@@ -91,41 +92,193 @@ def health_check() -> str:
     return f"FortiAnalyzer MCP Server is healthy (mode: {mode}, {tool_info})"
 
 
-def _coerce_structured_filters(raw: object) -> list[FilterCondition]:
-    """Validate a caller's ``filters`` into models, as FastMCP would have.
+def _coerce_model_list(
+    raw: object, model: type[BaseModel], param: str, shape: str
+) -> list[BaseModel]:
+    """Validate a caller's list-of-models parameter, as FastMCP would have.
 
     ``execute_advanced_tool`` invokes tool functions directly, so the protocol
-    layer that turns JSON arguments into typed parameters never runs and
-    ``filters`` arrives as raw dicts. The compilers are models-only by contract
-    (attribute access; see ``TestCompilerRequiresModelsNotDicts``), so without
-    this the dicts surfaced as an ``AttributeError`` that the tools' broad
-    handlers buried in a generic ``faz_operation_failed``. This mirrors full
-    mode's boundary: coerce before the tool runs, and reject a malformed
-    condition with a message about the condition.
+    layer that turns JSON arguments into typed parameters never runs and a
+    model-typed parameter arrives as raw dicts. Consumers are models-only by
+    contract (attribute access; see ``TestCompilerRequiresModelsNotDicts``), so
+    without this the dicts surfaced as an ``AttributeError`` that the tools'
+    broad handlers buried in a generic ``faz_operation_failed``. This mirrors
+    full mode's boundary: coerce before the tool runs, and reject a malformed
+    entry with a message about that entry.
+
+    Any tool parameter typed ``list[SomeModel]`` needs an entry in
+    ``_STRUCTURED_PARAMS`` or it breaks in dynamic mode only — full mode keeps
+    working because FastMCP coerces there, which is what made this class of bug
+    easy to ship.
 
     Raises:
         ValidationError: If ``raw`` is not a list, or an entry fails model
-            validation (unknown op, unknown key, non-dict entry).
+            validation (unknown key, wrong type, non-dict entry).
     """
     if not isinstance(raw, list):
         raise ValidationError(
-            "'filters' must be a list of conditions, each {field, op, value} -- got "
-            f"{type(raw).__name__}. Wrap the condition in a list: filters=[{{...}}]."
+            f"'{param}' must be a list of {shape} -- got {type(raw).__name__}. "
+            f"Wrap it in a list: {param}=[{{...}}]."
         )
-    coerced: list[FilterCondition] = []
+    coerced: list[BaseModel] = []
     for index, item in enumerate(raw):
-        if isinstance(item, FilterCondition):
+        if isinstance(item, model):
             coerced.append(item)
             continue
         try:
-            coerced.append(FilterCondition.model_validate(item))
+            coerced.append(model.model_validate(item))
         except PydanticValidationError as exc:
             details = "; ".join(
-                f"{'.'.join(str(loc) for loc in err['loc']) or 'condition'}: {err['msg']}"
+                f"{'.'.join(str(loc) for loc in err['loc']) or 'entry'}: {err['msg']}"
                 for err in exc.errors()
             )
-            raise ValidationError(f"filters[{index}] is invalid: {details}") from exc
+            raise ValidationError(f"{param}[{index}] is invalid: {details}") from exc
     return coerced
+
+
+def _structured_params() -> dict[str, tuple[type[BaseModel], str]]:
+    """Tool parameters typed ``list[SomeModel]``, by parameter name.
+
+    ``IocEventRef`` is imported lazily: it lives in a tool module, and tool
+    modules import this one at registration time, so a module-level import
+    would be circular.
+    """
+    from fortianalyzer_mcp.tools.ioc_tools import IocEventRef
+
+    return {
+        "filters": (FilterCondition, "conditions, each {field, op, value}"),
+        "events": (IocEventRef, "IOC events, each {endpoint_id/source_ip, timestamp}"),
+    }
+
+
+#: Category -> tool names, for dynamic mode's search surface.
+#:
+#: Static on purpose. find_fortianalyzer_tool must not import the tool modules
+#: to build this, because importing them registers every tool and destroys the
+#: minimal surface dynamic mode exists for. The cost is that it can drift from
+#: what is registered -- and it had, badly -- so
+#: tests/test_tool_catalogue_parity.py asserts the two match exactly.
+TOOL_CATALOGUE: Mapping[str, tuple[str, ...]] = {
+    "system": (
+        "get_system_status",
+        "get_ha_status",
+        "list_adoms",
+        "get_adom",
+        "list_devices",
+        "get_device",
+        "list_tasks",
+        "get_task",
+        "wait_for_task",
+        "get_api_ratelimit",
+        "update_api_ratelimit",
+    ),
+    "logs": (
+        "query_logs",
+        "get_log_search_progress",
+        "fetch_more_logs",
+        "cancel_log_search",
+        "get_log_stats",
+        "get_log_fields",
+        "get_logfiles_state",
+        "get_pcap_file",
+    ),
+    "dvm": (
+        "add_device",
+        "delete_device",
+        "add_devices_bulk",
+        "delete_devices_bulk",
+        "get_device_info",
+        "search_devices",
+        "list_device_groups",
+        "list_device_vdoms",
+    ),
+    "events": (
+        "get_alerts",
+        "get_alert_count",
+        "acknowledge_alerts",
+        "unacknowledge_alerts",
+        "get_alert_logs",
+        "get_alert_details",
+        "add_alert_comment",
+        "get_alert_incident_stats",
+        "get_alert_handlers",
+    ),
+    "fortiview": (
+        "run_fortiview",
+        "fetch_fortiview",
+        "get_fortiview_data",
+    ),
+    "reports": (
+        "list_report_layouts",
+        "list_report_templates",
+        "run_report",
+        "fetch_report",
+        "get_report_data",
+        "get_running_reports",
+        "get_report_history",
+        "run_and_wait_report",
+        "save_report",
+    ),
+    "incidents": (
+        "get_incidents",
+        "get_incident",
+        "get_incident_count",
+        "create_incident",
+        "update_incident",
+        "get_incident_stats",
+    ),
+    "ioc": (
+        "get_ioc_license_state",
+        "acknowledge_ioc_events",
+        "run_ioc_rescan",
+        "get_ioc_rescan_status",
+        "get_ioc_rescan_history",
+        "run_and_wait_ioc_rescan",
+    ),
+    "pcap": (
+        "search_ips_logs",
+        "get_pcap_by_session",
+        "download_pcap_by_url",
+        "search_and_download_pcaps",
+        "list_available_pcaps",
+    ),
+    "soar": (
+        "get_linked_indicators",
+        "get_indicator_enrichment",
+    ),
+    "ueba": (
+        "get_endpoints",
+        "get_endpoint_vulnerabilities",
+        "get_endusers",
+        "get_endpoint_stats",
+        "get_enduser_stats",
+    ),
+    "traffic": ("analyze_policy_traffic",),
+}
+
+#: All registered tool names, flattened. Used both to build ``tool_map`` in
+#: ``execute_advanced_tool`` and by the parity test.
+TOOL_CATALOGUE_NAMES: frozenset[str] = frozenset(
+    name for names in TOOL_CATALOGUE.values() for name in names
+)
+
+#: Human-readable blurb per category, for ``list_fortianalyzer_categories`` and
+#: search results. Purely descriptive text -- unlike ``TOOL_CATALOGUE`` this
+#: cannot drift into a wrong *count*, so it stays hand-written.
+_CATEGORY_DESCRIPTIONS: Mapping[str, str] = {
+    "system": "System status, HA, ADOMs, devices, and tasks",
+    "logs": "Log search with TID workflow, analytics",
+    "dvm": "Device management, add/delete, groups",
+    "events": "Alert management and SOC operations",
+    "fortiview": "FortiView analytics with TID workflow",
+    "reports": "Report templates and execution with TID workflow",
+    "incidents": "Incident management and tracking",
+    "ioc": "IOC detection and rescan operations",
+    "pcap": "IPS log search and PCAP download for forensics",
+    "soar": "Threat-intel indicator lookups (SOAR)",
+    "ueba": "Endpoint and end-user behavior analytics (UEBA)",
+    "traffic": "Policy traffic analysis (profile, ports, protocols)",
+}
 
 
 # Dynamic mode: lightweight discovery tools
@@ -144,99 +297,10 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
         """
         op = operation.lower().strip()
 
-        # Define available tools and their categories
-        tool_catalog = {
-            "system": [
-                ("get_system_status", "Get FortiAnalyzer system status"),
-                ("get_ha_status", "Get HA cluster status"),
-                ("list_adoms", "List administrative domains"),
-                ("get_adom", "Get ADOM details"),
-                ("list_devices", "List devices in ADOM"),
-                ("get_device", "Get device details"),
-                ("list_tasks", "List background tasks"),
-                ("get_task", "Get task status"),
-                ("wait_for_task", "Wait for task to complete"),
-            ],
-            "logs": [
-                ("query_logs", "Query logs with two-step TID workflow"),
-                ("get_log_search_progress", "Get search progress by TID"),
-                ("fetch_more_logs", "Fetch more logs using TID"),
-                ("cancel_log_search", "Cancel a running search"),
-                ("get_log_stats", "Get log statistics"),
-                ("get_log_fields", "Get available log fields"),
-                ("search_traffic_logs", "Search traffic logs"),
-                ("search_security_logs", "Search security logs"),
-                ("search_event_logs", "Search event logs"),
-                ("get_logfiles_state", "Get log file state info"),
-                ("get_pcap_file", "Get PCAP file from log"),
-            ],
-            "dvm": [
-                ("add_device", "Add device to FortiAnalyzer"),
-                ("delete_device", "Delete device from FortiAnalyzer"),
-                ("add_devices_bulk", "Add multiple devices"),
-                ("delete_devices_bulk", "Delete multiple devices"),
-                ("get_device_info", "Get detailed device info"),
-                ("search_devices", "Search devices with filters"),
-                ("list_device_groups", "List device groups"),
-                ("list_device_vdoms", "List device VDOMs"),
-            ],
-            "events": [
-                ("get_alerts", "Get alert events"),
-                ("get_alert_count", "Get alert count"),
-                ("acknowledge_alerts", "Acknowledge alerts"),
-                ("unacknowledge_alerts", "Unacknowledge alerts"),
-                ("get_alert_logs", "Get logs for alerts"),
-                ("get_alert_details", "Get alert details"),
-                ("add_alert_comment", "Add comment to alert"),
-                ("get_alert_incident_stats", "Get alert-incident statistics"),
-            ],
-            "fortiview": [
-                ("run_fortiview", "Start FortiView query (returns TID)"),
-                ("fetch_fortiview", "Fetch FortiView results by TID"),
-                ("get_fortiview_data", "Get FortiView data with auto TID"),
-                ("get_top_sources", "Get top traffic sources"),
-                ("get_top_destinations", "Get top traffic destinations"),
-                ("get_top_applications", "Get top applications"),
-                ("get_top_threats", "Get top security threats"),
-                ("get_top_websites", "Get top websites"),
-                ("get_top_cloud_applications", "Get top cloud apps"),
-                ("get_policy_hits", "Get policy hit statistics"),
-            ],
-            "reports": [
-                ("list_report_layouts", "List runnable report layouts"),
-                ("list_report_templates", "List read-only report templates (blueprints)"),
-                ("run_report", "Run a report"),
-                ("fetch_report", "Fetch report status"),
-                ("get_report_data", "Download report data"),
-                ("get_report_history", "Get report history"),
-                ("run_and_wait_report", "Run report and wait"),
-            ],
-            "incidents": [
-                ("get_incidents", "Get security incidents"),
-                ("get_incident", "Get incident by ID"),
-                ("get_incident_count", "Get incident count"),
-                ("create_incident", "Create new incident"),
-                ("update_incident", "Update incident"),
-                ("get_incident_stats", "Get incident statistics"),
-            ],
-            "ioc": [
-                ("get_ioc_license_state", "Get IOC license state"),
-                ("acknowledge_ioc_events", "Acknowledge IOC events"),
-                ("run_ioc_rescan", "Start IOC rescan"),
-                ("get_ioc_rescan_status", "Get IOC rescan status"),
-                ("get_ioc_rescan_history", "Get IOC rescan history"),
-                ("run_and_wait_ioc_rescan", "Run IOC rescan and wait"),
-            ],
-            "traffic": [
-                ("get_policy_traffic_profile", "Get sampled traffic summary per policy"),
-                ("get_policy_port_analysis", "Get bounded port/protocol enumeration per policy"),
-                ("get_policy_protocol_summary", "Get protocol breakdown per policy"),
-            ],
-        }
-
         results = []
-        for category, tools in tool_catalog.items():
-            for tool_name, description in tools:
+        for category, tool_names in TOOL_CATALOGUE.items():
+            description = _CATEGORY_DESCRIPTIONS.get(category, "")
+            for tool_name in tool_names:
                 search_text = f"{tool_name} {category} {description}".lower()
                 if all(tok in search_text for tok in op.split()):
                     results.append(
@@ -275,7 +339,9 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
         # Copied so the coercion below never mutates the caller's dict.
         params = dict(parameters) if parameters else {}
 
-        # Import tools dynamically and execute
+        # Import tools dynamically and execute. This already imports every tool
+        # module, so -- unlike TOOL_CATALOGUE, which must stay static to avoid
+        # exactly this import -- tool_map below can be derived from it for free.
         from fortianalyzer_mcp.tools import (
             dvm_tools,
             event_tools,
@@ -291,102 +357,27 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
             ueba_tools,
         )
 
-        # Map tool names to functions
-        tool_map = {
-            # System tools
-            "get_system_status": system_tools.get_system_status,
-            "get_ha_status": system_tools.get_ha_status,
-            "list_adoms": system_tools.list_adoms,
-            "get_adom": system_tools.get_adom,
-            "list_devices": system_tools.list_devices,
-            "get_device": system_tools.get_device,
-            "list_tasks": system_tools.list_tasks,
-            "get_task": system_tools.get_task,
-            "wait_for_task": system_tools.wait_for_task,
-            # Log tools
-            "query_logs": log_tools.query_logs,
-            "get_log_search_progress": log_tools.get_log_search_progress,
-            "fetch_more_logs": log_tools.fetch_more_logs,
-            "cancel_log_search": log_tools.cancel_log_search,
-            "get_log_stats": log_tools.get_log_stats,
-            "get_log_fields": log_tools.get_log_fields,
-            "search_traffic_logs": log_tools.search_traffic_logs,
-            "search_security_logs": log_tools.search_security_logs,
-            "search_event_logs": log_tools.search_event_logs,
-            "get_logfiles_state": log_tools.get_logfiles_state,
-            "get_pcap_file": log_tools.get_pcap_file,
-            # DVM tools
-            "add_device": dvm_tools.add_device,
-            "delete_device": dvm_tools.delete_device,
-            "add_devices_bulk": dvm_tools.add_devices_bulk,
-            "delete_devices_bulk": dvm_tools.delete_devices_bulk,
-            "get_device_info": dvm_tools.get_device_info,
-            "search_devices": dvm_tools.search_devices,
-            "list_device_groups": dvm_tools.list_device_groups,
-            "list_device_vdoms": dvm_tools.list_device_vdoms,
-            # Event tools
-            "get_alerts": event_tools.get_alerts,
-            "get_alert_count": event_tools.get_alert_count,
-            "acknowledge_alerts": event_tools.acknowledge_alerts,
-            "unacknowledge_alerts": event_tools.unacknowledge_alerts,
-            "get_alert_logs": event_tools.get_alert_logs,
-            "get_alert_details": event_tools.get_alert_details,
-            "add_alert_comment": event_tools.add_alert_comment,
-            "get_alert_incident_stats": event_tools.get_alert_incident_stats,
-            "get_alert_handlers": event_tools.get_alert_handlers,
-            # UEBA tools (Wave-2 skills readers)
-            "get_endpoints": ueba_tools.get_endpoints,
-            "get_endpoint_vulnerabilities": ueba_tools.get_endpoint_vulnerabilities,
-            "get_endusers": ueba_tools.get_endusers,
-            "get_endpoint_stats": ueba_tools.get_endpoint_stats,
-            "get_enduser_stats": ueba_tools.get_enduser_stats,
-            # SOAR tools (Wave-2 threat-intel readers)
-            "get_linked_indicators": soar_tools.get_linked_indicators,
-            "get_indicator_enrichment": soar_tools.get_indicator_enrichment,
-            # FortiView tools
-            "run_fortiview": fortiview_tools.run_fortiview,
-            "fetch_fortiview": fortiview_tools.fetch_fortiview,
-            "get_fortiview_data": fortiview_tools.get_fortiview_data,
-            "get_top_sources": fortiview_tools.get_top_sources,
-            "get_top_destinations": fortiview_tools.get_top_destinations,
-            "get_top_applications": fortiview_tools.get_top_applications,
-            "get_top_threats": fortiview_tools.get_top_threats,
-            "get_top_websites": fortiview_tools.get_top_websites,
-            "get_top_cloud_applications": fortiview_tools.get_top_cloud_applications,
-            "get_policy_hits": fortiview_tools.get_policy_hits,
-            # Report tools
-            "list_report_layouts": report_tools.list_report_layouts,
-            "list_report_templates": report_tools.list_report_templates,
-            "run_report": report_tools.run_report,
-            "fetch_report": report_tools.fetch_report,
-            "get_report_data": report_tools.get_report_data,
-            "get_report_history": report_tools.get_report_history,
-            "run_and_wait_report": report_tools.run_and_wait_report,
-            # Incident tools
-            "get_incidents": incident_tools.get_incidents,
-            "get_incident": incident_tools.get_incident,
-            "get_incident_count": incident_tools.get_incident_count,
-            "create_incident": incident_tools.create_incident,
-            "update_incident": incident_tools.update_incident,
-            "get_incident_stats": incident_tools.get_incident_stats,
-            # IOC tools
-            "get_ioc_license_state": ioc_tools.get_ioc_license_state,
-            "acknowledge_ioc_events": ioc_tools.acknowledge_ioc_events,
-            "run_ioc_rescan": ioc_tools.run_ioc_rescan,
-            "get_ioc_rescan_status": ioc_tools.get_ioc_rescan_status,
-            "get_ioc_rescan_history": ioc_tools.get_ioc_rescan_history,
-            "run_and_wait_ioc_rescan": ioc_tools.run_and_wait_ioc_rescan,
-            # PCAP tools
-            "search_ips_logs": pcap_tools.search_ips_logs,
-            "get_pcap_by_session": pcap_tools.get_pcap_by_session,
-            "download_pcap_by_url": pcap_tools.download_pcap_by_url,
-            "search_and_download_pcaps": pcap_tools.search_and_download_pcaps,
-            "list_available_pcaps": pcap_tools.list_available_pcaps,
-            # Traffic analysis tools
-            "get_policy_traffic_profile": traffic_tools.get_policy_traffic_profile,
-            "get_policy_port_analysis": traffic_tools.get_policy_port_analysis,
-            "get_policy_protocol_summary": traffic_tools.get_policy_protocol_summary,
-        }
+        tool_modules = (
+            system_tools,
+            log_tools,
+            dvm_tools,
+            event_tools,
+            fortiview_tools,
+            report_tools,
+            incident_tools,
+            ioc_tools,
+            pcap_tools,
+            soar_tools,
+            ueba_tools,
+            traffic_tools,
+        )
+        tool_map: dict[str, Any] = {}
+        for module in tool_modules:
+            tool_map.update(
+                (name, getattr(module, name))
+                for name in TOOL_CATALOGUE_NAMES
+                if name not in tool_map and hasattr(module, name)
+            )
 
         if tool_name not in tool_map:
             return {
@@ -395,9 +386,11 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
                 "available_tools": list(tool_map.keys()),
             }
 
-        if params.get("filters") is not None:
+        for param, (model, shape) in _structured_params().items():
+            if params.get(param) is None:
+                continue
             try:
-                params["filters"] = _coerce_structured_filters(params["filters"])
+                params[param] = _coerce_model_list(params[param], model, param, shape)
             except ValidationError as e:
                 return error_response(
                     error="validation_error",
@@ -419,48 +412,13 @@ def register_dynamic_tools(mcp_server: FastMCP) -> None:
         return {
             "status": "success",
             "categories": {
-                "system": {
-                    "description": "System status, HA, ADOMs, devices, and tasks",
-                    "tool_count": 9,
-                },
-                "logs": {
-                    "description": "Log search with TID workflow, analytics",
-                    "tool_count": 11,
-                },
-                "dvm": {
-                    "description": "Device management, add/delete, groups",
-                    "tool_count": 8,
-                },
-                "events": {
-                    "description": "Alert management and SOC operations",
-                    "tool_count": 8,
-                },
-                "fortiview": {
-                    "description": "FortiView analytics with TID workflow",
-                    "tool_count": 10,
-                },
-                "reports": {
-                    "description": "Report templates and execution with TID workflow",
-                    "tool_count": 6,
-                },
-                "incidents": {
-                    "description": "Incident management and tracking",
-                    "tool_count": 6,
-                },
-                "ioc": {
-                    "description": "IOC detection and rescan operations",
-                    "tool_count": 6,
-                },
-                "pcap": {
-                    "description": "IPS log search and PCAP download for forensics",
-                    "tool_count": 5,
-                },
-                "traffic": {
-                    "description": "Policy traffic analysis, port enumeration, protocol summary",
-                    "tool_count": 3,
-                },
+                category: {
+                    "description": _CATEGORY_DESCRIPTIONS.get(category, ""),
+                    "tool_count": len(tool_names),
+                }
+                for category, tool_names in TOOL_CATALOGUE.items()
             },
-            "total_tools": 72,
+            "total_tools": sum(len(names) for names in TOOL_CATALOGUE.values()),
             "note": "Use find_fortianalyzer_tool() to search, execute_advanced_tool() to run",
         }
 

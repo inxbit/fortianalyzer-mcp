@@ -17,6 +17,7 @@ from fortianalyzer_mcp.query.fields import (
     canonical_log_field,
     coerce_value,
     get_vocabulary,
+    has_projection,
     resolve_field,
 )
 from fortianalyzer_mcp.query.filters import (
@@ -25,16 +26,49 @@ from fortianalyzer_mcp.query.filters import (
     compile_to_array,
     compile_to_string,
 )
+from fortianalyzer_mcp.query.groups import (
+    LOG_GROUP_SURFACES,
+    VIEW_FILTER_FIELDS,
+    VIEW_SORT_DEFAULTS,
+    GroupPlan,
+    GroupSurfacePopulationMismatch,
+    LogGroupSurface,
+    UnsupportedGroupDimension,
+    aggregate_breakdowns,
+    resolve_group_plan,
+)
+from fortianalyzer_mcp.query.shape import (
+    ALL_FIELDS,
+    fields_returned,
+    project_payload,
+    project_rows,
+    resolve_projection,
+)
 
 __all__ = [
+    "ALL_FIELDS",
+    "LOG_GROUP_SURFACES",
+    "VIEW_FILTER_FIELDS",
+    "VIEW_SORT_DEFAULTS",
     "TASK_STATE_CODES",
     "FilterCondition",
     "FilterOp",
+    "GroupPlan",
+    "GroupSurfacePopulationMismatch",
+    "LogGroupSurface",
+    "UnsupportedGroupDimension",
     "Vocabulary",
+    "aggregate_breakdowns",
     "canonical_log_field",
     "coerce_value",
     "compile_to_array",
     "compile_to_string",
+    "fields_returned",
     "get_vocabulary",
+    "has_projection",
+    "project_payload",
+    "project_rows",
     "resolve_field",
+    "resolve_group_plan",
+    "resolve_projection",
 ]

@@ -288,6 +288,15 @@ FIELD_TYPES: dict[str, str] = {
     # outside the log rows unless these are scanned too.
     "filter": TEXT,
     "filter_applied": TEXT,
+    # The projection echo. Same class of bug as filter_applied (#95): argument
+    # unmasking runs at the wrapper boundary, so a tool building
+    # ``fields_returned`` is holding whatever the caller's ``fields`` list
+    # resolved to. ``fields`` names response KEYS rather than values, so the
+    # real close is FIELD_NAME_ARGS below -- the token never becomes plaintext
+    # in the first place. TEXT is the belt to that braces: it gives the echo
+    # the same pass-2 substitution and IOC scan every other caller-facing
+    # string gets, for any other route by which a value reaches this key.
+    "fields_returned": TEXT,
     "device": HOSTNAME,
     # --- caller-facing prose: the skills layer and every tool error build
     # these strings themselves, and they name the record they are about
@@ -321,6 +330,66 @@ FIELD_TYPES: dict[str, str] = {
     "headline": TEXT,  # skill summaries; first interpolated an identifier in #89
 }
 
+#: Tool-argument keys whose value names *fields*, not values, and which the
+#: argument unmasker must therefore leave alone.
+#:
+#: ``resolve_scalar`` resolves any self-identifying token wherever it appears,
+#: and ``query.fields.resolve_field`` passes an unknown-but-well-shaped name
+#: through -- and a mask token (``host-6b7e-zwyu4i8an``) is well shaped. So a
+#: token placed in ``fields`` was unmasked to plaintext, used as a projection
+#: key, and echoed back under ``fields_returned``: a complete token ->
+#: plaintext oracle driven entirely by the model's own token. A field name is
+#: never customer data, so there is nothing here for unmasking to be right
+#: about; skipping the key closes the round trip at the source rather than
+#: trying to re-mask the echo afterwards.
+#:
+#: Structured-filter conditions are already handled this way for the same
+#: reason: ``unmask_filter_conditions`` resolves only ``value`` and leaves the
+#: sibling ``field`` untouched.
+#:
+#: Every key here names a field, a column, or a view -- never a value, so a
+#: caller has no legitimate reason to put a masked identifier in one, and each
+#: is echoed back somewhere:
+#:   fields      -> ``fields_returned`` (the original oracle, #95's shape)
+#:   group_by    -> ``query_logs``'s echoed ``group_by`` on success, and
+#:                  interpolated verbatim into the ``unsupported_group_dimension``
+#:                  / ``group_dimension_logtype_mismatch`` refusal messages,
+#:                  which is a *guaranteed* echo for any token, since a token
+#:                  can never be a mapped dimension
+#:   sample_by   -> ``query_logs``'s and ``analyze_policy_traffic``'s echoed
+#:                  ``sample_by``, plus every ``breakdowns`` key
+#:   sort_by     -> sort column names on the FortiView tools
+#:   view_name   -> echoed by ``run_fortiview``/``fetch_fortiview``/
+#:                  ``get_fortiview_data`` and by ``group_source``
+#: The refusal path is what makes this urgent rather than theoretical: an
+#: unmapped dimension is refused, and the refusal quotes the dimension. Resolve
+#: the token first and the refusal hands back the plaintext -- a token ->
+#: plaintext oracle that needs no valid query at all, only a bad one.
+#:
+#: This closes one direction only: token -> plaintext. The opposite,
+#: plaintext -> token, stays open on ``fields`` alone -- measured, not
+#: assumed. Its echo ``fields_returned`` is typed TEXT and is therefore
+#: scanned by pass 2, so an unresolved argument reaches the tool body
+#: verbatim and comes back masked, and a caller learns ``mask()`` of any value
+#: it chooses (guess, mask, compare -- a chosen-plaintext check against a
+#: token it already holds). ``fields`` being a *list* is what makes it worth
+#: naming: N guesses per call rather than one.
+#:
+#: The other four echo verbatim and are never scanned -- ``group_by``,
+#: ``sample_by``, ``sort_by`` and ``view_name`` have no ``FIELD_TYPES`` entry,
+#: so the direction is closed there today. Closed incidentally, though, not by
+#: design: typing any of those echoes would open it, which is the thing to
+#: remember when adding one.
+#:
+#: The oracle itself is not new and not closable from here -- an echoed
+#: ``filter`` over an untyped field does the same on every release since
+#: masking shipped (verified against main, not inferred: ``dstport=="<ip>"``
+#: comes back with the token substituted). Only a keyed tag on tokens (#40's
+#: authenticated envelope) makes a chosen-plaintext token distinguishable from
+#: a real one. Recorded so the docstring neither overclaims safety nor
+#: overclaims exposure.
+FIELD_NAME_ARGS = ("fields", "group_by", "sample_by", "sort_by", "view_name")
+
 #: Composite keys whose value is a single string holding one or more
 #: identifiers inside a larger structure. Name matching cannot reach them,
 #: so ``wrapper.py`` parses each shape and masks the parts.
@@ -330,6 +399,37 @@ FIELD_TYPES: dict[str, str] = {
 COMPOSITE_PREFIXED = ("groupby1", "groupby2")
 COMPOSITE_JSON = ("grpby",)
 COMPOSITE_TARGET = ("target",)
+
+#: ``analyze_policy_traffic`` and ``query_logs(sample_by=...)``:
+#: ``{dimension: [{"value": "...", "hits": N}, ...]}``. The dimension name
+#: (the dict key one level up) decides the type of each bucket's
+#: ``"value"``, exactly the "field decides the paired value's type" shape
+#: ``groupby1`` already uses, just with the field name sitting one level up
+#: instead of packed into the string. Verified live to leak: a synthetic
+#: ``{"breakdowns": {"srcip": [{"value": "10.1.2.3", "hits": 5}]}}`` survived
+#: masking whole -- pass 1 only masks a bare ``"value"`` key when a sibling
+#: ``"type"`` key exists (``_mask_indicator_pair``, SOAR-specific), and pass 2
+#: only scans keys typed TEXT, which a plain ``"value"`` key never is.
+#:
+#: Deliberately NOT a "burn unknown dimension" handler like ``target``'s: a
+#: caller may group by almost any field (``port``, ``service``, ``app``,
+#: ``proto``, a derived dimension with no field type at all), and most of
+#: those are not identifiers. A dimension absent from ``FIELD_TYPES`` (and
+#: from ``DEVICE_IDENTITY_TYPES`` unless ``FAZ_MASK_DEVICE_IDENTITY`` is set)
+#: passes its bucket values through untouched instead of being burned to a
+#: placeholder -- the device-identity keep-set applies here exactly as it
+#: does to a flat field, because the lookup is the same shared type table.
+#:
+#: A TEXT dimension (``sample_by=["msg"]``, ``["ui"]``, ``["subject"]``) is the
+#: one class pass 1 cannot finish: prose has no scalar type to mask by, and the
+#: generic ``"value"`` key means the sentence above applies to it too -- pass 2
+#: never reached it, so the free text rode out in clear while a hostname inside
+#: it sat beside its own token in a sibling row (#109 review). ``wrapper``
+#: therefore handles this key in BOTH passes: identifier dimensions in pass 1,
+#: TEXT dimensions in pass 2 via ``_mask_breakdown_text``, which gives a bucket
+#: value the same scan the flat key of that name gets. Only TEXT, because a
+#: pass-1 token is itself a valid IPv4 and a second scan would mask it again.
+COMPOSITE_BREAKDOWNS = ("breakdowns",)
 
 #: ``filter_applied`` when a tool echoes a *compiled* filter as
 #: ``[[field, op, value], ...]`` rather than as one string. Argument

@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Coroutine
 from datetime import datetime
 from typing import Any
 
+from fortianalyzer_mcp.query.groups import VIEW_SORT_DEFAULTS
 from fortianalyzer_mcp.skills.models import (
     AlertEvidence,
     AlertRuleHandler,
@@ -274,12 +275,18 @@ async def run_incidents(params: IncidentsParams) -> IncidentsResult:
 
     warnings: list[str] = []
 
+    # fields=["*"]: these readers curate by default, and the skills below read
+    # keys outside that set (risk_score, importance, vuln-stats, and — here —
+    # the full incident/alert objects IncidentRecord promises "verbatim"). The
+    # curated default is for direct MCP callers; a composing skill wants the
+    # whole row.
     incidents_res, err = await _call(
         get_incidents,
         adom=params.adom,
         time_range=params.time_range,
         filter=params.filter,
         limit=params.limit,
+        fields=["*"],
     )
     if incidents_res is None:
         raise SkillExecutionError(f"could not retrieve incidents ({err})")
@@ -320,6 +327,7 @@ async def run_incidents(params: IncidentsParams) -> IncidentsResult:
             adom=params.adom,
             time_range=params.time_range,
             limit=params.alerts_scan_limit,
+            fields=["*"],
         )
         if alerts_res is None:
             warnings.append(f"alert correlation skipped: {err}")
@@ -383,6 +391,7 @@ async def run_reports(params: ReportsParams) -> ReportsResult:
             adom=params.adom,
             time_range=params.time_range,
             title=params.title,
+            fields=["*"],
         )
         if history_res is None:
             raise SkillExecutionError(f"could not retrieve report history ({err})")
@@ -428,6 +437,11 @@ async def run_log_search(params: LogSearchParams) -> LogSearchResult:
         filter=params.filter,
         limit=params.limit,
         timeout=params.timeout,
+        # LogSearchResult.rows is documented "verbatim FAZ log rows", and
+        # log_search exposes no `fields` of its own -- so the curated default
+        # would silently and unfixably strip srcintf/dstintf/hostname/msg/
+        # logid/level/devid/itime and the rest from every caller.
+        fields=["*"],
     )
     if search_res is None:
         raise SkillExecutionError(f"log search failed ({err})")
@@ -517,6 +531,7 @@ async def run_triage(params: TriageParams) -> TriageResult:
             time_range=_SUBJECT_LOOKUP_WINDOW,
             filter=f"alertid=={safe_alert_id}",
             limit=5,
+            fields=["*"],
         )
         if lookup_res is None:
             warnings.append(f"alert filter lookup unavailable: {err}")
@@ -531,7 +546,11 @@ async def run_triage(params: TriageParams) -> TriageResult:
             )
         if not subject:
             alerts_res, err = await _call(
-                get_alerts, adom=params.adom, time_range=params.context_time_range, limit=500
+                get_alerts,
+                adom=params.adom,
+                time_range=params.context_time_range,
+                limit=500,
+                fields=["*"],
             )
             if alerts_res is None:
                 warnings.append(f"alert window scan unavailable: {err}")
@@ -568,7 +587,9 @@ async def run_triage(params: TriageParams) -> TriageResult:
                 "record (no severity -> priority 'informational')."
             )
 
-        logs_res, err = await _call(get_alert_logs, alert_ids=[params.alert_id], adom=params.adom)
+        logs_res, err = await _call(
+            get_alert_logs, alert_ids=[params.alert_id], adom=params.adom, fields=["*"]
+        )
         if logs_res is None:
             warnings.append(f"triggering logs unavailable: {err}")
         else:
@@ -591,8 +612,15 @@ async def run_triage(params: TriageParams) -> TriageResult:
             # (attachsrcid without incid) is rejected by FAZ, and with incid
             # present the attachsrcid param is ignored (both live-verified
             # on 7.6.7), so membership is checked per candidate incident.
+            # time-range is undocumented on the incidents endpoint but does
+            # filter (verified 7.6.6 — see tools.incident_tools.get_incidents),
+            # so context_time_range narrows this like the alert reads above.
             inc_res, err = await _call(
-                get_incidents, adom=params.adom, time_range=params.context_time_range, limit=50
+                get_incidents,
+                adom=params.adom,
+                time_range=params.context_time_range,
+                limit=50,
+                fields=["*"],
             )
             if inc_res is None:
                 warnings.append(f"incident context unavailable: {err}")
@@ -651,7 +679,11 @@ async def run_triage(params: TriageParams) -> TriageResult:
                     "fell back to linkage-key matching"
                 )
             alerts_res, err = await _call(
-                get_alerts, adom=params.adom, time_range=params.context_time_range, limit=200
+                get_alerts,
+                adom=params.adom,
+                time_range=params.context_time_range,
+                limit=200,
+                fields=["*"],
             )
             if alerts_res is None:
                 warnings.append(f"alert context unavailable: {err}")
@@ -757,7 +789,7 @@ def _timeline(incident: dict[str, Any], evidence: list[AlertEvidence]) -> list[T
 async def run_incident_summary(params: IncidentSummaryParams) -> IncidentSummary:
     """Structured investigation summary for one incident."""
     from fortianalyzer_mcp.tools.event_tools import get_alert_logs, get_alerts
-    from fortianalyzer_mcp.tools.fortiview_tools import get_top_threats
+    from fortianalyzer_mcp.tools.fortiview_tools import get_fortiview_data
     from fortianalyzer_mcp.tools.incident_tools import get_incident
 
     warnings: list[str] = []
@@ -780,7 +812,7 @@ async def run_incident_summary(params: IncidentSummaryParams) -> IncidentSummary
                 "fell back to linkage-key matching"
             )
         alerts_res, err = await _call(
-            get_alerts, adom=params.adom, time_range=params.time_range, limit=500
+            get_alerts, adom=params.adom, time_range=params.time_range, limit=500, fields=["*"]
         )
         if alerts_res is None:
             warnings.append(f"related alerts unavailable: {err}")
@@ -810,6 +842,7 @@ async def run_incident_summary(params: IncidentSummaryParams) -> IncidentSummary
                     alert_ids=[alert_id],
                     adom=params.adom,
                     limit=params.max_logs_per_alert,
+                    fields=["*"],
                 )
                 if logs_res is None:
                     warnings.append(f"logs for alert {alert_id} unavailable: {err}")
@@ -826,7 +859,13 @@ async def run_incident_summary(params: IncidentSummaryParams) -> IncidentSummary
     threat_landscape: list[dict[str, Any]] | FeatureGap
     if params.include_top_threats:
         threats_res, err = await _call(
-            get_top_threats, adom=params.adom, time_range=params.time_range, limit=10
+            get_fortiview_data,
+            view_name="top-threats",
+            sort_by=VIEW_SORT_DEFAULTS["top-threats"],
+            adom=params.adom,
+            time_range=params.time_range,
+            limit=10,
+            fields=["*"],
         )
         if threats_res is None:
             threat_landscape = FeatureGap(reason=f"top threats unavailable: {err}")
@@ -928,6 +967,7 @@ async def run_asset_lookup(params: AssetLookupParams) -> AssetLookupResult:
         epids=params.epids,
         detail_level=params.detail_level,
         time_range=params.time_range,
+        fields=["*"],
     )
     if endpoints_res is None:
         raise SkillExecutionError(f"could not retrieve UEBA endpoints ({err})")
@@ -1017,6 +1057,7 @@ async def run_identity_lookup(params: IdentityLookupParams) -> IdentityLookupRes
         adom=params.adom,
         euids=params.euids,
         detail_level=params.detail_level,
+        fields=["*"],
     )
     if users_res is None:
         raise SkillExecutionError(f"could not retrieve UEBA end-users ({err})")
@@ -1265,7 +1306,7 @@ async def run_threat_intel(params: ThreatIntelParams) -> ThreatIntelResult:
     unenriched. The FortiView threat landscape is context and degrades to
     a gap marker. All reads are plain GETs — no logview search slots.
     """
-    from fortianalyzer_mcp.tools.fortiview_tools import get_top_threats
+    from fortianalyzer_mcp.tools.fortiview_tools import get_fortiview_data
     from fortianalyzer_mcp.tools.soar_tools import get_indicator_enrichment, get_linked_indicators
 
     warnings: list[str] = []
@@ -1356,10 +1397,13 @@ async def run_threat_intel(params: ThreatIntelParams) -> ThreatIntelResult:
     threat_landscape: list[dict[str, Any]] | FeatureGap
     if params.include_threat_landscape:
         threats_res, err = await _call(
-            get_top_threats,
+            get_fortiview_data,
+            view_name="top-threats",
+            sort_by=VIEW_SORT_DEFAULTS["top-threats"],
             adom=params.adom,
             time_range=params.time_range or "24-hour",
             limit=10,
+            fields=["*"],
         )
         if threats_res is None:
             warnings.append(f"threat landscape unavailable: {err}")
@@ -1403,6 +1447,7 @@ async def run_identity_profile(params: IdentityProfileParams) -> IdentityProfile
         adom=params.adom,
         euids=[params.euid] if params.euid is not None else None,
         detail_level=params.detail_level,
+        fields=["*"],
     )
     if users_res is None:
         raise SkillExecutionError(f"could not retrieve UEBA end-users ({err})")
@@ -1432,7 +1477,9 @@ async def run_identity_profile(params: IdentityProfileParams) -> IdentityProfile
 
     endpoints: list[dict[str, Any]] = []
     if params.include_endpoints:
-        eps_res, err = await _call(get_endpoints, adom=params.adom, detail_level="standard")
+        eps_res, err = await _call(
+            get_endpoints, adom=params.adom, detail_level="standard", fields=["*"]
+        )
         if eps_res is None:
             warnings.append(f"endpoint context unavailable ({err})")
         else:
@@ -1461,6 +1508,8 @@ async def run_identity_profile(params: IdentityProfileParams) -> IdentityProfile
             time_range=params.time_range,
             filter=f"user=={safe_user} and {_IDENTITY_ACTIVITY_CLAUSE}",
             limit=params.activity_limit,
+            # IdentityProfileResult.recent_activity is documented verbatim.
+            fields=["*"],
         )
         if logs_res is None:
             recent_activity = FeatureGap(reason=f"activity search unavailable: {err}")
@@ -1493,11 +1542,7 @@ async def run_app_usage(params: AppUsageParams) -> AppUsageResult:
     independently to a warning plus a ``FeatureGap``; the skill fails only
     when every attempted section fails.
     """
-    from fortianalyzer_mcp.tools.fortiview_tools import (
-        get_top_applications,
-        get_top_cloud_applications,
-        get_top_websites,
-    )
+    from fortianalyzer_mcp.tools.fortiview_tools import get_fortiview_data
     from fortianalyzer_mcp.tools.log_tools import query_logs
 
     warnings: list[str] = []
@@ -1507,25 +1552,34 @@ async def run_app_usage(params: AppUsageParams) -> AppUsageResult:
     top_results = await _gather_bounded(
         [
             _call(
-                get_top_applications,
+                get_fortiview_data,
+                view_name="top-applications",
+                sort_by=VIEW_SORT_DEFAULTS["top-applications"],
                 adom=params.adom,
                 device=params.device,
                 time_range=params.time_range,
                 limit=params.top_limit,
+                fields=["*"],
             ),
             _call(
-                get_top_websites,
+                get_fortiview_data,
+                view_name="top-websites",
+                sort_by=VIEW_SORT_DEFAULTS["top-websites"],
                 adom=params.adom,
                 device=params.device,
                 time_range=params.time_range,
                 limit=params.top_limit,
+                fields=["*"],
             ),
             _call(
-                get_top_cloud_applications,
+                get_fortiview_data,
+                view_name="top-cloud-applications",
+                sort_by=VIEW_SORT_DEFAULTS["top-cloud-applications"],
                 adom=params.adom,
                 device=params.device,
                 time_range=params.time_range,
                 limit=params.top_limit,
+                fields=["*"],
             ),
         ],
         limit=3,
@@ -1554,6 +1608,10 @@ async def run_app_usage(params: AppUsageParams) -> AppUsageResult:
             device=params.device,
             time_range=params.time_range,
             limit=params.dlp_limit,
+            # AppUsageResult.dlp_events is documented verbatim. (dlp has no
+            # curated set today, so this is also what silences the uncurated
+            # warning from leaking into AppUsageResult.warnings.)
+            fields=["*"],
         )
         if search_res is None:
             warnings.append(f"DLP log search unavailable: {err}")
@@ -1650,11 +1708,7 @@ async def run_network_context(params: NetworkContextParams) -> NetworkContextRes
     section becomes a warning plus a ``FeatureGap``. The skill fails only
     when every attempted section fails. Rows pass through verbatim.
     """
-    from fortianalyzer_mcp.tools.fortiview_tools import (
-        get_fortiview_data,
-        get_top_destinations,
-        get_top_sources,
-    )
+    from fortianalyzer_mcp.tools.fortiview_tools import get_fortiview_data
 
     warnings: list[str] = []
     common: dict[str, Any] = {
@@ -1666,12 +1720,28 @@ async def run_network_context(params: NetworkContextParams) -> NetworkContextRes
 
     attempted = ["top_destinations", "top_sources"]
     coros = [
-        _call(get_top_destinations, **common),
-        _call(get_top_sources, **common),
+        _call(
+            get_fortiview_data,
+            view_name="top-destinations",
+            sort_by=VIEW_SORT_DEFAULTS["top-destinations"],
+            fields=["*"],
+            **common,
+        ),
+        _call(
+            get_fortiview_data,
+            view_name="top-sources",
+            sort_by=VIEW_SORT_DEFAULTS["top-sources"],
+            fields=["*"],
+            **common,
+        ),
     ]
     if params.include_geo:
         attempted.append("top_countries")
-        coros.append(_call(get_fortiview_data, view_name=_GEO_VIEW, **common))
+        # fields=["*"]: FortiView rows pass through verbatim here, and it also
+        # keeps get_fortiview_data's uncurated-vocabulary warning (which names
+        # a `fields` parameter this skill's caller does not have) out of the
+        # skill's warnings list.
+        coros.append(_call(get_fortiview_data, view_name=_GEO_VIEW, fields=["*"], **common))
     vpn_window = params.time_range
     if params.include_vpn:
         attempted.append("vpn_tunnels")
@@ -1680,7 +1750,12 @@ async def run_network_context(params: NetworkContextParams) -> NetworkContextRes
         # (an explicit vpn_time_range wins).
         vpn_window = params.vpn_time_range or _vpn_window(params.time_range)
         coros.append(
-            _call(get_fortiview_data, view_name=_VPN_VIEW, **{**common, "time_range": vpn_window})
+            _call(
+                get_fortiview_data,
+                view_name=_VPN_VIEW,
+                fields=["*"],
+                **{**common, "time_range": vpn_window},
+            )
         )
 
     results = await _gather_bounded(coros)
@@ -1759,7 +1834,11 @@ async def run_risk_assessment(params: RiskAssessmentParams) -> RiskAssessmentRes
     entity_filter_gap: str | None = None
     if params.epid is not None:
         eps_res, err = await _call(
-            get_endpoints, adom=params.adom, epids=[params.epid], detail_level="simple"
+            get_endpoints,
+            adom=params.adom,
+            epids=[params.epid],
+            detail_level="simple",
+            fields=["*"],
         )
         if eps_res is None:
             raise SkillExecutionError(f"could not resolve endpoint {params.epid} ({err})")
@@ -1777,7 +1856,9 @@ async def run_risk_assessment(params: RiskAssessmentParams) -> RiskAssessmentRes
         else:
             entity_filter_gap = f"endpoint {params.epid} carries no 'epip'"
     else:
-        users_res, err = await _call(get_endusers, adom=params.adom, euids=[params.euid])
+        users_res, err = await _call(
+            get_endusers, adom=params.adom, euids=[params.euid], fields=["*"]
+        )
         if users_res is None:
             raise SkillExecutionError(f"could not resolve end-user {params.euid} ({err})")
         record = next(
@@ -1837,10 +1918,12 @@ async def run_risk_assessment(params: RiskAssessmentParams) -> RiskAssessmentRes
         threats_res, err = await _call(
             get_fortiview_data,
             view_name="top-threats",
+            sort_by=VIEW_SORT_DEFAULTS["top-threats"],
             adom=params.adom,
             time_range=params.time_range,
             filter=entity_filter,
             limit=100,
+            fields=["*"],
         )
         if threats_res is None:
             warnings.append(f"threat dimension unavailable ({err}); its subscore is 0")
@@ -1863,6 +1946,9 @@ async def run_risk_assessment(params: RiskAssessmentParams) -> RiskAssessmentRes
             time_range=params.time_range,
             filter=f"action==failure and {entity_filter}",
             limit=1000,
+            # Counts rows and reads `total`; keeps the row shape the skill's
+            # other log reads use rather than a silently different one.
+            fields=["*"],
         )
         if logs_res is None:
             warnings.append(f"auth-failure dimension unavailable ({err}); its subscore is 0")
@@ -2271,7 +2357,7 @@ async def _entity_behavioral_alerts(
             "behavioural detections cannot be tied to it"
         )
     alerts_res, err = await _call(
-        get_alerts, adom=adom, time_range=time_range, filter=pivot, limit=200
+        get_alerts, adom=adom, time_range=time_range, filter=pivot, limit=200, fields=["*"]
     )
     if alerts_res is None:
         warnings.append(f"behavior[{entity_ref}]: behavioural alert lookup unavailable: {err}")
@@ -2318,7 +2404,7 @@ async def _hunt_behavior(
         # drop the target itself. The percentile denominator must be the full
         # current inventory (live-verified: a 7-day first-seen filter excluded
         # long-standing hosts on 8.0.0), so the estate read is unwindowed.
-        eps_res, err = await _call(get_endpoints, adom=adom, detail_level="standard")
+        eps_res, err = await _call(get_endpoints, adom=adom, detail_level="standard", fields=["*"])
         if eps_res is None:
             raise SkillExecutionError(f"could not retrieve UEBA endpoints ({err})")
         estate = _records(eps_res.get("data"))
@@ -2373,7 +2459,7 @@ async def _hunt_behavior(
         )
 
     # End-user: no risk_score — importance + behavioural alerts only.
-    users_res, err = await _call(get_endusers, adom=adom, euids=[entity_id])
+    users_res, err = await _call(get_endusers, adom=adom, euids=[entity_id], fields=["*"])
     if users_res is None:
         raise SkillExecutionError(f"could not retrieve UEBA end-users ({err})")
     record = next(
@@ -2584,6 +2670,10 @@ async def _hunt_sweep(
             time_range=time_range,
             filter=pivot,
             limit=params.sweep_limit,
+            # SweepMatch.rows is documented "Verbatim matched rows", and the
+            # sweep fans out over logtypes whose curated sets differ -- a
+            # per-logtype trim would make the matches non-comparable.
+            fields=["*"],
         )
         if logs_res is None:
             matches.append(
@@ -3020,6 +3110,10 @@ async def _entity_impact(
             time_range=time_range,
             filter=pivot,
             limit=lateral_limit,
+            # EntityImpact.lateral_activity is documented "Per-logtype
+            # verbatim rows"; same per-logtype comparability point as the
+            # hunt sweep above.
+            fields=["*"],
         )
         if logs_res is None:
             lateral[logtype] = FeatureGap(reason=f"lateral '{logtype}' search unavailable: {err}")
@@ -3079,7 +3173,9 @@ async def _resolve_impact_entities(
     resolved: list[dict[str, Any]] = []
 
     for epid in epids:
-        eps_res, err = await _call(get_endpoints, adom=adom, epids=[epid], detail_level="simple")
+        eps_res, err = await _call(
+            get_endpoints, adom=adom, epids=[epid], detail_level="simple", fields=["*"]
+        )
         record = None
         if eps_res is None:
             warnings.append(f"impact: endpoint {epid} lookup unavailable: {err}")
@@ -3095,7 +3191,7 @@ async def _resolve_impact_entities(
         resolved.append({"type": "endpoint", "ref": str(epid), "pivot": pivot, "epids": [epid]})
 
     for euid in euids:
-        users_res, err = await _call(get_endusers, adom=adom, euids=[euid])
+        users_res, err = await _call(get_endusers, adom=adom, euids=[euid], fields=["*"])
         record = None
         if users_res is None:
             warnings.append(f"impact: end-user {euid} lookup unavailable: {err}")

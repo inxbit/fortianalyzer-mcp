@@ -6,6 +6,7 @@ Follows the same pattern as test_system_tools.py to avoid server initialization.
 
 import pytest
 
+import fortianalyzer_mcp.tools.incident_tools as incident_tools
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 
 
@@ -142,13 +143,7 @@ class TestIncidentClient:
             password="password",
         )
         with pytest.raises(ConnectionError, match="Not connected"):
-            await client.get_incidents(
-                adom="root",
-                time_range={
-                    "start": "2024-01-01 00:00:00",
-                    "end": "2024-01-02 00:00:00",
-                },
-            )
+            await client.get_incidents(adom="root")
 
     async def test_get_incident_not_connected(self) -> None:
         """Test get_incident raises when not connected."""
@@ -172,13 +167,7 @@ class TestIncidentClient:
             password="password",
         )
         with pytest.raises(ConnectionError, match="Not connected"):
-            await client.get_incidents_count(
-                adom="root",
-                time_range={
-                    "start": "2024-01-01 00:00:00",
-                    "end": "2024-01-02 00:00:00",
-                },
-            )
+            await client.get_incidents_count(adom="root")
 
     async def test_create_incident_not_connected(self) -> None:
         """Test create_incident raises when not connected."""
@@ -290,3 +279,65 @@ class TestIncidentClient:
                     "end": "2024-01-02 00:00:00",
                 },
             )
+
+
+class TestGetIncidentsProjection:
+    """Incidents project under the incident vocabulary."""
+
+    ROW = {
+        "incid": 5,
+        "severity": "high",
+        "status": "open",
+        "alertid": "A-1",
+        "epid": 12,
+        "euid": 34,
+        "description": "long free text",
+    }
+
+    def _install(self, monkeypatch: pytest.MonkeyPatch, rows: object) -> None:
+        class FakeClient:
+            async def ensure_connected(self) -> None:
+                return None
+
+            async def get_system_timezone(self) -> None:
+                return None
+
+            async def get_incidents(self, **kwargs: object) -> object:
+                return rows
+
+        monkeypatch.setattr(incident_tools, "_get_client", lambda: FakeClient())
+
+    async def test_default_projection_keeps_the_join_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install(monkeypatch, [dict(self.ROW)])
+
+        result = await incident_tools.get_incidents()
+
+        row = result["data"][0]
+        assert "description" not in row
+        assert row["alertid"] == "A-1"
+        assert row["epid"] == 12 and row["euid"] == 34
+
+    async def test_star_returns_the_full_incident(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._install(monkeypatch, [dict(self.ROW)])
+
+        result = await incident_tools.get_incidents(fields=["*"])
+
+        assert result["data"][0]["description"] == "long free text"
+
+    async def test_a_non_list_data_value_is_wrapped_into_a_single_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A "data" value that isn't a list is still coerced into a one-row list.
+
+        Some FAZ responses collapse a singleton result to a bare object rather
+        than a one-item list. The skills layer (handlers.py) relies on
+        get_incidents always handing back a list under "data" -- iterating a
+        bare dict would walk its keys, not rows.
+        """
+        self._install(monkeypatch, {"data": dict(self.ROW)})
+
+        result = await incident_tools.get_incidents(fields=["*"])
+
+        assert result["data"] == [self.ROW]

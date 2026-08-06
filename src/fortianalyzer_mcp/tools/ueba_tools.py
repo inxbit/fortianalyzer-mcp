@@ -12,9 +12,11 @@ import logging
 from typing import Any
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
+from fortianalyzer_mcp.query.shape import project_payload
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tool_annotations import READ_ONLY
-from fortianalyzer_mcp.utils.responses import redact
+from fortianalyzer_mcp.utils.errors import ValidationError
+from fortianalyzer_mcp.utils.responses import error_response, redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import get_default_adom, validate_adom
 
@@ -61,12 +63,13 @@ async def get_endpoints(
     epids: list[int] | None = None,
     detail_level: str = "standard",
     time_range: str | None = None,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Get UEBA endpoint (asset) records from FortiAnalyzer.
 
-    Resolves endpoint/asset profiles: hostname, IP, MAC, OS, first/last
-    seen, department, associated users and vulnerability-stat counts.
-    Requires UEBA to be enabled/licensed on the FortiAnalyzer.
+    Resolves endpoint/asset profiles: name and IP (``epname``/``epip``),
+    the detecting appliance, and the ``user`` association list. Requires
+    UEBA to be enabled/licensed on the FortiAnalyzer.
 
     Args:
         adom: ADOM name (default: from config DEFAULT_ADOM)
@@ -74,6 +77,11 @@ async def get_endpoints(
         detail_level: "simple", "basic" or "standard" (default: "standard")
         time_range: Optional first-seen window, e.g. "7-day" or a custom
             "start|end" range
+        fields: Which keys each endpoint record carries. Omit for a curated
+            default (epname/epip identity, the associated-user list, and the
+            epid/euid join keys), ["*"] for the full object, or name the
+            fields you want. "hostname"/"host"/"ip"/"username" are accepted
+            as aliases for the real field names.
 
     Returns:
         dict with endpoint records under "data"
@@ -100,7 +108,20 @@ async def get_endpoints(
         result = await client.get_endpoints(
             adom=adom, epids=epids, detail_level=detail_level, time_range=tr
         )
-        return {"status": "success", "data": result}
+        data, returned, projection_warnings = project_payload("endpoint", result, fields)
+        return {
+            "status": "success",
+            "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
+        }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_endpoints",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to get UEBA endpoints: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -173,17 +194,23 @@ async def get_endusers(
     adom: str | None = None,
     euids: list[int] | None = None,
     detail_level: str = "standard",
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Get UEBA end-user (identity) records from FortiAnalyzer.
 
-    Resolves user identity records: username, groups, VPN IP, first/last
-    seen. With detail_level "extended", also returns email, department,
-    title and phone. Requires UEBA to be enabled/licensed on the FAZ.
+    Resolves user identity records keyed on ``euname``. With detail_level
+    "extended", also returns ``email``. Requires UEBA to be enabled/licensed
+    on the FAZ.
 
     Args:
         adom: ADOM name (default: from config DEFAULT_ADOM)
         euids: Optional list of end-user IDs to scope the query
         detail_level: "basic", "standard" or "extended" (default: "standard")
+        fields: Which keys each end-user record carries. Omit for a curated
+            default (euname identity and the euid/epids join keys), ["*"]
+            for the full object (needed for "email" at detail_level
+            "extended"), or name the fields you want. "username"/"user"
+            are accepted as aliases for "euname".
 
     Returns:
         dict with end-user records under "data"
@@ -207,7 +234,20 @@ async def get_endusers(
         logger.info(f"Getting UEBA end-users from ADOM {adom}")
 
         result = await client.get_endusers(adom=adom, euids=euids, detail_level=detail_level)
-        return {"status": "success", "data": result}
+        data, returned, projection_warnings = project_payload("enduser", result, fields)
+        return {
+            "status": "success",
+            "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
+        }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_endusers",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to get UEBA end-users: {e}")
         return {"status": "error", "message": redact(str(e))}

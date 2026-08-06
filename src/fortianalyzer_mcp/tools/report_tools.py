@@ -14,9 +14,10 @@ from datetime import datetime
 from typing import Any
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
+from fortianalyzer_mcp.query.shape import project_payload
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tool_annotations import READ_ONLY
-from fortianalyzer_mcp.utils.responses import coerce_num, redact
+from fortianalyzer_mcp.utils.responses import coerce_num, error_response, redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
@@ -587,6 +588,7 @@ async def get_report_history(
     adom: str | None = None,
     time_range: str = "30-day",
     title: str | None = None,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Get report history - list of generated reports.
 
@@ -596,6 +598,12 @@ async def get_report_history(
         adom: ADOM name (default: from config DEFAULT_ADOM)
         time_range: Time range to search (default: "30-day")
         title: Filter by report title (optional)
+        fields: Which keys each report record carries. There is no verified
+            catalogue of what a report record emits, so omitting this returns
+            full rows plus a warning rather than a guessed subset. Pass the
+            keys you want -- ``tid`` is the handle fetch_report,
+            get_report_data and save_report all take -- or ["*"] to keep full
+            rows and silence the warning.
 
     Returns:
         dict with report history
@@ -604,6 +612,8 @@ async def get_report_history(
         >>> result = await get_report_history(time_range="7-day")
         >>> for report in result["data"]:
         ...     print(f"{report['title']}: {report['state']}")
+        >>> # Narrow to the handle plus enough to pick a report:
+        >>> result = await get_report_history(fields=["tid", "title", "state"])
     """
     try:
         adom = validate_adom(adom or get_default_adom())
@@ -623,12 +633,23 @@ async def get_report_history(
         if not isinstance(data, list):
             data = [data] if data else []
 
+        data, returned, projection_warnings = project_payload("report", data, fields)
+
         return {
             "status": "success",
             "adom": adom,
             "count": len(data),
             "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
         }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_report_history",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to get report history: {e}")
         return {"status": "error", "message": redact(str(e))}

@@ -8,13 +8,19 @@ import logging
 from typing import Any
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
+from fortianalyzer_mcp.query.shape import project_payload
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tool_annotations import CREATES, READ_ONLY, UPDATES
-from fortianalyzer_mcp.utils.responses import redact
+from fortianalyzer_mcp.utils.errors import ValidationError
+from fortianalyzer_mcp.utils.responses import error_response, redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import get_default_adom, validate_adom
 
 logger = logging.getLogger(__name__)
+
+# Bucket widths for the alert-incident stats endpoint, from its `timescale`
+# enum. Identical on 7.6.6 and 8.0.0.
+_VALID_TIMESCALES = {"month", "hour"}
 
 
 def _get_client() -> FortiAnalyzerClient:
@@ -47,6 +53,7 @@ async def get_alerts(
     filter: str | None = None,
     limit: int = 100,
     offset: int = 0,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Get alert events from FortiAnalyzer.
 
@@ -61,6 +68,13 @@ async def get_alerts(
         filter: Filter expression (e.g., "severity==critical")
         limit: Maximum number of alerts to return (1-2000)
         offset: Record offset for pagination
+        fields: Which keys each alert carries. Omit for a curated default
+            (alertid/epid/euid join keys, the epname/epip endpoint identity,
+            severity, status, both ack spellings, timing, subject and the
+            groupby dimensions), ["*"] for the full object, or name the fields
+            you want. Note live alerts spell acknowledgement `ackflag`, not
+            `acknowledged`; both are in the default so whichever this build
+            emits survives.
 
     Returns:
         dict with alerts data and metadata
@@ -91,13 +105,24 @@ async def get_alerts(
         if not isinstance(data, list):
             data = [data] if data else []
 
+        data, returned, projection_warnings = project_payload("alert", data, fields)
+
         return {
             "status": "success",
             "adom": adom,
             "time_range": tr,
             "count": len(data),
             "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
         }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_alerts",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to get alerts: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -233,6 +258,7 @@ async def get_alert_logs(
     adom: str | None = None,
     limit: int = 1000,
     offset: int = 0,
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Get log entries associated with alerts.
 
@@ -243,6 +269,10 @@ async def get_alert_logs(
         adom: ADOM name (default: from config DEFAULT_ADOM)
         limit: Maximum number of logs (1-2000)
         offset: Record offset for pagination
+        fields: Which keys each log row carries. Omit for a curated default,
+            ["*"] for the full object, or name the fields you want. These
+            rows are the logs that triggered the alert, not the alerts
+            themselves, so they project under the event field set.
 
     Returns:
         dict with alert logs
@@ -263,12 +293,35 @@ async def get_alert_logs(
             offset=offset,
         )
 
+        # alertlogs answers with an envelope dict (data plus percentage,
+        # tid, etc. -- see api.client.get_alert_logs / _raw_request_once),
+        # not a bare row list. project_payload only projects a list, so
+        # unwrap the inner "data" list, project it, and put it back --
+        # every other envelope key is left untouched. The skills layer's
+        # _records() (skills/handlers.py) depends on this exact envelope
+        # shape surviving under "data".
+        data: Any
+        if isinstance(result, dict) and isinstance(result.get("data"), list):
+            inner, returned, projection_warnings = project_payload("event", result["data"], fields)
+            data = {**result, "data": inner}
+        else:
+            data, returned, projection_warnings = project_payload("event", result, fields)
+
         return {
             "status": "success",
             "adom": adom,
             "alert_count": len(alert_ids),
-            "data": result,
+            "data": data,
+            "fields_returned": returned,
+            "warnings": projection_warnings,
         }
+    except ValidationError as e:
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_alert_logs",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to get alert logs: {e}")
         return {"status": "error", "message": redact(str(e))}
@@ -361,40 +414,52 @@ async def add_alert_comment(
 async def get_alert_incident_stats(
     adom: str | None = None,
     time_range: str = "30-day",
-    stat_type: str = "severity",
+    timescale: str = "month",
 ) -> dict[str, Any]:
     """Get alert and incident statistics.
 
     Retrieves aggregated statistics for SOC dashboards.
 
+    The breakdown returned is fixed -- ``timescale`` only chooses the
+    bucket width. This tool used to take a ``stat_type`` ("severity",
+    "severity-timescale", "status"); the endpoint has no such parameter on
+    7.6.6 or 8.0.0, so it never selected anything: live, a nonsense value
+    and "severity" returned byte-identical responses while the tool echoed
+    the requested type back as though it had applied.
+
     Args:
         adom: ADOM name (default: from config DEFAULT_ADOM)
         time_range: Time range for statistics
-        stat_type: Type of statistics:
-            - "severity": Alert counts by severity
-            - "severity-timescale": Severity over time
-            - "status": Alert counts by status
+        timescale: Bucket width, "month" (default) or "hour"
 
     Returns:
         dict with statistics
     """
     try:
         adom = validate_adom(adom or get_default_adom())
+        if timescale not in _VALID_TIMESCALES:
+            valid = ", ".join(sorted(_VALID_TIMESCALES))
+            return {
+                "status": "error",
+                "message": (
+                    f"Validation error: Invalid timescale '{timescale}'. Must be one of: {valid}"
+                ),
+            }
         client = _get_client()
         tr = await _parse_time_range(time_range)
 
-        logger.info(f"Getting {stat_type} stats from ADOM {adom}")
+        logger.info(f"Getting alert-incident stats ({timescale}) from ADOM {adom}")
 
         result = await client.get_alert_incident_stats(
             adom=adom,
             time_range=tr,
-            stat_type=stat_type,
+            timescale=timescale,
         )
 
         return {
             "status": "success",
             "adom": adom,
-            "stat_type": stat_type,
+            "timescale": timescale,
             "time_range": tr,
             "data": result,
         }

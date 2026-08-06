@@ -6,10 +6,12 @@ Follows the same pattern as test_system_tools.py to avoid server initialization.
 
 import pytest
 
+import fortianalyzer_mcp.tools.fortiview_tools as fortiview_tools
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.utils.validation import (
     VALID_FORTIVIEW_VIEWS,
     ValidationError,
+    build_device_filter,
     validate_fortiview_view,
 )
 
@@ -69,6 +71,62 @@ class TestFortiViewHelpers:
         device = None
         device_filter = [{"devname": device}] if device else [{"devname": "All_Device"}]
         assert device_filter == [{"devname": "All_Device"}]
+
+
+class TestFortiViewDeviceFilter:
+    """The all-devices token has two spellings and only one of them works.
+
+    ``build_device_filter`` is logview's: it sends every ``All_*`` group as
+    ``devid`` and defaults to ``All_FortiGate``. FortiView answers only to
+    ``[{"devname": "All_Device"}]`` -- and answers the other spellings with an
+    empty top-N and no error, which reads as "no traffic".
+    """
+
+    def test_none_becomes_fortiviews_all_devices(self) -> None:
+        assert fortiview_tools.build_fortiview_device_filter(None) == [{"devname": "All_Device"}]
+
+    @pytest.mark.parametrize(
+        "token", ["All_FortiGate", "All_FortiMail", "All_Device", "All_FortiWeb"]
+    )
+    def test_every_all_devices_group_is_translated(self, token: str) -> None:
+        assert fortiview_tools.build_fortiview_device_filter(token) == [{"devname": "All_Device"}]
+        # The logview builder is what this exists to correct.
+        assert build_device_filter(token) == [{"devid": token}]
+
+    def test_a_named_device_is_untouched(self) -> None:
+        assert fortiview_tools.build_fortiview_device_filter("FGT1") == [{"devname": "FGT1"}]
+
+    def test_a_serial_still_goes_under_devid(self) -> None:
+        """A serial under devname silently matches nothing."""
+        assert fortiview_tools.build_fortiview_device_filter("FG100FTK19001333") == [
+            {"devid": "FG100FTK19001333"}
+        ]
+
+    async def test_get_fortiview_data_sends_the_translated_filter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Asserted at the client, which is the only boundary that matters."""
+        captured: dict[str, object] = {}
+
+        class FakeClient:
+            async def get_system_timezone(self) -> None:
+                return None
+
+            async def fortiview_run(self, **kwargs: object) -> dict[str, object]:
+                captured.update(kwargs)
+                return {"tid": 1}
+
+            async def fortiview_fetch(self, **kwargs: object) -> dict[str, object]:
+                return {"percentage": 100, "data": []}
+
+        monkeypatch.setattr(fortiview_tools, "_get_client", lambda: FakeClient())
+
+        result = await fortiview_tools.get_fortiview_data(
+            view_name="top-sources", device="All_FortiGate", fields=["*"]
+        )
+
+        assert result["status"] == "success"
+        assert captured["device"] == [{"devname": "All_Device"}]
 
     def test_sort_by_param_build(self) -> None:
         """Test sort_by parameter building logic."""
@@ -195,23 +253,107 @@ class TestFortiViewViews:
             validate_fortiview_view(view)
 
 
-class TestCloudApplicationsSortDefault:
-    """The Shadow-IT cloud-apps view has no ``bandwidth`` column (its byte
-    columns are ``total_size``/... and always 0 — FGT app-ctrl logs carry no
-    bytes). Sorting by ``bandwidth`` raised a FAZ ``Missing columns`` DB
-    error, so the default must be a real, populated column."""
+class TestFortiViewProjection:
+    """FortiView rows are per-view, so there is no curated default."""
 
-    async def test_default_sort_is_sessions_not_bandwidth(self) -> None:
-        from unittest.mock import patch
+    ROWS = [{"srcip": "10.0.0.1", "bandwidth": 100, "sessions": 4}]
 
-        from fortianalyzer_mcp.tools.fortiview_tools import get_top_cloud_applications
+    class FakeClient:
+        """get_fortiview_data starts a task then polls fetch until 100%."""
 
-        with patch(
-            "fortianalyzer_mcp.tools.fortiview_tools.get_fortiview_data",
-            autospec=True,
-            return_value={"status": "success", "data": []},
-        ) as gfd:
-            await get_top_cloud_applications()
-        assert gfd.call_args.kwargs["view_name"] == "top-cloud-applications"
-        assert gfd.call_args.kwargs["sort_by"] == "sessions"
-        assert gfd.call_args.kwargs["sort_by"] != "bandwidth"
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self.rows = rows
+
+        async def ensure_connected(self) -> None:
+            return None
+
+        async def get_system_timezone(self) -> None:
+            return None
+
+        async def fortiview_run(self, **kwargs: object) -> dict[str, object]:
+            return {"tid": 4242}
+
+        async def fortiview_fetch(self, **kwargs: object) -> dict[str, object]:
+            return {"percentage": 100, "data": self.rows}
+
+    def _install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            fortiview_tools, "_get_client", lambda: self.FakeClient(list(self.ROWS))
+        )
+
+    async def test_default_returns_full_rows_with_a_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._install(monkeypatch)
+
+        result = await fortiview_tools.get_fortiview_data(view_name="top-sources")
+
+        assert result["data"][0]["sessions"] == 4
+        assert any("fields" in w for w in result["warnings"])
+
+    async def test_explicit_fields_select(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._install(monkeypatch)
+
+        result = await fortiview_tools.get_fortiview_data(
+            view_name="top-sources", fields=["srcip", "bandwidth"]
+        )
+
+        # Keys plus the non-PII value: `srcip` is IP-typed, so its value is
+        # rewritten by the arg unmasker under MASKING_ENABLED.
+        assert result["data"][0].keys() == {"srcip", "bandwidth"}
+        assert result["data"][0]["bandwidth"] == 100
+
+    async def test_get_fortiview_data_still_warns_because_it_has_the_parameter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The suppression is scoped to the wrappers, not to the warning."""
+        self._install(monkeypatch)
+
+        result = await fortiview_tools.get_fortiview_data(view_name="top-sources")
+
+        assert any("fields" in w for w in result["warnings"])
+
+
+class TestFortiViewWrapperEquivalence:
+    """Each removed wrapper was get_fortiview_data with a fixed view_name."""
+
+    VIEW_FOR_REMOVED_TOOL = {
+        "get_top_sources": "top-sources",
+        "get_top_destinations": "top-destinations",
+        "get_top_applications": "top-applications",
+        "get_top_threats": "top-threats",
+        "get_top_websites": "top-websites",
+        "get_top_cloud_applications": "top-cloud-applications",
+        "get_policy_hits": "policy-hits",
+    }
+
+    @pytest.mark.parametrize("view", sorted(set(VIEW_FOR_REMOVED_TOOL.values())))
+    async def test_the_replacement_reaches_each_view(
+        self, monkeypatch: pytest.MonkeyPatch, view: str
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeClient:
+            async def ensure_connected(self) -> None:
+                return None
+
+            async def get_system_timezone(self) -> None:
+                return None
+
+            async def fortiview_run(self, **kwargs: object) -> dict[str, object]:
+                captured.update(kwargs)
+                return {"tid": 1}
+
+            async def fortiview_fetch(self, **kwargs: object) -> dict[str, object]:
+                return {"percentage": 100, "data": []}
+
+        monkeypatch.setattr(fortiview_tools, "_get_client", lambda: FakeClient())
+
+        result = await fortiview_tools.get_fortiview_data(view_name=view, fields=["*"])
+
+        assert result["status"] == "success"
+        assert captured["view_name"] == view
+
+    @pytest.mark.parametrize("name", sorted(VIEW_FOR_REMOVED_TOOL))
+    def test_the_wrapper_is_gone(self, name: str) -> None:
+        assert not hasattr(fortiview_tools, name), f"{name} should have been removed"

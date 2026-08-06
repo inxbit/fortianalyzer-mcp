@@ -130,11 +130,12 @@ def test_instructions_point_large_result_sets_at_the_aggregation_tools(
 ) -> None:
     """A caller facing 100k rows should be steered off raw paging.
 
-    The policy family pre-aggregates server-side and is honest about
-    exactness; paging 100k rows through an LLM context is never the right
-    answer to a volume question.
+    analyze_policy_traffic (successor to the retired policy trio) and
+    query_logs's own group_by/sample_by pre-aggregate server-side and are
+    honest about exactness; paging 100k rows through an LLM context is never
+    the right answer to a volume question.
     """
-    assert "get_policy_traffic_profile" in instructions
+    assert "analyze_policy_traffic" in instructions
 
 
 def test_instructions_document_the_field_trim_escape_hatch(instructions: str) -> None:
@@ -253,3 +254,121 @@ class TestMaskingGuidance:
         assert "case-sensitive" in text
         # The failure mode is named, so the caller can recognise it when seen.
         assert "zero rows" in text
+
+
+def test_projection_surface_is_documented(instructions: str) -> None:
+    """A caller who does not know `fields` exists pays for every key."""
+    assert "fields" in instructions
+    assert '["*"]' in instructions or '"*"' in instructions
+
+
+def test_curated_default_is_described_as_a_default_not_a_limit(
+    instructions: str,
+) -> None:
+    """The opt-out must be discoverable in the same breath as the default."""
+    lowered = instructions.lower()
+    assert "curated" in lowered
+
+
+def test_the_projection_tool_list_matches_the_tools_that_actually_take_fields(
+    instructions: str,
+) -> None:
+    """The guide named the surface wrong in both directions before this.
+
+    It claimed "Every read tool takes `fields`" when 15 of ~85 do -- and the
+    ones an LLM reaches for most (get_top_*, list_tasks, get_alert_details,
+    get_incident) still do not. An overclaim here is worse than silence: it
+    sends the model to spend a call discovering a parameter that is not there.
+
+    Derived from the tool signatures rather than from a second hand-written
+    list, so adding or removing a `fields` parameter fails this test until the
+    guide is updated with it.
+    """
+    import ast
+    import pathlib
+
+    import fortianalyzer_mcp.tools as tools_pkg
+
+    root = pathlib.Path(next(iter(tools_pkg.__path__)))
+    taking_fields = {
+        node.name
+        for path in root.glob("*.py")
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        and "fields" in {a.arg for a in node.args.args + node.args.kwonlyargs}
+    }
+
+    assert taking_fields, "sanity: some tool must take fields"
+    missing = sorted(name for name in taking_fields if name not in instructions)
+    assert not missing, f"the usage guide does not name these fields-taking tools: {missing}"
+    assert str(len(taking_fields)) in instructions, (
+        f"{len(taking_fields)} tools take fields; the guide states a different count"
+    )
+
+
+def test_the_guide_does_not_claim_every_read_tool_takes_fields(instructions: str) -> None:
+    """The specific overclaim, frozen so it cannot come back."""
+    assert "Every read tool takes" not in instructions
+
+
+def test_response_size_and_projection_do_not_contradict_each_other(instructions: str) -> None:
+    """Two sections, six lines apart, said opposite things about the default.
+
+    ``## Projection`` said the default is curated; ``## Response size`` said
+    list_adoms and list_devices "return every field by default". Both were
+    true of different tools, which is exactly what made the pair read as a
+    contradiction. The reconciliation is that the tools with no curated
+    default are named as such in both places.
+    """
+    assert "return every field by default" not in instructions
+    projection = instructions.split("## Projection")[1].split("## Choosing")[0]
+    assert "no curated default" in projection
+    assert "list_adoms and list_devices have no curated default" in instructions
+
+
+AGGREGATION_PARAMETERS = ("group_by", "sample_by", "count_only", "top_n")
+
+CONSOLIDATED_TOOLS = (
+    "get_fortiview_data",
+    "analyze_policy_traffic",
+    "query_logs",
+)
+
+REMOVED_TOOL_NAMES = (
+    "get_top_sources",
+    "get_top_destinations",
+    "get_top_applications",
+    "get_top_threats",
+    "get_top_websites",
+    "get_top_cloud_applications",
+    "get_policy_hits",
+    "search_traffic_logs",
+    "search_security_logs",
+    "search_event_logs",
+    "get_policy_traffic_profile",
+    "get_policy_port_analysis",
+    "get_policy_protocol_summary",
+)
+
+
+@pytest.mark.parametrize("parameter", AGGREGATION_PARAMETERS)
+def test_aggregation_parameters_are_documented(instructions: str, parameter: str) -> None:
+    assert parameter in instructions, f"{parameter} missing from the usage guide"
+
+
+@pytest.mark.parametrize("name", CONSOLIDATED_TOOLS)
+def test_the_surviving_tools_are_named(instructions: str, name: str) -> None:
+    assert name in instructions
+
+
+@pytest.mark.parametrize("name", REMOVED_TOOL_NAMES)
+def test_removed_tools_are_not_recommended(instructions: str, name: str) -> None:
+    """A guide that still names a deleted tool sends every client to an error."""
+    assert name not in instructions, f"{name} was removed but is still recommended"
+
+
+def test_the_exactness_split_is_stated(instructions: str) -> None:
+    """group_by exact, sample_by bounded -- the reason there are two names."""
+    lowered = instructions.lower()
+    assert "exact" in lowered
+    assert "sample" in lowered

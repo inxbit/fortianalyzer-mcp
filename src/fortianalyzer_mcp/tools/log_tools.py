@@ -9,26 +9,38 @@ import logging
 from typing import Any
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
+from fortianalyzer_mcp.query.derive import is_derived
+from fortianalyzer_mcp.query.fields import resolve_field
 from fortianalyzer_mcp.query.filters import FilterCondition, compile_to_string
+from fortianalyzer_mcp.query.groups import (
+    VIEW_FILTER_FIELDS,
+    VIEW_SORT_DEFAULTS,
+    GroupPlan,
+    GroupSurfacePopulationMismatch,
+    UnsupportedGroupDimension,
+    aggregate_breakdowns_with_residuals,
+    resolve_group_plan,
+)
+from fortianalyzer_mcp.query.shape import fields_returned, project_rows, resolve_projection
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tool_annotations import DESTRUCTIVE, READ_ONLY
 from fortianalyzer_mcp.utils.log_clock import resolve_time_window
-from fortianalyzer_mcp.utils.responses import build_warnings, coerce_num, error_response, redact
+from fortianalyzer_mcp.utils.responses import (
+    build_warnings,
+    coerce_num,
+    error_response,
+    limit_clamped_warning,
+    redact,
+    unknown_timezone_warning,
+)
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
     build_device_filter,
     get_default_adom,
-    sanitize_filter_value,
     validate_adom,
-    validate_event_level,
-    validate_event_subtype,
-    validate_ip_or_cidr,
     validate_log_type,
     validate_pcapurl,
-    validate_port,
-    validate_severity,
-    validate_traffic_action,
 )
 
 logger = logging.getLogger(__name__)
@@ -146,6 +158,39 @@ def _clamp_limit(limit: int) -> int:
     if not isinstance(limit, int) or isinstance(limit, bool):
         return 100
     return max(1, min(limit, LOG_FETCH_LIMIT_MAX))
+
+
+def _aggregation_warnings(
+    *,
+    requested_limit: int,
+    limit: int,
+    timezone: str,
+    filter_warnings: list[str],
+) -> list[str]:
+    """The advisories every ``query_logs`` aggregation path shares.
+
+    ``build_warnings`` is the rows-path builder, and two of its four conditions
+    are not about rows at all: the limit clamp bounds a grouping's top-N and a
+    sample's scan just as it bounds a page, and the undetected-timezone caveat
+    applies to whatever the window produced. Only the rows path emitted them, so
+    a caller who passed ``limit=5000`` to ``sample_by`` was silently answered
+    from 1000 scanned rows. Its other two conditions stay out: a bare count
+    reports ``total_is_known`` structurally, and "aggregate instead of paging
+    rows" is absurd advice to someone already aggregating.
+
+    Order matches ``build_warnings`` (clamp, then timezone), with the caller's
+    filter/projection warnings after, so a response's ``warnings`` list stays
+    deterministic across paths.
+    """
+    out: list[str] = []
+    clamped = limit_clamped_warning(requested_limit, limit)
+    if clamped is not None:
+        out.append(clamped)
+    unknown_tz = unknown_timezone_warning(timezone)
+    if unknown_tz is not None:
+        out.append(unknown_tz)
+    out.extend(filter_warnings)
+    return out
 
 
 def _compute_has_more(offset: int, count: int, limit: int, total: int | None) -> bool:
@@ -409,6 +454,11 @@ async def query_logs(
     time_range: str = "1-hour",
     filter: str | None = None,
     filters: list[FilterCondition] | None = None,
+    fields: list[str] | None = None,
+    group_by: str | None = None,
+    sample_by: list[str] | None = None,
+    count_only: bool = False,
+    top_n: int = 10,
     limit: int = 100,
     offset: int = 0,
     timeout: int = DEFAULT_SEARCH_TIMEOUT,
@@ -420,18 +470,21 @@ async def query_logs(
     2. Poll for results until complete
 
     Prefer a narrower tool where one fits:
-        - Filtering only on srcip/dstip/srcport/dstport/action/policy_id ->
-          search_traffic_logs builds the filter string for you.
-        - "How much traffic did policy N carry" -> get_policy_traffic_profile,
-          get_policy_port_analysis or get_policy_protocol_summary. They
-          aggregate on the appliance and report their own exactness; paging
-          raw rows to answer a volume question wastes the context it costs.
+        - Filtering on srcip/dstip/srcport/dstport/action/policy_id -> pass
+          them as `filters` right here; that is what the structured-filter
+          surface replaced the old search_traffic_logs wrapper with.
+        - "How much traffic did policy N carry" -> analyze_policy_traffic. It
+          fans out per policy under its own bounded-scan budget and reports
+          its own exactness; paging raw rows to answer a volume question
+          wastes the context it costs. For one aggregate over a single query
+          with no policy fan-out, group_by/sample_by right here do the same
+          job.
         - IPS/attack events, especially with PCAP -> search_ips_logs.
         - Unsure what is filterable -> get_log_fields(name_filter="...").
 
     Args:
         adom: ADOM name (default: from config DEFAULT_ADOM)
-        logtype: Log type to query. Options:
+        logtype: Log type to query. The common ones:
             - "traffic": Firewall traffic logs
             - "event": System event logs
             - "attack": IPS/IDS attack logs
@@ -440,6 +493,14 @@ async def query_logs(
             - "app-ctrl": Application control logs
             - "dlp": DLP logs
             - "emailfilter": Email filter logs
+            - "dns", "ssl", "ssh", "file-filter", "waf", "netscan",
+              "security", "ztna", "gtp", "content", "voip", "sniffer",
+              "protocol", "asset", "siem", "im", "generic", "history",
+              "fct-event", "fct-traffic", "fct-netscan" are also served.
+            "anomaly", "icap" and "virtual-patch" are accepted and resolve
+            to "attack", "protocol" and "security". There is no "utm"
+            logtype -- the appliance reads it as "no logtype filter", so it
+            is rejected rather than silently widening the search.
         device: Device filter (optional). Options:
             - Serial number (recommended): "FG100FTK19001333"
             - Device name: "myfw01" or "myfw01[root]" (with VDOM)
@@ -467,12 +528,88 @@ async def query_logs(
                       {"field": "dstport", "op": "in", "value": [80, 443]}]
             English field names are accepted where unambiguous (source_ip,
             destination_port, application); get_log_fields lists the rest.
-        limit: Maximum logs to return (default: 100, max: 1000)
+        fields: Which keys each returned row should carry. Omit for a curated
+            default (the fields that answer most questions about this logtype,
+            including the ones other tools take as input); pass ["*"] for the
+            full row as before; or name the fields you want. English aliases
+            work here exactly as they do in `filters`.
+            Example: fields=["srcip", "dstip", "action", "sentbyte"]
+        group_by: Return exact per-value counts for one dimension instead of
+            rows. Only dimensions the appliance aggregates natively are
+            accepted, and each is tied to the logtype whose logs its native
+            surface actually reads:
+            - logtype="traffic": srcip, dstip, policyid, dstcountry
+            - logtype="webfilter": catdesc (alias: web_category)
+            - logtype="attack": attack, threat
+            `hostname`/`website`/`app` are deliberately absent: top-websites
+            returns web CATEGORIES and carries no hostname column, and
+            top-applications labels its rows app_group, so grouping on them
+            reported the view's buckets under the caller's dimension name
+            with is_exact=true. sample_by=["hostname"]/["app"] answers those
+            honestly.
+            Any other pairing is an error naming sample_by, including a
+            dimension that works under a different logtype -- each surface
+            aggregates its own log source, so answering across that boundary
+            would describe a different population than the logtype asked for.
+            The answer is exact because the appliance counted it.
+            Cannot be combined with `filter`/`filters`: this server has not
+            verified that the underlying view applies a logview filter rather
+            than ignoring it, and a silently ignored filter would return an
+            unfiltered top-N under is_exact=true. Use sample_by for a filtered
+            breakdown.
+            `device` is honoured; any all-devices token ("All_FortiGate",
+            "All_Device", ...) is translated to the one the view understands.
+        sample_by: Return per-value counts for one or more dimensions from a
+            bounded row scan. Unlike group_by this is a *sample*, and the
+            response says so: check is_exact and analysis_mode before quoting
+            any number. Derived dimensions work here: "port" is proto/dstport,
+            "icmp_type_code" decodes the ICMP pair FAZ hides in `service`.
+            Dimension names accept the same English aliases as fields/filters
+            and the response echoes the canonical spelling ("source_ip" groups
+            srcip, under the key "srcip"); a name outside the known field set
+            passes through with a warning naming get_log_fields, so an empty
+            bucket for it means "unrecognised", not "no values".
+        count_only: Return just the total row count for the query.
+        top_n: Buckets per dimension for sample_by (default 10). 0 returns
+            every bucket.
+        limit: Maximum logs to return (default: 100, max: 1000). With group_by
+            it caps the number of *groups* instead, since no rows are returned:
+            the response reports `group_limit` and `groups_truncated` so a cut
+            ranking is visible. With sample_by it caps the rows scanned (and so
+            drives is_exact); use top_n to cap the buckets reported. A value
+            above 1000 is clamped, not refused, on every one of those paths, and
+            `warnings` names both numbers when that happens.
         offset: Offset for pagination (default: 0)
         timeout: Search timeout in seconds (default: 60)
 
     Returns:
-        dict: Log query results with keys:
+        dict: The shape depends on which aggregation was asked for.
+
+        With group_by (exact, appliance-aggregated):
+            - status, adom, logtype, filter, time_range, timezone, warnings
+            - group_by: the canonical dimension actually grouped on
+            - groups: the appliance's own rows for that dimension
+            - group_source: "fortiview:<view>" — which surface counted it
+            - is_exact: always true here; group_by refuses anything it cannot
+              answer exactly rather than falling back to a sample
+            - group_limit, groups_truncated: the cap actually applied (the
+              clamped `limit`, which is not the caller's above 1000), and
+              whether it bound (more groups may exist; counts stay exact)
+
+        With sample_by (bounded, one row scan):
+            - status, adom, logtype, filter, time_range, timezone, warnings
+            - sample_by: the dimensions requested
+            - breakdowns: {dimension: [{"value", "hits"}, ...]}, top_n each
+            - is_exact / analysis_mode ("exact" | "bounded_sample"): read these
+              before quoting any number
+            - total_hits, total_hits_is_known, total_hit_source, observed_hits
+            - log_limit_per_slice, slices_scanned, truncated_slices, recommendation
+
+        With count_only:
+            - status, adom, logtype, filter, time_range, timezone, warnings
+            - total, total_is_known, count_source
+
+        With no aggregation, the rows shape:
             - status: "success" or "error"
             - count: Number of logs returned in this page
             - total: The handle's first-page Baseline total (int), or None if unknown.
@@ -494,6 +631,8 @@ async def query_logs(
             - has_more: Whether more results remain beyond this page
             - next_offset: Offset to pass to fetch_more_logs, or None when has_more is False
             - logs: List of log entries (bounded by `limit`)
+            - fields_returned: The keys each row carries. Reported even for a
+              zero-row page, so it still says what is queryable next.
             - adom, logtype, filter, device: Echoed query context (auditability)
             - filter: The filter string actually sent to FortiAnalyzer (the
               compiled form when `filters` was used)
@@ -543,8 +682,167 @@ async def query_logs(
                     "Use 'filters' unless you need syntax it cannot express, such as a regex match."
                 ),
             )
+        # Canonical field names behind a structured `filters`, kept so the
+        # group_by path can check them against each view's measured filter
+        # acceptance. A raw `filter` string stays None: its fields would have
+        # to be re-parsed out of syntax this server did not build, and
+        # guessing wrong there is exactly the unfiltered-top-N hazard the
+        # check exists to prevent.
+        filter_fields: frozenset[str] | None = None
         if filters:
             filter, filter_warnings = compile_to_string(filters, logtype)
+            resolved_filter_fields: set[str] = set()
+            for condition in filters:
+                try:
+                    resolved_filter_fields.add(
+                        resolve_field(logtype, condition.field, enforce_complete=False)[0]
+                    )
+                except ValidationError:
+                    resolved_filter_fields.clear()
+                    break
+            else:
+                filter_fields = frozenset(resolved_filter_fields)
+
+        # Exactly one aggregation mode, or none. Two would each describe a
+        # different response shape and there is no sensible merge.
+        chosen = [
+            name
+            for name, active in (
+                ("group_by", group_by is not None),
+                ("sample_by", bool(sample_by)),
+                ("count_only", count_only),
+            )
+            if active
+        ]
+        if len(chosen) > 1:
+            return error_response(
+                error="conflicting_aggregation",
+                message=(
+                    f"Pass at most one of group_by, sample_by or count_only; got "
+                    f"{', '.join(chosen)}. Each returns a different response shape."
+                ),
+                operation="query_logs",
+                adom=adom,
+                logtype=logtype,
+                recommendation=(
+                    "Use group_by for an exact grouping the appliance computes, "
+                    "sample_by for a bounded breakdown over a row scan, or count_only "
+                    "for just the total."
+                ),
+            )
+
+        aggregating = bool(chosen)
+        if aggregating and fields is not None:
+            # Inert rather than fatal: it describes a row shape that no rows
+            # will be returned in, which is a harmless mistake, not a wrong
+            # query.
+            filter_warnings.append(
+                f"'fields' is ignored with {chosen[0]}: no raw rows are returned."
+            )
+
+        projection: frozenset[str] | None
+        projection_warnings: list[str]
+        if aggregating:
+            projection, projection_warnings = None, []
+        else:
+            projection, projection_warnings = resolve_projection(logtype, fields)
+
+        # Validate group_by before touching the client: an unsupported dimension
+        # or an unverified filter combination is a pure input error and should
+        # be refused without ever starting a session.
+        group_plan: GroupPlan | None = None
+        if group_by is not None:
+            try:
+                group_plan = resolve_group_plan(logtype, group_by)
+            except UnsupportedGroupDimension as e:
+                # Two distinct facts, two codes: the dimension has no exact
+                # surface anywhere, or it has one that reads a different log
+                # population than this logtype. Only the second is fixed by
+                # changing logtype, and both are fixed by sample_by.
+                return error_response(
+                    error=(
+                        "group_dimension_logtype_mismatch"
+                        if isinstance(e, GroupSurfacePopulationMismatch)
+                        else "unsupported_group_dimension"
+                    ),
+                    message=str(e),
+                    operation="query_logs",
+                    adom=adom,
+                    logtype=logtype,
+                    recommendation=f"Use sample_by=['{group_by}'] for a bounded breakdown.",
+                )
+
+            # A filter is forwarded only for a (view, field) pair measured to
+            # be accepted -- see VIEW_FILTER_FIELDS. Anything else is refused:
+            # an ignored filter would return an unfiltered top-N under
+            # is_exact: true, a confident answer about a population nobody
+            # asked for. A raw `filter` string never qualifies, because its
+            # fields are not known here.
+            accepted = VIEW_FILTER_FIELDS.get(group_plan.target, frozenset())
+            if filter and not (filter_fields and filter_fields <= accepted):
+                unsupported = sorted(filter_fields - accepted) if filter_fields else []
+                return error_response(
+                    error="unsupported_view_filter",
+                    message=(
+                        f"group_by='{group_by}' dispatches to the FortiView view "
+                        f"'{group_plan.target}', which "
+                        + (
+                            f"does not accept a filter on {', '.join(unsupported)}"
+                            if unsupported
+                            else "has no measured filter acceptance for the fields given"
+                        )
+                        + ". Refusing rather than returning a top-N that may cover "
+                        "unfiltered traffic."
+                        + (
+                            ""
+                            if filter_fields
+                            else " Pass 'filters' rather than a raw 'filter' string: the "
+                            "fields of a raw string cannot be checked against the view."
+                        )
+                    ),
+                    operation="query_logs",
+                    adom=adom,
+                    logtype=logtype,
+                    recommendation=(
+                        (
+                            f"This view accepts a filter on {', '.join(sorted(accepted))}. "
+                            if accepted
+                            else ""
+                        )
+                        + f"Otherwise drop the filter to group the whole window, or use "
+                        f"sample_by=['{group_by}'] which applies the filter and labels the "
+                        "result as a bounded sample."
+                    ),
+                )
+
+        # sample_by dimensions resolve through the same vocabulary as fields
+        # and filters, so an alias ("source_ip") extracts values and the
+        # breakdown key comes back canonical ("srcip"). Both halves matter:
+        # unresolved, the alias did a raw row.get and answered with an empty
+        # bucket; resolved for extraction but echoed as spelled, the key would
+        # sit outside the masking allowlist and the bucket values would leak.
+        if sample_by:
+            resolved_dimensions: list[str] = []
+            seen_dimensions: set[str] = set()
+            for dimension in sample_by:
+                if is_derived(dimension):
+                    derived = dimension.strip().lower()
+                    if derived not in seen_dimensions:
+                        seen_dimensions.add(derived)
+                        resolved_dimensions.append(derived)
+                    continue
+                canonical, dimension_warning = resolve_field(
+                    logtype, dimension, enforce_complete=False
+                )
+                if dimension_warning is not None:
+                    filter_warnings.append(dimension_warning)
+                # An alias and its canonical name are one dimension. Without
+                # this they were echoed twice in sample_by and the rows
+                # scanned twice, while breakdowns collapsed to one key anyway.
+                if canonical not in seen_dimensions:
+                    seen_dimensions.add(canonical)
+                    resolved_dimensions.append(canonical)
+            sample_by = resolved_dimensions
 
         client = _get_client()
         await client.ensure_connected()
@@ -578,6 +876,115 @@ async def query_logs(
         offset = max(0, offset)
         timeout = _clamp_timeout(timeout)
 
+        if group_plan is not None:
+            # Call the run/poll/fetch implementation directly, not the
+            # get_fortiview_data tool wrapper: the wrapper re-resolves
+            # time_range itself via _parse_time_range, which anchors relative
+            # presets on FortiView's own FAZ-system-tz "now" -- a different
+            # clock than resolve_time_window's log-clock anchor already used
+            # above. Passing the raw time_range string through would let
+            # FortiView scan a window that silently differs from the
+            # time_range_dict/tz_name this response echoes, which is_exact:
+            # true cannot afford. Threading time_range_dict keeps the two in
+            # lockstep.
+            from fortianalyzer_mcp.tools.fortiview_tools import _get_fortiview_data_impl
+
+            view: dict[str, Any] = await _get_fortiview_data_impl(
+                client=client,
+                adom=adom,
+                view_name=group_plan.target,
+                # The plan carries FortiView's own all-devices token, and
+                # build_fortiview_device_filter inside the impl translates any
+                # remaining logview spelling (All_FortiGate, All_FortiMail) to
+                # the same All_Device. Either layer alone would do; both are
+                # kept because the wrong spelling is not an error -- it is an
+                # empty top-N that reads as "no traffic".
+                device=device or group_plan.all_devices_group,
+                tr=time_range_dict,
+                filter=filter,
+                limit=limit,
+                timeout=30,
+                # The retired get_top_* wrapper for this view hard-coded a
+                # sort; without it the response claimed "top N groups" over
+                # appliance-default ordering (#109 review).
+                sort_by=VIEW_SORT_DEFAULTS.get(group_plan.target),
+                sort_order="desc",
+                field_names=["*"],
+            )
+            if view.get("status") != "success":
+                # Re-wrap rather than pass through verbatim: the FortiView
+                # helper's own failure shapes ({"status": "error"|"timeout",
+                # "message": ...}) carry none of query_logs's envelope fields
+                # (error code, operation, retry_count), and forwarding them
+                # unwrapped would break that contract on this one path.
+                return error_response(
+                    error=(
+                        "search_timeout"
+                        if view.get("status") == "timeout"
+                        else "fortiview_query_failed"
+                    ),
+                    message=(
+                        view.get("message")
+                        or f"FortiView query for view '{group_plan.target}' did not succeed."
+                    ),
+                    operation="query_logs",
+                    adom=adom,
+                    logtype=logtype,
+                    time_range=time_range_dict,
+                    timezone=tz_name,
+                )
+
+            groups = view.get("data", [])
+            if not isinstance(groups, list):
+                groups = [groups] if groups else []
+
+            # `limit` is the row limit on the rows path; here it is the view's
+            # top-N cap, so a full-length list means the ranking was cut off.
+            # This does NOT weaken is_exact: every count returned is the
+            # appliance's own exact count for that group. What may be missing
+            # is *groups*, not accuracy -- so it gets its own flag rather than
+            # a downgrade of the exactness claim.
+            groups_truncated = len(groups) >= limit
+            group_warnings = _aggregation_warnings(
+                requested_limit=requested_limit,
+                limit=limit,
+                timezone=tz_name,
+                filter_warnings=filter_warnings,
+            )
+            if groups_truncated:
+                # Say which cap bound, and never advise raising a limit that is
+                # already at the ceiling: `limit` here is the CLAMPED value, so
+                # attributing it to the caller reads as a lie to anyone who
+                # asked for more than 1000 and got 1000.
+                group_warnings.append(
+                    f"Returned the top {limit} groups, the most this server requests from "
+                    "a view; further groups may exist below them. Narrow the time window "
+                    "to bring the tail into range. Each count shown is still exact."
+                    if limit >= LOG_FETCH_LIMIT_MAX
+                    else f"Returned the top {limit} groups, the effective `limit`; further "
+                    f"groups may exist below them. Raise limit (max {LOG_FETCH_LIMIT_MAX}) "
+                    "for a longer ranking. Each count shown is still exact."
+                )
+
+            return {
+                "status": "success",
+                "adom": adom,
+                "logtype": logtype,
+                "group_by": group_plan.dimension,
+                "groups": groups,
+                "group_source": f"fortiview:{group_plan.target}",
+                # The appliance aggregated this. That is the whole reason
+                # group_by refuses dimensions with no native surface.
+                "is_exact": True,
+                # How many groups were asked for, and whether that cap bound.
+                "group_limit": limit,
+                "groups_truncated": groups_truncated,
+                "time_range": time_range_dict,
+                "timezone": tz_name,
+                "filter": filter,
+                "warnings": group_warnings,
+            }
+
         # Run this page as a self-contained search (FAZ tids are single-use).
         logger.info(
             f"Starting log search: adom={adom}, logtype={logtype}, "
@@ -606,7 +1013,86 @@ async def query_logs(
                 timezone=tz_name,
             )
 
-        logs = page["logs"]
+        if count_only:
+            total = page["total"]
+            return {
+                "status": "success",
+                "adom": adom,
+                "logtype": logtype,
+                "total": total,
+                "total_is_known": total is not None,
+                "count_source": "logsearch_total_count",
+                "time_range": time_range_dict,
+                "timezone": tz_name,
+                "filter": filter,
+                "warnings": _aggregation_warnings(
+                    requested_limit=requested_limit,
+                    limit=limit,
+                    timezone=tz_name,
+                    filter_warnings=filter_warnings,
+                ),
+            }
+
+        if sample_by:
+            rows = page["logs"]
+            observed = len(rows)
+            total = page["total"]
+            total_known = total is not None
+            # One page, one window: exact only when the appliance's own total
+            # equals what we actually scanned. A full page means rows were
+            # left behind, so nothing here may claim exactness.
+            truncated = observed >= limit
+            is_exact = total_known and not truncated and total == observed
+            breakdowns, breakdown_residuals = aggregate_breakdowns_with_residuals(
+                rows, list(sample_by), top_n=top_n
+            )
+            # total_hits is documented as a floor, so it can never sit below
+            # the rows actually observed. analyze_policy_traffic has carried
+            # this shim since v2.4.1; this path had no equivalent, so an
+            # appliance that under-reported total-count published a floor that
+            # was not one (#109 review).
+            resolved_total = max(total, observed) if total_known and total is not None else observed
+            if total_known and total is not None and total < observed:
+                logger.warning(
+                    f"logsearch total-count {total} below observed rows {observed}; "
+                    "clamping to observed"
+                )
+            return {
+                "status": "success",
+                "adom": adom,
+                "logtype": logtype,
+                "sample_by": list(sample_by),
+                "breakdowns": breakdowns,
+                # What each breakdown left out: rows the dimension did not
+                # apply to, and values cut by top_n. Without them a top_n cut
+                # is indistinguishable from "nothing else matched" (#109).
+                "breakdown_residuals": breakdown_residuals,
+                "is_exact": is_exact,
+                "analysis_mode": "exact" if is_exact else "bounded_sample",
+                "total_hits": resolved_total,
+                "total_hits_is_known": total_known,
+                "total_hit_source": "logsearch_total_count" if total_known else "observed_rows",
+                "observed_hits": observed,
+                "log_limit_per_slice": limit,
+                "slices_scanned": 1,
+                "truncated_slices": 1 if truncated else 0,
+                "recommendation": (
+                    "Narrow the time window or raise limit for a closer count."
+                    if not is_exact
+                    else ""
+                ),
+                "time_range": time_range_dict,
+                "timezone": tz_name,
+                "filter": filter,
+                "warnings": _aggregation_warnings(
+                    requested_limit=requested_limit,
+                    limit=limit,
+                    timezone=tz_name,
+                    filter_warnings=filter_warnings,
+                ),
+            }
+
+        logs = project_rows(page["logs"], projection)
         count = len(logs)
         total = page["total"]
         total_is_known = total is not None
@@ -629,6 +1115,7 @@ async def query_logs(
             has_more=has_more,
         )
         warnings.extend(filter_warnings)
+        warnings.extend(projection_warnings)
         if count == 0 and total_is_known and total is not None and total > offset:
             warnings.append(
                 "FortiAnalyzer reports more matching rows beyond this offset but returned "
@@ -650,6 +1137,7 @@ async def query_logs(
                 "time_basis_source": time_basis_source,
                 "clock_skew_seconds": clock_skew_seconds,
                 "initial_total": total,
+                "fields": fields,
             },
         )
 
@@ -669,6 +1157,7 @@ async def query_logs(
             "has_more": has_more,
             "next_offset": next_offset,
             "logs": logs,
+            "fields_returned": fields_returned(logs, projection),
             "adom": adom,
             "logtype": logtype,
             "filter": filter,
@@ -758,6 +1247,7 @@ async def fetch_more_logs(
     tid: int = 0,
     limit: int = 100,
     offset: int = 0,
+    fields: list[str] | None = None,
     timeout: int = DEFAULT_SEARCH_TIMEOUT,
 ) -> dict[str, Any]:
     """Fetch another page of a previous query_logs search using its handle.
@@ -774,6 +1264,9 @@ async def fetch_more_logs(
         tid: Reusable pagination handle from a previous query_logs call
         limit: Maximum logs to return (default: 100)
         offset: Offset for pagination (default: 0)
+        fields: Override the projection for this page. Omit to reuse the
+            projection the original query_logs call resolved, so a later page
+            has the same shape as the first.
         timeout: Search timeout in seconds (default: 60) -- raise it to page over
             large windows (e.g. 30-day) that take longer than the default to scan
 
@@ -782,6 +1275,8 @@ async def fetch_more_logs(
             - status: "success" or "error"
             - count: Number of logs returned in this page
             - logs: List of log entries
+            - fields_returned: The keys each row carries. Reported even for a
+              zero-row page, so it still says what is queryable next.
             - tid, adom, logtype, filter, device: Echoed pagination context
             - total: The handle's first-page Baseline total (stays fixed across pages;
               None if no baseline was ever captured). It is NOT this page's live count.
@@ -831,6 +1326,9 @@ async def fetch_more_logs(
                 "search handle is not known to this server process",
             )
 
+        effective_fields = fields if fields is not None else context.get("fields")
+        projection, projection_warnings = resolve_projection(context["logtype"], effective_fields)
+
         # The handle is bound to the ADOM query_logs ran under: comparing a
         # baseline from one ADOM against a page from another is meaningless.
         if adom is None:
@@ -878,7 +1376,7 @@ async def fetch_more_logs(
                 tid=tid,
             )
 
-        logs = page["logs"]
+        logs = project_rows(page["logs"], projection)
         count = len(logs)
         page_total = page["total"]
         initial_total = context.get("initial_total")
@@ -937,6 +1435,7 @@ async def fetch_more_logs(
             timezone=timezone,
             has_more=has_more,
         )
+        warnings.extend(projection_warnings)
         if count == 0 and paging_total is not None and paging_total > offset:
             warnings.append(
                 "FortiAnalyzer reports more matching rows beyond this offset but returned "
@@ -966,6 +1465,7 @@ async def fetch_more_logs(
             "status": "success",
             "count": count,
             "logs": logs,
+            "fields_returned": fields_returned(logs, projection),
             "tid": tid,
             "adom": adom,
             "logtype": context.get("logtype"),
@@ -1230,322 +1730,6 @@ async def get_log_fields(
     except Exception as e:
         logger.error(f"Failed to get log fields: {e}")
         return {"status": "error", "message": redact(str(e))}
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def search_traffic_logs(
-    adom: str | None = None,
-    srcip: str | None = None,
-    dstip: str | None = None,
-    srcport: int | None = None,
-    dstport: int | None = None,
-    action: str | None = None,
-    policy_id: int | None = None,
-    device: str | None = None,
-    time_range: str = "1-hour",
-    limit: int = 100,
-    timeout: int = DEFAULT_SEARCH_TIMEOUT,
-) -> dict[str, Any]:
-    """Search traffic logs with common filter criteria.
-
-    Convenience function for searching traffic logs with typical
-    network-based filters. Wraps query_logs, so the returned `tid` is the same
-    reusable pagination handle and works with fetch_more_logs.
-
-    Prefer get_policy_traffic_profile over this when the question is how much
-    a policy carried rather than which rows matched -- it aggregates on the
-    appliance instead of returning rows to be counted here.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        srcip: Source IP address filter
-        dstip: Destination IP address filter
-        srcport: Source port filter
-        dstport: Destination port filter
-        action: Action filter ("accept", "deny", "drop", "close")
-        policy_id: Policy ID filter
-        device: Device filter (serial number like "FG100FTK19001333" or name like "myfw01")
-        time_range: Time range (default: "1-hour")
-        limit: Maximum logs to return (default: 100)
-        timeout: Search timeout in seconds (default: 60)
-
-    Returns:
-        dict: Log search results with keys:
-            - status: "success" or "error"
-            - count: Number of logs found
-            - logs: List of traffic log entries
-            - filter_applied: Filter string used
-            - tid: Reusable pagination handle -- this tool wraps query_logs,
-              so the tid pages onward with fetch_more_logs like any
-              query_logs tid (it is NOT an appliance task id)
-            - message: Error message if failed
-
-    Example:
-        >>> # Find denied traffic from specific IP
-        >>> result = await search_traffic_logs(
-        ...     srcip="192.168.1.100",
-        ...     action="deny",
-        ...     time_range="24-hour"
-        ... )
-    """
-    try:
-        adom = validate_adom(adom or get_default_adom())
-        # Build filter string using FortiAnalyzer syntax.
-        # Every caller-supplied value is validated/sanitized before
-        # interpolation to prevent filter injection.
-        filters = []
-        if srcip:
-            filters.append(f"srcip=={validate_ip_or_cidr(srcip, 'srcip')}")
-        if dstip:
-            filters.append(f"dstip=={validate_ip_or_cidr(dstip, 'dstip')}")
-        if srcport:
-            filters.append(f"srcport=={validate_port(srcport, 'srcport')}")
-        if dstport:
-            filters.append(f"dstport=={validate_port(dstport, 'dstport')}")
-        if action:
-            filters.append(f"action=={validate_traffic_action(action)}")
-        if policy_id is not None:
-            if isinstance(policy_id, bool) or not isinstance(policy_id, int) or policy_id < 0:
-                raise ValidationError(
-                    f"Invalid policy_id '{policy_id}'. Must be a non-negative integer."
-                )
-            filters.append(f"policyid=={policy_id}")
-
-        filter_str = " and ".join(filters) if filters else None
-
-        result: dict[str, Any] = await query_logs(
-            adom=adom,
-            logtype="traffic",
-            device=device,
-            time_range=time_range,
-            filter=filter_str,
-            limit=limit,
-            timeout=timeout,
-        )
-
-        if result.get("status") == "success":
-            result["filter_applied"] = filter_str or "none"
-
-        return result
-
-    except ValidationError as e:
-        return error_response(
-            error="validation_error",
-            message=f"Validation error: {e}",
-            operation="search_traffic_logs",
-            adom=adom,
-        )
-    except Exception as e:
-        logger.error(f"Failed to search traffic logs: {e}")
-        return error_response(
-            error="faz_operation_failed",
-            message=str(e),
-            operation="search_traffic_logs",
-            adom=adom,
-            retry_count=getattr(e, "retries_attempted", 0),
-        )
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def search_security_logs(
-    adom: str | None = None,
-    attack_name: str | None = None,
-    severity: str | None = None,
-    srcip: str | None = None,
-    dstip: str | None = None,
-    device: str | None = None,
-    time_range: str = "24-hour",
-    limit: int = 100,
-    timeout: int = DEFAULT_SEARCH_TIMEOUT,
-) -> dict[str, Any]:
-    """Search security logs (IPS, AV, etc.) with common filters.
-
-    Search for security events including intrusion attempts,
-    malware detections, and other security-related logs.
-
-    For IPS specifically, search_ips_logs filters on more dimensions (CVE,
-    PCAP availability, multiple severities at once) and its results feed the
-    PCAP downloaders. Use this one when you want a single logtype's events
-    across the broader security vocabularies.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        attack_name: Attack/signature name filter
-        severity: Severity filter ("critical", "high", "medium", "low", "info")
-        srcip: Source IP address filter
-        dstip: Destination IP address filter
-        device: Device filter (serial number like "FG100FTK19001333" or name like "myfw01")
-        time_range: Time range (default: "24-hour")
-        limit: Maximum logs to return (default: 100)
-        timeout: Search timeout in seconds (default: 60)
-
-    Returns:
-        dict: Security log results with keys:
-            - status: "success" or "error"
-            - count: Number of security events found
-            - logs: List of security log entries
-            - filter_applied: Filter string used
-            - tid: Reusable pagination handle -- this tool wraps query_logs,
-              so the tid pages onward with fetch_more_logs like any
-              query_logs tid (it is NOT an appliance task id)
-            - message: Error message if failed
-
-    Example:
-        >>> # Find critical security events
-        >>> result = await search_security_logs(
-        ...     severity="critical",
-        ...     time_range="7-day"
-        ... )
-    """
-    try:
-        adom = validate_adom(adom or get_default_adom())
-        # Build filter string. Every caller-supplied value is validated or
-        # sanitized before interpolation to prevent filter injection.
-        filters = []
-        if attack_name:
-            # ``contain`` is inert: the logview parser accepts it and then
-            # matches nothing, so this answered "no such attack" with total
-            # confidence. Same remedy and same emitted form as
-            # query.filters.compile_to_string -- ``like`` with ``%`` wildcards,
-            # the wildcards sanitised together with the value so the pattern is
-            # one escaped literal that cannot terminate its own clause.
-            # Measured on 7.6.6 over one fixed hour (289391 rows):
-            # ``service contain DNS`` -> 0, ``service like "%DNS%"`` -> 120671.
-            pattern = sanitize_filter_value(f"%{attack_name}%", "attack_name")
-            filters.append(f"attack like {pattern}")
-        if severity:
-            filters.append(f"severity=={validate_severity(severity)}")
-        if srcip:
-            filters.append(f"srcip=={validate_ip_or_cidr(srcip, 'srcip')}")
-        if dstip:
-            filters.append(f"dstip=={validate_ip_or_cidr(dstip, 'dstip')}")
-
-        filter_str = " and ".join(filters) if filters else None
-
-        result: dict[str, Any] = await query_logs(
-            adom=adom,
-            logtype="attack",
-            device=device,
-            time_range=time_range,
-            filter=filter_str,
-            limit=limit,
-            timeout=timeout,
-        )
-
-        if result.get("status") == "success":
-            result["filter_applied"] = filter_str or "none"
-
-        return result
-
-    except ValidationError as e:
-        return error_response(
-            error="validation_error",
-            message=f"Validation error: {e}",
-            operation="search_security_logs",
-            adom=adom,
-        )
-    except Exception as e:
-        logger.error(f"Failed to search security logs: {e}")
-        return error_response(
-            error="faz_operation_failed",
-            message=str(e),
-            operation="search_security_logs",
-            adom=adom,
-            retry_count=getattr(e, "retries_attempted", 0),
-        )
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def search_event_logs(
-    adom: str | None = None,
-    subtype: str | None = None,
-    level: str | None = None,
-    device: str | None = None,
-    time_range: str = "24-hour",
-    limit: int = 100,
-    timeout: int = DEFAULT_SEARCH_TIMEOUT,
-) -> dict[str, Any]:
-    """Search system event logs.
-
-    Search for system events including configuration changes,
-    admin actions, system status changes, and VPN events.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        subtype: Event subtype filter. Options:
-            - "system": System events
-            - "vpn": VPN events
-            - "user": User/auth events
-            - "router": Routing events
-            - "wireless": Wireless events
-        level: Event level filter ("emergency", "alert", "critical",
-               "error", "warning", "notice", "information", "debug")
-        device: Device filter (serial number like "FG100FTK19001333" or name like "myfw01")
-        time_range: Time range (default: "24-hour")
-        limit: Maximum logs to return (default: 100)
-        timeout: Search timeout in seconds (default: 60)
-
-    Returns:
-        dict: Event log results with keys:
-            - status: "success" or "error"
-            - count: Number of events found
-            - logs: List of event log entries
-            - filter_applied: Filter string used
-            - tid: Reusable pagination handle -- this tool wraps query_logs,
-              so the tid pages onward with fetch_more_logs like any
-              query_logs tid (it is NOT an appliance task id)
-            - message: Error message if failed
-
-    Example:
-        >>> # Find VPN-related events
-        >>> result = await search_event_logs(
-        ...     subtype="vpn",
-        ...     time_range="7-day"
-        ... )
-    """
-    try:
-        adom = validate_adom(adom or get_default_adom())
-        # Build filter string. Caller-supplied values are validated against
-        # allowlists before interpolation to prevent filter injection.
-        filters = []
-        if subtype:
-            filters.append(f"subtype=={validate_event_subtype(subtype)}")
-        if level:
-            filters.append(f"level=={validate_event_level(level)}")
-
-        filter_str = " and ".join(filters) if filters else None
-
-        result: dict[str, Any] = await query_logs(
-            adom=adom,
-            logtype="event",
-            device=device,
-            time_range=time_range,
-            filter=filter_str,
-            limit=limit,
-            timeout=timeout,
-        )
-
-        if result.get("status") == "success":
-            result["filter_applied"] = filter_str or "none"
-
-        return result
-
-    except ValidationError as e:
-        return error_response(
-            error="validation_error",
-            message=f"Validation error: {e}",
-            operation="search_event_logs",
-            adom=adom,
-        )
-    except Exception as e:
-        logger.error(f"Failed to search event logs: {e}")
-        return error_response(
-            error="faz_operation_failed",
-            message=str(e),
-            operation="search_event_logs",
-            adom=adom,
-            retry_count=getattr(e, "retries_attempted", 0),
-        )
 
 
 @mcp.tool(annotations=READ_ONLY)

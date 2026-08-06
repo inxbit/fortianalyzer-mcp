@@ -13,8 +13,11 @@ to strip out of free text once we know what it masks to:
    depth, and composite keys are parsed and masked part by part
    (``groupby1``/``groupby2`` are ``"<field>:<value>"``, ``grpby`` is an
    embedded JSON blob, ``target`` is a list of ``{name, value}``,
-   ``devvds`` is ``"<devname>[<vdom>]"``). Every real value masked here is
-   recorded in a response-scoped raw-to-token map.
+   ``devvds`` is ``"<devname>[<vdom>]"``, ``breakdowns`` is
+   ``{dimension: [{"value", "hits"}, ...]}`` from ``analyze_policy_traffic``
+   and ``query_logs(sample_by=...)``, the dimension name typing each
+   bucket's ``"value"``). Every real value masked here is recorded in a
+   response-scoped raw-to-token map.
 2. **Free-text pass.** ``msg``, ``logdesc``, ``subject``, ``extrainfo``,
    the echoed ``filter`` strings and friends get an in-place scan for
    embedded IPv4s, MACs and emails, then every raw value from pass 1 is
@@ -23,6 +26,17 @@ to strip out of free text once we know what it masks to:
    but you can replace the exact strings you just masked elsewhere in the
    same response. It also removes the "masked under one key, cleartext two
    keys away" failure that a leak test over live alert records exposed.
+   Two keys are handled in this pass rather than the first because their
+   values name their own field and a pass-1 token would be scanned twice:
+   ``filter_applied``'s compiled entries, and the buckets of a ``breakdowns``
+   dimension typed TEXT.
+
+One assumption runs through every pass here: **dict keys are strings.** Each
+key-matching site calls ``key.lower()`` unguarded, which holds because a tool
+result is JSON-shaped, and JSON has no other kind of key. The two breakdown
+handlers do check ``isinstance(dimension, str)`` — not as defence against a
+malformed response, but because those particular keys are dimension names a
+tool built in-process from caller input, so they never came off the wire.
 
 Fail-closed by construction:
 
@@ -57,6 +71,7 @@ from functools import wraps
 from typing import Any
 
 from fortianalyzer_mcp.masking.fields import (
+    COMPOSITE_BREAKDOWNS,
     COMPOSITE_DEVICE_VDOM,
     COMPOSITE_FILTER_ENTRIES,
     COMPOSITE_JSON,
@@ -95,9 +110,69 @@ _MIN_SUBSTITUTION_LEN = 4
 
 _PLACEHOLDER_MARK = "masked-unrepresentable-"
 
+#: Dimension names whose flat key is served by a composite handler rather
+#: than by a ``FIELD_TYPES`` entry. ``_mask_breakdowns`` has to consult this
+#: as well as the type table: a bucket under ``url`` carries exactly what a
+#: flat ``url`` carries, and typing it from ``FIELD_TYPES`` alone found
+#: nothing and passed it through in clear (#109 review). ``COMPOSITE_TARGET``
+#: and ``COMPOSITE_BREAKDOWNS`` are deliberately absent -- neither names a
+#: log field, so neither can be a breakdown dimension.
+_COMPOSITE_DIMENSIONS: frozenset[str] = frozenset(
+    (
+        *COMPOSITE_URL_HOST,
+        *COMPOSITE_URL_FULL,
+        *COMPOSITE_DEVICE_VDOM,
+        *COMPOSITE_PREFIXED,
+        *COMPOSITE_JSON,
+    )
+)
+
 #: Structural shape of a prefix-marked token: ``<marker>-<4-hex-kid>-``.
 #: "host-fw01" has no kid group and is a legitimate name, not a token.
 _TOKEN_PREFIX_SHAPE_RE = re.compile(r"^(?:host|user|url)-[0-9a-f]{4}-")
+
+
+#: Keys that prove a dict is a dvmdb device object, so its ``name`` is the
+#: device's name rather than an ADOM's, a report layout's or a device
+#: group's. Every one of these is device-only: none appears on an ADOM row
+#: (``name``/``desc``/``oid``), a report layout or a group (``name``/
+#: ``member``). One is enough -- a record carrying ``sn`` or ``platform_str``
+#: is not something else wearing a device's clothes.
+_DEVICE_SHAPE_SIBLINGS: frozenset[str] = frozenset(
+    {
+        "sn",
+        "serialno",
+        "os_ver",
+        "os_type",
+        "platform_str",
+        "conn_status",
+        "dev_status",
+        "ha_mode",
+        "mr",
+        "patch",
+    }
+)
+
+
+def _device_name_in(obj: dict[str, Any]) -> str | None:
+    """Original spelling of a device-proving ``name`` key, or None.
+
+    ``name`` cannot be typed key-name-globally: dvmdb uses it for a device,
+    but it is equally the ADOM key, the report-layout key and the
+    device-group key. Masking it everywhere under
+    ``FAZ_MASK_DEVICE_IDENTITY`` tokenises ADOM names and *burns* a report
+    layout ("Monthly Security Report" is not a valid hostname, so it becomes
+    an irreversible placeholder), and with the flag off it would put every
+    such string into the keep set, exempting arbitrary values from masking
+    elsewhere. The record decides instead, the same way
+    ``incident_reporter`` is decided by its siblings (#109 review).
+    """
+    key = _find_key(obj, "name")
+    if key is None or not isinstance(obj[key], str) or not obj[key].strip():
+        return None
+    if not _DEVICE_SHAPE_SIBLINGS & {k.lower() for k in obj if isinstance(k, str)}:
+        return None
+    return key
 
 
 def _find_key(obj: dict[str, Any], name: str) -> str | None:
@@ -241,6 +316,96 @@ class OutputMasker:
             device = self._mask_scalar(HOSTNAME, match.group("dev"), mapping)
             out.append(f"{device}[{match.group('vdom')}]")
         return ",".join(out)
+
+    def _mask_breakdowns(self, value: Any, mapping: dict[str, str], keep: frozenset[str]) -> Any:
+        """``{dimension: [{"value": ..., "hits": N}, ...]}`` (#98).
+
+        ``analyze_policy_traffic`` and ``query_logs(sample_by=...)`` both
+        return this shape. The dimension name -- the dict key one level up
+        from each bucket -- decides the type of that bucket's ``"value"``,
+        the same "field decides the paired value's type" rule ``groupby1``
+        already applies, just with the field name sitting one level up
+        instead of packed into the string.
+
+        Deliberately not a "burn what we do not recognise" handler like
+        ``_mask_target``: ``sample_by``/``group_by`` let a caller group on
+        almost any field (``port``, ``service``, ``app``, ``proto``, a
+        derived dimension with no field type at all), and most of those are
+        not identifiers. A dimension absent from the type table -- because
+        it is not in ``FIELD_TYPES``, or is a device-identity field and
+        ``FAZ_MASK_DEVICE_IDENTITY`` is off -- passes its bucket values
+        through untouched rather than being burned to a placeholder. That
+        table already merges in ``DEVICE_IDENTITY_TYPES`` only when the flag
+        is set (see ``__init__``), so the device-identity keep-set applies to
+        a dimension name exactly as it does to a flat field, with no
+        separate check needed here.
+
+        A TEXT dimension is skipped here but *not* passed through: its values
+        are prose with no scalar type to mask by, so they are scanned in pass
+        2 by :meth:`_mask_breakdown_text`, exactly as the same string would be
+        under a flat ``msg``/``ui``/``subject`` key. Leaving them to this pass
+        was the gap the #109 review found.
+
+        The bucket ``"value"`` goes through :meth:`_mask_entry` under the
+        dimension's own name rather than through a ``FIELD_TYPES`` lookup, so
+        the rule above holds literally: a bucket value gets exactly what the
+        same value gets under a flat key of that name. Typing it from
+        ``FIELD_TYPES`` alone missed every composite-served key -- ``url``,
+        ``referralurl``, ``http_url``, ``link``, ``devvds`` have no entry
+        there -- and passed them through in clear beside the token the same
+        host carried elsewhere in the response, with ``hits`` as the join key.
+        The ``keep`` check stays wrapped around the call. Since #112
+        ``_mask_entry`` refuses a kept value on its typed-scalar path itself,
+        so for a typed dimension the two agree; the wrapper is load-bearing
+        for a *composite* dimension, whose handlers still do not consult the
+        keep set, and a value left clear under one key must never be masked
+        under another.
+
+        A shape this handler cannot type -- a non-dict bucket, or a
+        ``buckets`` that is not a list -- burns when the dimension IS typed or
+        composite, the same fail-closed policy ``_mask_target`` and the URL
+        dict branch follow (#104). Under an untyped dimension it still passes
+        through: burning there would placeholder every legitimate
+        non-identifier breakdown.
+        """
+        if not isinstance(value, dict):
+            return self._mask_structured(value, mapping, keep)
+        out: dict[str, Any] = {}
+        for dimension, buckets in value.items():
+            lowered = dimension.strip().lower() if isinstance(dimension, str) else ""
+            vtype = self._field_types.get(lowered)
+            handled = (vtype is not None and vtype != TEXT) or lowered in _COMPOSITE_DIMENSIONS
+            if not handled:
+                out[dimension] = self._mask_structured(buckets, mapping, keep)
+                continue
+            if not isinstance(buckets, list):
+                out[dimension] = self._burn_strings(buckets, keep)
+                continue
+            masked_buckets: list[Any] = []
+            for bucket in buckets:
+                if not isinstance(bucket, dict):
+                    masked_buckets.append(self._burn_strings(bucket, keep))
+                    continue
+                entry: dict[str, Any] = {}
+                for bkey, bvalue in bucket.items():
+                    if bkey.lower() == "value" and isinstance(bvalue, str):
+                        entry[bkey] = (
+                            bvalue
+                            if bvalue in keep
+                            else self._mask_entry(lowered, bvalue, mapping, keep)
+                        )
+                    else:
+                        # Today's producers emit only {value, hits}, but a
+                        # type-specific branch must preserve the walk for the
+                        # shapes it does not consume (#83's lesson): before
+                        # this handler existed a typed sibling key masked via
+                        # the allowlist walk, and copying it verbatim here
+                        # would have quietly re-opened it. `hits` is an int
+                        # and passes through _mask_entry untouched.
+                        entry[bkey] = self._mask_entry(bkey, bvalue, mapping, keep)
+                masked_buckets.append(entry)
+            out[dimension] = masked_buckets
+        return out
 
     def _burn_strings(self, value: Any, keep: frozenset[str]) -> Any:
         if isinstance(value, str):
@@ -511,6 +676,9 @@ class OutputMasker:
 
         def walk(node: Any) -> None:
             if isinstance(node, dict):
+                shaped = _device_name_in(node)
+                if shaped is not None:
+                    out.add(node[shaped].strip())
                 for key, value in node.items():
                     if key.lower() in DEVICE_IDENTITY_TYPES:
                         if isinstance(value, str):
@@ -548,6 +716,7 @@ class OutputMasker:
             paired = self._mask_threat_pair(obj, mapping)
             paired.update(self._mask_incident_reporter(obj, mapping))
             paired.update(self._mask_indicator_pair(obj, mapping))
+            paired.update(self._mask_device_name(obj, mapping))
             return {
                 key: paired[key] if key in paired else self._mask_entry(key, value, mapping, keep)
                 for key, value in obj.items()
@@ -555,6 +724,26 @@ class OutputMasker:
         if isinstance(obj, list):
             return [self._mask_structured(item, mapping, keep) for item in obj]
         return obj
+
+    def _mask_device_name(self, obj: dict[str, Any], mapping: dict[str, str]) -> dict[str, str]:
+        """``name``: masked only when the record proves it a device object.
+
+        Device identity follows ``FAZ_MASK_DEVICE_IDENTITY``, so with the
+        flag off this returns nothing and the value additionally joins the
+        keep set (see :meth:`_device_identity_values`), which is what stops
+        the same name masking under ``target[].value`` two keys away. With
+        the flag on it carries the identical token its ``devname`` sibling
+        carries, because both go through ``_mask_scalar(HOSTNAME, ...)``.
+
+        See :func:`_device_name_in` for why the shape, not the key name,
+        decides.
+        """
+        if not self._mask_device_identity:
+            return {}
+        key = _device_name_in(obj)
+        if key is None:
+            return {}
+        return {key: self._mask_scalar(HOSTNAME, obj[key], mapping)}
 
     def _mask_incident_reporter(
         self, obj: dict[str, Any], mapping: dict[str, str]
@@ -830,6 +1019,8 @@ class OutputMasker:
             return self._burn_strings(value, keep)
         if lowered in COMPOSITE_DEVICE_VDOM and isinstance(value, str):
             return self._mask_device_vdom(value, mapping)
+        if lowered in COMPOSITE_BREAKDOWNS and isinstance(value, dict):
+            return self._mask_breakdowns(value, mapping, keep)
 
         vtype = self._field_types.get(lowered)
         if vtype is not None and vtype != TEXT:
@@ -864,6 +1055,8 @@ class OutputMasker:
             for key, value in obj.items():
                 if key.lower() in COMPOSITE_FILTER_ENTRIES and isinstance(value, list):
                     out[key] = self._mask_filter_entries(value, mapping, keep)
+                elif key.lower() in COMPOSITE_BREAKDOWNS and isinstance(value, dict):
+                    out[key] = self._mask_breakdown_text(value, mapping, keep)
                 elif self._field_types.get(key.lower()) == TEXT:
                     out[key] = self._mask_text_tree(value, mapping, keep)
                 else:
@@ -872,6 +1065,59 @@ class OutputMasker:
         if isinstance(obj, list):
             return [self._mask_free_text(item, mapping, keep) for item in obj]
         return obj
+
+    def _mask_breakdown_text(
+        self, value: Any, mapping: dict[str, str], keep: frozenset[str] = frozenset()
+    ) -> Any:
+        """``breakdowns`` in pass 2: the buckets of a TEXT dimension.
+
+        Pass 1 types a bucket's ``"value"`` from the dimension name, which
+        covers every dimension whose values *are* identifiers. A TEXT dimension
+        has none to mask by -- its values are prose that may embed an identifier
+        anywhere -- and prose is what this pass exists for. Under a flat
+        ``msg``/``ui``/``subject`` key the scan fires because the KEY is typed
+        TEXT; inside a bucket the key is a generic ``"value"``, so nothing
+        reached it and the free text rode out in clear. ``sample_by`` is not
+        restricted to a vocabulary, so ``sample_by=["msg"]`` is an ordinary
+        call, and a hostname in that prose sat beside its own token in the same
+        response.
+
+        Only a TEXT dimension is scanned here. An identifier-typed dimension was
+        already masked in pass 1 and a masked IPv4 is itself a valid IPv4, so
+        re-scanning it would mask it twice and yield a token matching nothing
+        else in the response -- the same hazard that puts
+        ``_mask_filter_entries`` in this pass rather than the other. An untyped
+        dimension keeps the passthrough :meth:`_mask_breakdowns` documents: it
+        is not an identifier, and a flat key of that name is not scanned either.
+        Both fall through to the ordinary walk, so behaviour there is unchanged.
+        """
+        out: dict[str, Any] = {}
+        for dimension, buckets in value.items():
+            vtype = (
+                self._field_types.get(dimension.strip().lower())
+                if isinstance(dimension, str)
+                else None
+            )
+            if vtype != TEXT or not isinstance(buckets, list):
+                out[dimension] = self._mask_free_text(buckets, mapping, keep)
+                continue
+            scanned: list[Any] = []
+            for bucket in buckets:
+                if not isinstance(bucket, dict):
+                    # Not the shape aggregate_breakdowns writes. Treat it as the
+                    # free-text leaf a flat TEXT key would have made of it.
+                    scanned.append(self._mask_text_tree(bucket, mapping, keep))
+                    continue
+                scanned.append(
+                    {
+                        bkey: self._mask_scalar_text(bvalue, mapping, keep)
+                        if bkey.lower() == "value" and isinstance(bvalue, str)
+                        else bvalue
+                        for bkey, bvalue in bucket.items()
+                    }
+                )
+            out[dimension] = scanned
+        return out
 
     def _mask_filter_entries(
         self, value: Any, mapping: dict[str, str], keep: frozenset[str] = frozenset()

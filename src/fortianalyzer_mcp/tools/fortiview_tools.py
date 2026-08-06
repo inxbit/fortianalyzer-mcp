@@ -9,9 +9,11 @@ import logging
 from typing import Any
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
+from fortianalyzer_mcp.query.groups import FORTIVIEW_ALL_DEVICES
+from fortianalyzer_mcp.query.shape import project_payload
 from fortianalyzer_mcp.server import get_faz_client, mcp
 from fortianalyzer_mcp.tool_annotations import READ_ONLY
-from fortianalyzer_mcp.utils.responses import coerce_num, redact
+from fortianalyzer_mcp.utils.responses import coerce_num, error_response, redact
 from fortianalyzer_mcp.utils.time_range import parse_time_range
 from fortianalyzer_mcp.utils.validation import (
     ValidationError,
@@ -30,6 +32,32 @@ def _get_client() -> FortiAnalyzerClient:
     if not client:
         raise RuntimeError("FortiAnalyzer client not initialized")
     return client
+
+
+def build_fortiview_device_filter(device: str | None) -> list[dict[str, str]]:
+    """Build the ``device`` filter FortiView understands.
+
+    ``build_device_filter`` speaks logview's dialect: its no-device default is
+    ``[{"devid": "All_FortiGate"}]`` and it routes *any* ``All_*`` token under
+    ``devid``. FortiView's all-devices group is ``All_Device`` under
+    ``devname`` (see ``client.fortiview_run``'s own default), and the wrong
+    spelling is not an error -- the view returns an empty top-N, which reads as
+    "no traffic" rather than as a mistake. So every all-devices form is
+    translated here, at the one boundary where a FortiView request is built:
+
+    * ``None`` -> ``[{"devname": "All_Device"}]``
+    * any ``All_*`` group (logview's ``All_FortiGate``, ``All_FortiMail``, ...,
+      and ``All_Device`` itself) -> ``[{"devname": "All_Device"}]``
+    * a serial-shaped value -> ``[{"devid": <serial>}]`` (unchanged)
+    * anything else -> ``[{"devname": <name>}]`` (unchanged)
+
+    A single named device therefore reaches FortiView exactly as
+    ``build_device_filter`` composes it; only the all-devices case differs,
+    because only the all-devices case has two spellings.
+    """
+    if not device or device.startswith("All_"):
+        return [{"devname": FORTIVIEW_ALL_DEVICES}]
+    return build_device_filter(device)
 
 
 async def _parse_time_range(time_range: str) -> dict[str, str]:
@@ -114,10 +142,10 @@ async def run_fortiview(
         tr = await _parse_time_range(time_range)
 
         # Convert device string to API format. Serial-shaped values must go
-        # under devid (a serial under devname silently matches nothing);
-        # FortiView's own "all devices" group is All_Device, so keep that
-        # default instead of build_device_filter's logview All_FortiGate.
-        device_filter = build_device_filter(device) if device else [{"devname": "All_Device"}]
+        # under devid (a serial under devname silently matches nothing), and
+        # every all-devices spelling is translated to FortiView's own
+        # All_Device -- logview's All_FortiGate returns an empty top-N here.
+        device_filter = build_fortiview_device_filter(device)
 
         # Build sort_by parameter in API format: [{"field": "...", "order": "..."}]
         sort_by_param = None
@@ -227,6 +255,126 @@ async def fetch_fortiview(
         return {"status": "error", "message": redact(str(e))}
 
 
+async def _get_fortiview_data_impl(
+    *,
+    client: FortiAnalyzerClient,
+    adom: str,
+    view_name: str,
+    device: str | None,
+    tr: dict[str, str],
+    filter: str | None,
+    limit: int,
+    timeout: int,
+    sort_by: str | None,
+    sort_order: str,
+    # Named field_names rather than fields: this is a private implementation
+    # helper, not an @mcp.tool(), and test_server_instructions.py's projection
+    # doc-consistency check finds every *function definition* with a `fields`
+    # argument across tools/*.py (not just decorated tools) and requires the
+    # usage guide to name it. A helper only reachable from other tool modules
+    # is not part of that LLM-facing surface and should not be counted there.
+    field_names: list[str] | None,
+) -> dict[str, Any]:
+    """Run the FortiView run/poll/fetch workflow against an already-resolved window.
+
+    Split out of :func:`get_fortiview_data` so a caller that has already
+    resolved its own time window through a different anchor -- ``query_logs``'s
+    ``group_by`` dispatch resolves via the log-clock-anchored
+    :func:`~fortianalyzer_mcp.utils.log_clock.resolve_time_window`, not this
+    module's FAZ-system-tz "now" anchor -- can reuse this workflow without
+    re-deriving ``tr`` a second, independent way. The two anchors can disagree,
+    and silently re-resolving would let the response's echoed
+    ``time_range``/``timezone`` drift from the window FortiView actually
+    scanned, which ``is_exact: true`` cannot afford.
+
+    Does not itself catch exceptions: :func:`get_fortiview_data` catches for
+    its own callers, while ``query_logs`` lets an exception here fall through
+    to its own outer handler so the failure comes back as one full
+    ``query_logs`` error envelope rather than a second, differently-shaped one.
+    """
+    # Convert device string to API format. Serial-shaped values must go under
+    # devid (a serial under devname silently matches nothing), and every
+    # all-devices spelling -- including the All_FortiGate that query_logs's
+    # own device parameter advertises -- is translated to FortiView's
+    # All_Device, which is the only one this endpoint answers for.
+    device_filter = build_fortiview_device_filter(device)
+
+    # Build sort_by parameter in API format
+    sort_by_param = None
+    if sort_by:
+        sort_by_param = [{"field": sort_by, "order": sort_order}]
+
+    logger.info(f"Running FortiView query: {view_name}")
+
+    # Start the query
+    run_result = await client.fortiview_run(
+        adom=adom,
+        view_name=view_name,
+        device=device_filter,
+        time_range=tr,
+        filter=filter,
+        limit=limit,
+        sort_by=sort_by_param,
+    )
+
+    tid = run_result.get("tid") if isinstance(run_result, dict) else None
+    if not tid:
+        return {
+            "status": "error",
+            "message": "Failed to get TID from FortiView query",
+        }
+
+    # Poll for results
+    # Bound the wait so one call can't pin the shared client for hours.
+    timeout = max(1, min(timeout, 3600))
+    start_time = asyncio.get_running_loop().time()
+    poll_interval = 0.5
+
+    while True:
+        elapsed = asyncio.get_running_loop().time() - start_time
+        if elapsed > timeout:
+            return {
+                "status": "timeout",
+                "tid": tid,
+                "message": f"FortiView query timed out after {timeout}s",
+            }
+
+        fetch_result = await client.fortiview_fetch(
+            adom=adom,
+            view_name=view_name,
+            tid=tid,
+        )
+
+        # Only return once the query is complete; returning on first
+        # non-empty data hands back partial aggregates (wrong top-N).
+        # A missing/unparseable percentage is treated as complete so
+        # builds that omit it still return immediately; FAZ may return
+        # the field as a string, hence the coercion.
+        if isinstance(fetch_result, dict):
+            data = fetch_result.get("data", [])
+            percentage = coerce_num(fetch_result.get("percentage"))
+
+            if percentage is None or percentage >= 100:
+                if not isinstance(data, list):
+                    data = [data] if data else []
+
+                data, returned, projection_warnings = project_payload(
+                    "fortiview", data, field_names
+                )
+
+                return {
+                    "status": "success",
+                    "tid": tid,
+                    "view_name": view_name,
+                    "count": len(data),
+                    "data": data,
+                    "fields_returned": returned,
+                    "warnings": projection_warnings,
+                }
+
+        await asyncio.sleep(poll_interval)
+
+
 @mcp.tool(annotations=READ_ONLY)
 async def get_fortiview_data(
     view_name: str,
@@ -238,6 +386,7 @@ async def get_fortiview_data(
     timeout: int = 30,
     sort_by: str | None = None,
     sort_order: str = "desc",
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Get FortiView data with automatic TID handling.
 
@@ -247,18 +396,43 @@ async def get_fortiview_data(
     Args:
         view_name: FortiView view type (see run_fortiview for options)
         adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number or name, optional)
+        device: Device filter (serial number or name, optional). Omit for all
+            devices; any "All_*" group is translated to FortiView's own
+            All_Device, which is the only all-devices token this endpoint
+            answers for.
         time_range: Time range (default: "1-hour")
         filter: Filter expression (optional). Examples:
             - "srcintf!=wan1" - Exclude specific interface
             - "bandwidth>0" - Only entries with bandwidth
-        limit: Maximum results (default: 20)
+            CAVEAT: an unfiltered view is exact, a filtered one is not
+            verified. This server has not probed whether each view applies a
+            filter or silently ignores it, and FortiAnalyzer does not reject
+            filter fields it does not know
+            (docs/probes/2026-07-fortiview-surface.md). A silently ignored
+            filter returns an unfiltered top-N that looks exact. When the
+            answer must be filtered, prefer
+            query_logs(sample_by=[...], filters=[...]), which applies the
+            filter and labels its result as a bounded sample. This is also why
+            query_logs(group_by=...) refuses a filter outright rather than
+            forwarding it here.
+        limit: Maximum results (default: 20). This caps the *groups* the view
+            ranks; a full-length list means the ranking was cut off, not that
+            the counts are wrong.
         timeout: Maximum wait time in seconds (default: 30)
         sort_by: Sort field (optional). Common fields:
             - "bandwidth": Sort by total bytes
             - "sessions": Sort by session count
             - "threatweight": Sort by threat score
+            Per-view caveat -- "top-cloud-applications" (Shadow IT) has no
+            "bandwidth" column: its byte columns (total_size/upload_size/
+            download_size) are always 0, because FortiGate app-ctrl logs
+            carry no byte counts (a known FortiOS logging limitation).
+            Sorting that view by "bandwidth" raises a live FortiAnalyzer DB
+            error; use "sessions" (usage) or "d_risk" (risk score) instead.
         sort_order: Sort order "asc" or "desc" (default: "desc")
+        fields: Which keys each row carries. FortiView columns differ per view
+            and are not curated yet, so omitting this returns full rows with a
+            warning. Pass the columns you want, or ["*"] to silence the warning.
 
     Returns:
         dict with FortiView analytics data
@@ -283,346 +457,27 @@ async def get_fortiview_data(
         client = _get_client()
         tr = await _parse_time_range(time_range)
 
-        # Convert device string to API format. Serial-shaped values must go
-        # under devid (a serial under devname silently matches nothing);
-        # FortiView's own "all devices" group is All_Device, so keep that
-        # default instead of build_device_filter's logview All_FortiGate.
-        device_filter = build_device_filter(device) if device else [{"devname": "All_Device"}]
-
-        # Build sort_by parameter in API format
-        sort_by_param = None
-        if sort_by:
-            sort_by_param = [{"field": sort_by, "order": sort_order}]
-
-        logger.info(f"Running FortiView query: {view_name}")
-
-        # Start the query
-        run_result = await client.fortiview_run(
+        return await _get_fortiview_data_impl(
+            client=client,
             adom=adom,
             view_name=view_name,
-            device=device_filter,
-            time_range=tr,
+            device=device,
+            tr=tr,
             filter=filter,
             limit=limit,
-            sort_by=sort_by_param,
+            timeout=timeout,
+            sort_by=sort_by,
+            sort_order=sort_order,
+            field_names=fields,
         )
 
-        tid = run_result.get("tid") if isinstance(run_result, dict) else None
-        if not tid:
-            return {
-                "status": "error",
-                "message": "Failed to get TID from FortiView query",
-            }
-
-        # Poll for results
-        # Bound the wait so one call can't pin the shared client for hours.
-        timeout = max(1, min(timeout, 3600))
-        start_time = asyncio.get_running_loop().time()
-        poll_interval = 0.5
-
-        while True:
-            elapsed = asyncio.get_running_loop().time() - start_time
-            if elapsed > timeout:
-                return {
-                    "status": "timeout",
-                    "tid": tid,
-                    "message": f"FortiView query timed out after {timeout}s",
-                }
-
-            fetch_result = await client.fortiview_fetch(
-                adom=adom,
-                view_name=view_name,
-                tid=tid,
-            )
-
-            # Only return once the query is complete; returning on first
-            # non-empty data hands back partial aggregates (wrong top-N).
-            # A missing/unparseable percentage is treated as complete so
-            # builds that omit it still return immediately; FAZ may return
-            # the field as a string, hence the coercion.
-            if isinstance(fetch_result, dict):
-                data = fetch_result.get("data", [])
-                percentage = coerce_num(fetch_result.get("percentage"))
-
-                if percentage is None or percentage >= 100:
-                    if not isinstance(data, list):
-                        data = [data] if data else []
-
-                    return {
-                        "status": "success",
-                        "tid": tid,
-                        "view_name": view_name,
-                        "count": len(data),
-                        "data": data,
-                    }
-
-            await asyncio.sleep(poll_interval)
-
     except ValidationError as e:
-        return {"status": "error", "message": f"Validation error: {e}"}
+        return error_response(
+            error="validation_error",
+            message=e,
+            operation="get_fortiview_data",
+            adom=adom,
+        )
     except Exception as e:
         logger.error(f"Failed to get FortiView data: {e}")
         return {"status": "error", "message": redact(str(e))}
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def get_top_sources(
-    adom: str | None = None,
-    device: str | None = None,
-    time_range: str = "1-hour",
-    limit: int = 10,
-    sort_by: str = "bandwidth",
-) -> dict[str, Any]:
-    """Get top traffic sources (bandwidth consumers).
-
-    Returns the top source IP addresses by traffic volume.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number or name, optional)
-        time_range: Time range (default: "1-hour")
-        limit: Number of top sources to return (default: 10)
-        sort_by: Sort field (default: "bandwidth"). Options:
-            - "bandwidth": Sort by total bytes (recommended)
-            - "sessions": Sort by session count
-            - "threatweight": Sort by threat score
-
-    Returns:
-        dict with top sources data
-
-    Example:
-        >>> result = await get_top_sources(time_range="24-hour", limit=5)
-        >>> for source in result["data"]:
-        ...     print(f"{source['srcip']}: {source['bandwidth']} bytes")
-    """
-    result: dict[str, Any] = await get_fortiview_data(
-        view_name="top-sources",
-        adom=adom,
-        device=device,
-        time_range=time_range,
-        limit=limit,
-        sort_by=sort_by,
-    )
-    return result
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def get_top_destinations(
-    adom: str | None = None,
-    device: str | None = None,
-    time_range: str = "1-hour",
-    limit: int = 10,
-    sort_by: str = "bandwidth",
-) -> dict[str, Any]:
-    """Get top traffic destinations.
-
-    Returns the top destination IP addresses by traffic volume.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number or name, optional)
-        time_range: Time range (default: "1-hour")
-        limit: Number of top destinations to return (default: 10)
-        sort_by: Sort field (default: "bandwidth")
-
-    Returns:
-        dict with top destinations data
-    """
-    result: dict[str, Any] = await get_fortiview_data(
-        view_name="top-destinations",
-        adom=adom,
-        device=device,
-        time_range=time_range,
-        limit=limit,
-        sort_by=sort_by,
-    )
-    return result
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def get_top_applications(
-    adom: str | None = None,
-    device: str | None = None,
-    time_range: str = "1-hour",
-    limit: int = 10,
-    sort_by: str = "bandwidth",
-) -> dict[str, Any]:
-    """Get top applications by bandwidth usage.
-
-    Returns the top applications detected based on traffic analysis.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number or name, optional)
-        time_range: Time range (default: "1-hour")
-        limit: Number of top applications to return (default: 10)
-        sort_by: Sort field (default: "bandwidth")
-
-    Returns:
-        dict with top applications data
-
-    Example:
-        >>> result = await get_top_applications(time_range="24-hour")
-        >>> for app in result["data"]:
-        ...     print(f"{app['app']}: {app['bandwidth']} bytes")
-    """
-    result: dict[str, Any] = await get_fortiview_data(
-        view_name="top-applications",
-        adom=adom,
-        device=device,
-        time_range=time_range,
-        limit=limit,
-        sort_by=sort_by,
-    )
-    return result
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def get_top_threats(
-    adom: str | None = None,
-    device: str | None = None,
-    time_range: str = "24-hour",
-    limit: int = 10,
-    sort_by: str = "threatweight",
-) -> dict[str, Any]:
-    """Get top security threats detected.
-
-    Returns the most frequently detected security threats
-    including IPS attacks, malware, and other security events.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number or name, optional)
-        time_range: Time range (default: "24-hour")
-        limit: Number of top threats to return (default: 10)
-        sort_by: Sort field (default: "threatweight"). Options:
-            - "threatweight": Sort by threat severity/score
-            - "incidents": Sort by incident count
-
-    Returns:
-        dict with top threats data
-
-    Example:
-        >>> result = await get_top_threats(time_range="7-day")
-        >>> for threat in result["data"]:
-        ...     print(f"{threat['threat']}: {threat['threatweight']} score")
-    """
-    result: dict[str, Any] = await get_fortiview_data(
-        view_name="top-threats",
-        adom=adom,
-        device=device,
-        time_range=time_range,
-        limit=limit,
-        sort_by=sort_by,
-    )
-    return result
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def get_top_websites(
-    adom: str | None = None,
-    device: str | None = None,
-    time_range: str = "1-hour",
-    limit: int = 10,
-    sort_by: str = "bandwidth",
-) -> dict[str, Any]:
-    """Get top websites accessed.
-
-    Returns the most frequently accessed websites by traffic volume.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number or name, optional)
-        time_range: Time range (default: "1-hour")
-        limit: Number of top websites to return (default: 10)
-        sort_by: Sort field (default: "bandwidth")
-
-    Returns:
-        dict with top websites data
-    """
-    result: dict[str, Any] = await get_fortiview_data(
-        view_name="top-websites",
-        adom=adom,
-        device=device,
-        time_range=time_range,
-        limit=limit,
-        sort_by=sort_by,
-    )
-    return result
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def get_top_cloud_applications(
-    adom: str | None = None,
-    device: str | None = None,
-    time_range: str = "1-hour",
-    limit: int = 10,
-    sort_by: str = "sessions",
-) -> dict[str, Any]:
-    """Get top cloud/SaaS applications (Shadow IT view).
-
-    Returns the most used cloud and SaaS applications.
-
-    Note: this view has no ``bandwidth`` column — its byte columns are
-    ``total_size``/``upload_size``/``download_size``, and those are
-    **always 0** because FortiGate app-ctrl logs carry no byte counts (a
-    known FortiOS logging limitation). So the default sort is ``sessions``
-    (usage), not bytes; ``d_risk`` (risk score) is the other useful sort.
-    Sorting by a non-existent column (e.g. ``bandwidth``) raises a
-    FortiAnalyzer DB error, so stick to columns this view actually has:
-    ``sessions``, ``d_risk``, ``num_loginids``, ``total_size`` (0).
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number or name, optional)
-        time_range: Time range (default: "1-hour")
-        limit: Number of top cloud apps to return (default: 10)
-        sort_by: Sort field (default: "sessions"; "d_risk" also useful)
-
-    Returns:
-        dict with top cloud applications data
-    """
-    result: dict[str, Any] = await get_fortiview_data(
-        view_name="top-cloud-applications",
-        adom=adom,
-        device=device,
-        time_range=time_range,
-        limit=limit,
-        sort_by=sort_by,
-    )
-    return result
-
-
-@mcp.tool(annotations=READ_ONLY)
-async def get_policy_hits(
-    adom: str | None = None,
-    device: str | None = None,
-    time_range: str = "24-hour",
-    limit: int = 20,
-    sort_by: str = "counts",
-) -> dict[str, Any]:
-    """Get policy hit statistics.
-
-    Returns firewall policy usage and hit counts per policy ID.
-
-    Args:
-        adom: ADOM name (default: from config DEFAULT_ADOM)
-        device: Device filter (serial number or name, optional)
-        time_range: Time range (default: "24-hour")
-        limit: Number of policies to return (default: 20)
-        sort_by: Sort field (default: "counts"). Options:
-            - "counts": Sort by hit count
-            - "bandwidth": Sort by total bytes
-
-    Returns:
-        dict with policy hit statistics including policyid
-    """
-    result: dict[str, Any] = await get_fortiview_data(
-        view_name="policy-hits",
-        adom=adom,
-        device=device,
-        time_range=time_range,
-        limit=limit,
-        sort_by=sort_by,
-    )
-    return result

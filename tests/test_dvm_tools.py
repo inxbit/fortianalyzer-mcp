@@ -207,3 +207,107 @@ class TestSearchDevicesStructuredFilters:
 
         assert result["status"] == "error"
         assert "conn_status" in result["message"]
+
+
+class TestSearchDevicesProjection:
+    """Device projection is native: the field list goes to dvmdb."""
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.captured_fields: list[str] | None = None
+
+        async def list_devices(
+            self,
+            adom: str,
+            filter: list[list[Any]] | None = None,
+            fields: list[str] | None = None,
+        ) -> list[dict[str, Any]]:
+            self.captured_fields = fields
+            return [{"name": "fgt-01", "ip": "10.0.0.1"}]
+
+    def _install(self, monkeypatch: pytest.MonkeyPatch) -> FakeClient:
+        fake = self.FakeClient()
+        monkeypatch.setattr(dvm_tools, "_get_client", lambda: fake)
+        return fake
+
+    async def test_default_sends_the_curated_field_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = self._install(monkeypatch)
+
+        await dvm_tools.search_devices()
+
+        assert fake.captured_fields is not None
+        assert "name" in fake.captured_fields
+        assert "sn" in fake.captured_fields, "join key must survive"
+        assert "adm_usr" not in fake.captured_fields
+
+    async def test_star_sends_no_field_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """["*"] means the appliance default, which is every field."""
+        fake = self._install(monkeypatch)
+
+        await dvm_tools.search_devices(fields=["*"])
+
+        assert fake.captured_fields is None
+
+    async def test_alias_is_resolved_before_sending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._install(monkeypatch)
+
+        await dvm_tools.search_devices(fields=["serial_number", "os_version"])
+
+        assert fake.captured_fields is not None
+        assert sorted(fake.captured_fields) == ["os_ver", "sn"]
+
+    async def test_a_field_outside_the_curated_set_is_forwarded_with_a_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``oid`` is a real dvmdb key -- this tool's own docstring says so.
+
+        The 16-name device set is a filter boundary, not a catalogue of what a
+        dvmdb device object carries (the appliance defines roughly sixty). When
+        the projection path enforced it, ``fields=["oid"]`` -- along with
+        ``ha_mode``, ``os_type``, ``last_checked`` and ``devvds`` -- became a
+        ValidationError, though every one of them was readable before this
+        parameter existed.
+        """
+        fake = self._install(monkeypatch)
+
+        result = await dvm_tools.search_devices(fields=["name", "oid", "ha_mode"])
+
+        assert result["status"] == "success"
+        assert fake.captured_fields == ["ha_mode", "name", "oid"]
+        assert len(result["warnings"]) == 2
+        assert any("oid" in w for w in result["warnings"])
+
+    async def test_a_malformed_field_name_is_still_rejected_locally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Permissive is not unguarded; the shape check still fails closed."""
+
+        class Unreachable:
+            async def list_devices(self, **kwargs: Any) -> list[dict[str, Any]]:
+                raise AssertionError("must not reach the API")
+
+        monkeypatch.setattr(dvm_tools, "_get_client", lambda: Unreachable())
+
+        result = await dvm_tools.search_devices(fields=['name" or 1=1'])
+
+        assert result["status"] == "error"
+
+    async def test_an_unknown_filter_field_is_still_rejected_locally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The filter path keeps its strict set; only projection loosened."""
+
+        class Unreachable:
+            async def list_devices(self, **kwargs: Any) -> list[dict[str, Any]]:
+                raise AssertionError("must not reach the API")
+
+        monkeypatch.setattr(dvm_tools, "_get_client", lambda: Unreachable())
+
+        result = await dvm_tools.search_devices(
+            filters=[FilterCondition(field="not_a_field", op="eq", value="x")]
+        )
+
+        assert result["status"] == "error"
+        assert "conn_status" in result["message"]
