@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.12.0] - 2026-08-05
+## [2.12.0] - 2026-08-06
 
 Minor release, breaking change to the tool surface: honest server-side aggregation on `query_logs` (`group_by`, `sample_by`, `count_only`) and a thirteen-tool consolidation into three (85 → 73) now that every removed tool's parameters are expressible on its replacement.
 
