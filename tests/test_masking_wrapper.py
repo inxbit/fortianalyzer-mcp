@@ -1050,6 +1050,43 @@ class TestKeepSetAcrossBothPasses:
 
         assert masked["grpby"] == f'{{"srcname": "{name}"}}'
 
+    def test_kept_name_stays_clear_whatever_case_it_is_written_in(self, masker: OutputMasker):
+        # Device names are routinely uppercase live, and two things fold case
+        # before the value is compared: urlsplit lowercases the host it
+        # returns, and a sibling field may simply spell the name differently
+        # from the key the keep set was built from. The engine already folds
+        # case for every type except USERNAME, so both spellings mask to one
+        # token -- which is exactly what makes the mismatch a leak rather
+        # than a cosmetic difference: the reader sees the name in clear under
+        # ``devname`` and its token beside it.
+        name = "FW-BRANCH-01"
+        masked = masker.mask_result(
+            {
+                "devname": name,
+                "url": f"https://{name}/admin",
+                "http_url": f"https://{name}/x",
+                "srcname": name.lower(),
+            }
+        )
+
+        assert masked["devname"] == name
+        assert masked["srcname"] == name.lower()
+        # Both URL handlers hand back the response's own spelling. Letting the
+        # value fall through to the scalar path instead would keep it out of a
+        # token but return urlsplit's lowercased copy, so the host would no
+        # longer match the ``devname`` printed beside it.
+        assert masked["url"].startswith(f"https://{name}/")
+        assert masked["http_url"] == f"https://{name}/x"
+
+    def test_a_kept_username_still_respects_case(self, masker: OutputMasker):
+        # The engine does NOT fold case for usernames, so two spellings are
+        # two principals and the case-insensitive match must not reach them.
+        # A device named ADMIN must not exempt a user called admin.
+        masked = masker.mask_result({"devname": "ADMIN", "user": "admin"})
+
+        assert masked["devname"] == "ADMIN"
+        assert masked["user"] != "admin"
+
     def test_kept_name_stays_clear_in_a_url_host(self, masker: OutputMasker):
         # The URL handlers mask the host component through the same scalar
         # path every typed field uses, so a device reached as a URL host

@@ -251,6 +251,31 @@ class OutputMasker:
             return self.placeholder(value)
         return self.placeholder(value)  # unknown type tag: fail closed
 
+    def _is_kept(self, vtype: str, value: str, keep: frozenset[str]) -> bool:
+        """Is ``value`` one the deployment chose to leave readable?
+
+        Exact match first, then case-insensitively for every type except
+        USERNAME. The fold is not a convenience: :meth:`FPEEngine._normalize`
+        lowercases the value for every other type before encrypting, so two
+        spellings of a hostname or a serial are one identity and mask to one
+        token. Comparing them case-sensitively here left the token beside the
+        clear name, which is the pairing the keep set exists to withhold --
+        found live, where device names are routinely uppercase and
+        ``urlsplit`` hands back a lowercased host.
+
+        USERNAME is excluded because the engine does not fold it, so two
+        spellings really are two principals: a device named ``ADMIN`` must
+        not exempt a user called ``admin`` from masking.
+        """
+        if not keep:
+            return False
+        if value in keep:
+            return True
+        if vtype == USERNAME:
+            return False
+        folded = value.lower()
+        return any(folded == kept.lower() for kept in keep)
+
     def _mask_scalar(
         self,
         vtype: str,
@@ -260,7 +285,7 @@ class OutputMasker:
     ) -> str:
         if value.strip() in SKIP_VALUES:
             return value
-        if value in keep:
+        if self._is_kept(vtype, value, keep):
             # A value the deployment chose to leave readable stays readable
             # under every key (#73 item 5). The check lives here rather than
             # at each call site because every pass-1 route ends up here, and
@@ -901,6 +926,11 @@ class OutputMasker:
             # Not a parseable URL: the free-text scan still catches
             # embedded IOCs and values masked elsewhere in this response.
             return self.mask_text(value, mapping, keep)
+        if self._is_kept(IP_OR_HOST, host, keep):
+            # ``urlsplit`` lowercased the host, and this handler masks nothing
+            # else, so hand the value back untouched rather than a case-folded
+            # copy of a name the response shows in clear elsewhere.
+            return value
         masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep)
         if ":" in masked_host:  # IPv6 literal: re-bracket
             masked_host = f"[{masked_host}]"
@@ -953,10 +983,14 @@ class OutputMasker:
                 return self._engine.mask_url_tail(stripped)
             except MaskingError:
                 return self.placeholder(value)
-        masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep)
-        if ":" in masked_host:  # IPv6 literal: re-bracket
-            masked_host = f"[{masked_host}]"
-        netloc = f"{masked_host}:{port}" if port is not None else masked_host
+        if self._is_kept(IP_OR_HOST, host, keep):
+            # Host stays as the response spells it; the tail still seals.
+            netloc = parts.netloc
+        else:
+            masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep)
+            if ":" in masked_host:  # IPv6 literal: re-bracket
+                masked_host = f"[{masked_host}]"
+            netloc = f"{masked_host}:{port}" if port is not None else masked_host
         prefix = f"{parts.scheme}://" if parts.scheme else "//"
         # Anchor the netloc search after the ``//`` authority marker: from
         # position 0 a single-letter host matches inside the scheme
@@ -1049,10 +1083,11 @@ class OutputMasker:
                 # key, not just the device-identity ones (#73 item 5).
                 # Masking it here while ``devname`` shows it two keys away
                 # hands over the token-to-name pairing the keep set exists
-                # to withhold.
-                if value in keep:
-                    return value
-                return self._mask_scalar(vtype, value, mapping)
+                # to withhold. #112 put that check inline here; it now lives
+                # in ``_mask_scalar``, which every pass-1 route reaches and
+                # which knows the type, so the fold that applies to a
+                # hostname is not applied to a username.
+                return self._mask_scalar(vtype, value, mapping, keep)
             if isinstance(value, list):
                 # e.g. dns "ipaddr" is a list of resolved addresses. The keep
                 # check is the string branch's, per element: the list form of
