@@ -251,17 +251,34 @@ class OutputMasker:
             return self.placeholder(value)
         return self.placeholder(value)  # unknown type tag: fail closed
 
-    def _mask_scalar(self, vtype: str, value: str, mapping: dict[str, str] | None = None) -> str:
+    def _mask_scalar(
+        self,
+        vtype: str,
+        value: str,
+        mapping: dict[str, str] | None = None,
+        keep: frozenset[str] = frozenset(),
+    ) -> str:
         if value.strip() in SKIP_VALUES:
+            return value
+        if value in keep:
+            # A value the deployment chose to leave readable stays readable
+            # under every key (#73 item 5). The check lives here rather than
+            # at each call site because every pass-1 route ends up here, and
+            # a route that forgot it masked the value while ``devname``
+            # showed it two keys away -- the token-to-name pairing the keep
+            # set exists to withhold. Checking before the mapping write also
+            # keeps the value out of pass 2's substitution table.
             return value
         if "," in value:
             # FAZ packs multi-valued fields into one comma-joined string
             # (live example: the dns ``ipaddr`` answer list). Mask each
             # element; an unmaskable element still fails closed on its own.
+            # Parts are checked against the keep set individually because the
+            # set is itself built by splitting the comma-joined form.
             return ",".join(
                 part
                 if part.strip() in SKIP_VALUES or not part
-                else self._mask_scalar(vtype, part, mapping)
+                else self._mask_scalar(vtype, part, mapping, keep)
                 for part in value.split(",")
             )
         token = self._mask_one(vtype, value)
@@ -278,7 +295,7 @@ class OutputMasker:
 
     # -- composite keys ------------------------------------------------- #
 
-    def _mask_prefixed(self, value: str, mapping: dict[str, str]) -> str:
+    def _mask_prefixed(self, value: str, mapping: dict[str, str], keep: frozenset[str]) -> str:
         """``"<fieldname>:<value>"`` (alert ``groupby1``/``groupby2``)."""
         field, sep, raw = value.partition(":")
         if not sep or not raw:
@@ -286,16 +303,16 @@ class OutputMasker:
         vtype = self._field_types.get(field.lower())
         if vtype is None or vtype == TEXT:
             return value
-        return f"{field}{sep}{self._mask_scalar(vtype, raw, mapping)}"
+        return f"{field}{sep}{self._mask_scalar(vtype, raw, mapping, keep)}"
 
-    def _mask_json_blob(self, value: str, mapping: dict[str, str]) -> str:
+    def _mask_json_blob(self, value: str, mapping: dict[str, str], keep: frozenset[str]) -> str:
         """An embedded JSON string (incident ``grpby``)."""
         try:
             parsed = json.loads(value)
         except (ValueError, TypeError):
             # Not JSON after all: at least strip the IOCs a regex can see.
-            return self.mask_text(value, mapping)
-        return json.dumps(self._mask_structured(parsed, mapping))
+            return self.mask_text(value, mapping, keep)
+        return json.dumps(self._mask_structured(parsed, mapping, keep))
 
     def _mask_device_vdom(self, value: str, mapping: dict[str, str]) -> str:
         """``"<devname>[<vdom>]"``, comma-joined (fortiview ``devvds``).
@@ -471,12 +488,10 @@ class OutputMasker:
             if vtype is None:
                 masked_value = self._burn_strings(raw, keep)
             elif isinstance(raw, str):
-                masked_value = raw if raw in keep else self._mask_scalar(vtype, raw, mapping)
+                masked_value = self._mask_scalar(vtype, raw, mapping, keep)
             elif isinstance(raw, list | tuple):
                 masked_value = [
-                    elem
-                    if isinstance(elem, str) and elem in keep
-                    else self._mask_scalar(vtype, elem, mapping)
+                    self._mask_scalar(vtype, elem, mapping, keep)
                     if isinstance(elem, str)
                     else self._burn_strings(elem, keep)
                     for elem in raw
@@ -510,12 +525,12 @@ class OutputMasker:
                     if item_value == raw:
                         entry[key] = masked_value
                     elif isinstance(item_value, str):
-                        if item_value in keep or item_value.isdigit():
+                        if item_value.isdigit():
                             entry[key] = item_value
                         elif vtype is None:
                             entry[key] = self._burn_strings(item_value, keep)
                         else:
-                            entry[key] = self._mask_scalar(vtype, item_value, mapping)
+                            entry[key] = self._mask_scalar(vtype, item_value, mapping, keep)
                     elif isinstance(item_value, list | tuple | dict):
                         entry[key] = self._burn_strings(item_value, keep)
                     else:
@@ -713,9 +728,9 @@ class OutputMasker:
     ) -> Any:
         """Pass 1: mask allowlisted and composite keys, record raw -> token."""
         if isinstance(obj, dict):
-            paired = self._mask_threat_pair(obj, mapping)
-            paired.update(self._mask_incident_reporter(obj, mapping))
-            paired.update(self._mask_indicator_pair(obj, mapping))
+            paired = self._mask_threat_pair(obj, mapping, keep)
+            paired.update(self._mask_incident_reporter(obj, mapping, keep))
+            paired.update(self._mask_indicator_pair(obj, mapping, keep))
             paired.update(self._mask_device_name(obj, mapping))
             return {
                 key: paired[key] if key in paired else self._mask_entry(key, value, mapping, keep)
@@ -746,7 +761,7 @@ class OutputMasker:
         return {key: self._mask_scalar(HOSTNAME, obj[key], mapping)}
 
     def _mask_incident_reporter(
-        self, obj: dict[str, Any], mapping: dict[str, str]
+        self, obj: dict[str, Any], mapping: dict[str, str], keep: frozenset[str]
     ) -> dict[str, str]:
         """``incident_reporter``: masked only when the record proves it a username.
 
@@ -773,9 +788,11 @@ class OutputMasker:
         )
         if value not in siblings:
             return {}
-        return {key: self._mask_scalar(USERNAME, value, mapping)}
+        return {key: self._mask_scalar(USERNAME, value, mapping, keep)}
 
-    def _mask_indicator_pair(self, obj: dict[str, Any], mapping: dict[str, str]) -> dict[str, str]:
+    def _mask_indicator_pair(
+        self, obj: dict[str, Any], mapping: dict[str, str], keep: frozenset[str]
+    ) -> dict[str, str]:
         """SOAR ``value``/``type``: the IOC itself, typed by its sibling.
 
         ``get_indicator_enrichment`` and ``get_linked_indicators`` return
@@ -802,14 +819,16 @@ class OutputMasker:
             return {}
         lowered = kind.strip().lower()
         if lowered == "ip":
-            return {key: self._mask_scalar(IP, value, mapping)}
+            return {key: self._mask_scalar(IP, value, mapping, keep)}
         if lowered == "domain":
-            return {key: self._mask_scalar(DOMAIN, value, mapping)}
+            return {key: self._mask_scalar(DOMAIN, value, mapping, keep)}
         if lowered == "url":
-            return {key: self._mask_url_full(value, mapping)}
+            return {key: self._mask_url_full(value, mapping, keep)}
         return {}
 
-    def _mask_threat_pair(self, obj: dict[str, Any], mapping: dict[str, str]) -> dict[str, str]:
+    def _mask_threat_pair(
+        self, obj: dict[str, Any], mapping: dict[str, str], keep: frozenset[str]
+    ) -> dict[str, str]:
         """fortiview ``threat``/``obf_url``: masked together, as domains (#40).
 
         ``obf_url`` is populated exactly when ``threat`` holds a browsable
@@ -841,7 +860,7 @@ class OutputMasker:
         if not isinstance(obf, str) or not obf.strip() or obf.strip() in SKIP_VALUES:
             return {}
         out: dict[str, str] = {}
-        token = self._mask_scalar(DOMAIN, obf.replace("[dot]", "."), mapping)
+        token = self._mask_scalar(DOMAIN, obf.replace("[dot]", "."), mapping, keep)
         escaped = token.replace(".", "[dot]")
         if _PLACEHOLDER_MARK not in token and escaped != obf:
             # Catch the escaped raw form in prose too; the unescaped form
@@ -852,10 +871,10 @@ class OutputMasker:
         if threat_key is not None:
             threat = obj[threat_key]
             if isinstance(threat, str) and threat.strip() and threat.strip() not in SKIP_VALUES:
-                out[threat_key] = self._mask_scalar(DOMAIN, threat, mapping)
+                out[threat_key] = self._mask_scalar(DOMAIN, threat, mapping, keep)
         return out
 
-    def _mask_url_host(self, value: str, mapping: dict[str, str]) -> str:
+    def _mask_url_host(self, value: str, mapping: dict[str, str], keep: frozenset[str]) -> str:
         """``http_url`` (alert ``event_details``): mask the HOST component only.
 
         Live alerts carry the browsed destination as a full URL
@@ -881,14 +900,14 @@ class OutputMasker:
         if not host:
             # Not a parseable URL: the free-text scan still catches
             # embedded IOCs and values masked elsewhere in this response.
-            return self.mask_text(value, mapping)
-        masked_host = self._mask_scalar(IP_OR_HOST, host, mapping)
+            return self.mask_text(value, mapping, keep)
+        masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep)
         if ":" in masked_host:  # IPv6 literal: re-bracket
             masked_host = f"[{masked_host}]"
         netloc = f"{masked_host}:{port}" if port is not None else masked_host
         return parts._replace(netloc=netloc).geturl()
 
-    def _mask_url_full(self, value: str, mapping: dict[str, str]) -> str:
+    def _mask_url_full(self, value: str, mapping: dict[str, str], keep: frozenset[str]) -> str:
         """``url``/``referralurl``: host in place, tail sealed (#40 decision).
 
         The host masks exactly like :meth:`_mask_url_host` (same guards,
@@ -934,7 +953,7 @@ class OutputMasker:
                 return self._engine.mask_url_tail(stripped)
             except MaskingError:
                 return self.placeholder(value)
-        masked_host = self._mask_scalar(IP_OR_HOST, host, mapping)
+        masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep)
         if ":" in masked_host:  # IPv6 literal: re-bracket
             masked_host = f"[{masked_host}]"
         netloc = f"{masked_host}:{port}" if port is not None else masked_host
@@ -962,36 +981,36 @@ class OutputMasker:
     ) -> Any:
         lowered = key.lower()
         if lowered in COMPOSITE_PREFIXED and isinstance(value, str):
-            return self._mask_prefixed(value, mapping)
+            return self._mask_prefixed(value, mapping, keep)
         if lowered in COMPOSITE_PREFIXED and isinstance(value, list):
             # list-valued group-bys are a normal FAZ variation (#73): each
             # element gets the same prefixed treatment the string form gets.
             # A dict-shaped groupby stays with the allowlist walk below,
             # which types it by its inner keys.
             return [
-                self._mask_prefixed(item, mapping)
+                self._mask_prefixed(item, mapping, keep)
                 if isinstance(item, str)
                 else self._mask_structured(item, mapping, keep)
                 for item in value
             ]
         if lowered in COMPOSITE_JSON and isinstance(value, str):
-            return self._mask_json_blob(value, mapping)
+            return self._mask_json_blob(value, mapping, keep)
         if lowered in COMPOSITE_URL_HOST and isinstance(value, str):
-            return self._mask_url_host(value, mapping)
+            return self._mask_url_host(value, mapping, keep)
         if lowered in COMPOSITE_URL_HOST and isinstance(value, list):
             # same list convention the typed fields handle below
             return [
-                self._mask_url_host(item, mapping)
+                self._mask_url_host(item, mapping, keep)
                 if isinstance(item, str)
                 else self._mask_structured(item, mapping, keep)
                 for item in value
             ]
         if lowered in COMPOSITE_URL_FULL and isinstance(value, str):
-            return self._mask_url_full(value, mapping)
+            return self._mask_url_full(value, mapping, keep)
         if lowered in COMPOSITE_URL_FULL and isinstance(value, list):
             # same list convention the typed fields handle below
             return [
-                self._mask_url_full(item, mapping)
+                self._mask_url_full(item, mapping, keep)
                 if isinstance(item, str)
                 else self._mask_structured(item, mapping, keep)
                 for item in value
@@ -1035,9 +1054,12 @@ class OutputMasker:
                     return value
                 return self._mask_scalar(vtype, value, mapping)
             if isinstance(value, list):
-                # e.g. dns "ipaddr" is a list of resolved addresses
+                # e.g. dns "ipaddr" is a list of resolved addresses. The keep
+                # check is the string branch's, per element: the list form of
+                # a typed key is the same key, so a kept value must survive it
+                # the same way.
                 return [
-                    self._mask_scalar(vtype, item, mapping)
+                    self._mask_scalar(vtype, item, mapping, keep)
                     if isinstance(item, str)
                     else self._mask_structured(item, mapping, keep)
                     for item in value
