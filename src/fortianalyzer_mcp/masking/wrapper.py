@@ -281,8 +281,18 @@ class OutputMasker:
         vtype: str,
         value: str,
         mapping: dict[str, str] | None = None,
-        keep: frozenset[str] = frozenset(),
+        *,
+        keep: frozenset[str],
     ) -> str:
+        """Mask one typed value, honouring the keep set.
+
+        ``keep`` is required and keyword-only on purpose. It used to default
+        to the empty set, which made forgetting it silent: the value masked,
+        nothing raised, and the response printed a token beside the cleartext
+        the keep set exists to protect. ``_mask_filter_entries`` was missed
+        that way twice over. A required keyword makes the omission a mypy
+        error and a TypeError instead.
+        """
         if value.strip() in SKIP_VALUES:
             return value
         if self._is_kept(vtype, value, keep):
@@ -303,7 +313,7 @@ class OutputMasker:
             return ",".join(
                 part
                 if part.strip() in SKIP_VALUES or not part
-                else self._mask_scalar(vtype, part, mapping, keep)
+                else self._mask_scalar(vtype, part, mapping, keep=keep)
                 for part in value.split(",")
             )
         token = self._mask_one(vtype, value)
@@ -328,7 +338,7 @@ class OutputMasker:
         vtype = self._field_types.get(field.lower())
         if vtype is None or vtype == TEXT:
             return value
-        return f"{field}{sep}{self._mask_scalar(vtype, raw, mapping, keep)}"
+        return f"{field}{sep}{self._mask_scalar(vtype, raw, mapping, keep=keep)}"
 
     def _mask_json_blob(self, value: str, mapping: dict[str, str], keep: frozenset[str]) -> str:
         """An embedded JSON string (incident ``grpby``)."""
@@ -339,7 +349,7 @@ class OutputMasker:
             return self.mask_text(value, mapping, keep)
         return json.dumps(self._mask_structured(parsed, mapping, keep))
 
-    def _mask_device_vdom(self, value: str, mapping: dict[str, str]) -> str:
+    def _mask_device_vdom(self, value: str, mapping: dict[str, str], keep: frozenset[str]) -> str:
         """``"<devname>[<vdom>]"``, comma-joined (fortiview ``devvds``).
 
         The vdom stays clear, like the flat ``vd`` log field. Only the
@@ -353,9 +363,9 @@ class OutputMasker:
             match = _DEVVDS_RE.match(part.strip())
             if match is None:
                 # Bare device name, or a shape we have not seen: mask whole.
-                out.append(self._mask_scalar(HOSTNAME, part, mapping))
+                out.append(self._mask_scalar(HOSTNAME, part, mapping, keep=keep))
                 continue
-            device = self._mask_scalar(HOSTNAME, match.group("dev"), mapping)
+            device = self._mask_scalar(HOSTNAME, match.group("dev"), mapping, keep=keep)
             out.append(f"{device}[{match.group('vdom')}]")
         return ",".join(out)
 
@@ -513,10 +523,10 @@ class OutputMasker:
             if vtype is None:
                 masked_value = self._burn_strings(raw, keep)
             elif isinstance(raw, str):
-                masked_value = self._mask_scalar(vtype, raw, mapping, keep)
+                masked_value = self._mask_scalar(vtype, raw, mapping, keep=keep)
             elif isinstance(raw, list | tuple):
                 masked_value = [
-                    self._mask_scalar(vtype, elem, mapping, keep)
+                    self._mask_scalar(vtype, elem, mapping, keep=keep)
                     if isinstance(elem, str)
                     else self._burn_strings(elem, keep)
                     for elem in raw
@@ -555,7 +565,7 @@ class OutputMasker:
                         elif vtype is None:
                             entry[key] = self._burn_strings(item_value, keep)
                         else:
-                            entry[key] = self._mask_scalar(vtype, item_value, mapping, keep)
+                            entry[key] = self._mask_scalar(vtype, item_value, mapping, keep=keep)
                     elif isinstance(item_value, list | tuple | dict):
                         entry[key] = self._burn_strings(item_value, keep)
                     else:
@@ -756,7 +766,7 @@ class OutputMasker:
             paired = self._mask_threat_pair(obj, mapping, keep)
             paired.update(self._mask_incident_reporter(obj, mapping, keep))
             paired.update(self._mask_indicator_pair(obj, mapping, keep))
-            paired.update(self._mask_device_name(obj, mapping))
+            paired.update(self._mask_device_name(obj, mapping, keep))
             return {
                 key: paired[key] if key in paired else self._mask_entry(key, value, mapping, keep)
                 for key, value in obj.items()
@@ -765,7 +775,9 @@ class OutputMasker:
             return [self._mask_structured(item, mapping, keep) for item in obj]
         return obj
 
-    def _mask_device_name(self, obj: dict[str, Any], mapping: dict[str, str]) -> dict[str, str]:
+    def _mask_device_name(
+        self, obj: dict[str, Any], mapping: dict[str, str], keep: frozenset[str]
+    ) -> dict[str, str]:
         """``name``: masked only when the record proves it a device object.
 
         Device identity follows ``FAZ_MASK_DEVICE_IDENTITY``, so with the
@@ -783,7 +795,7 @@ class OutputMasker:
         key = _device_name_in(obj)
         if key is None:
             return {}
-        return {key: self._mask_scalar(HOSTNAME, obj[key], mapping)}
+        return {key: self._mask_scalar(HOSTNAME, obj[key], mapping, keep=keep)}
 
     def _mask_incident_reporter(
         self, obj: dict[str, Any], mapping: dict[str, str], keep: frozenset[str]
@@ -813,7 +825,7 @@ class OutputMasker:
         )
         if value not in siblings:
             return {}
-        return {key: self._mask_scalar(USERNAME, value, mapping, keep)}
+        return {key: self._mask_scalar(USERNAME, value, mapping, keep=keep)}
 
     def _mask_indicator_pair(
         self, obj: dict[str, Any], mapping: dict[str, str], keep: frozenset[str]
@@ -844,9 +856,9 @@ class OutputMasker:
             return {}
         lowered = kind.strip().lower()
         if lowered == "ip":
-            return {key: self._mask_scalar(IP, value, mapping, keep)}
+            return {key: self._mask_scalar(IP, value, mapping, keep=keep)}
         if lowered == "domain":
-            return {key: self._mask_scalar(DOMAIN, value, mapping, keep)}
+            return {key: self._mask_scalar(DOMAIN, value, mapping, keep=keep)}
         if lowered == "url":
             return {key: self._mask_url_full(value, mapping, keep)}
         return {}
@@ -885,7 +897,7 @@ class OutputMasker:
         if not isinstance(obf, str) or not obf.strip() or obf.strip() in SKIP_VALUES:
             return {}
         out: dict[str, str] = {}
-        token = self._mask_scalar(DOMAIN, obf.replace("[dot]", "."), mapping, keep)
+        token = self._mask_scalar(DOMAIN, obf.replace("[dot]", "."), mapping, keep=keep)
         escaped = token.replace(".", "[dot]")
         if _PLACEHOLDER_MARK not in token and escaped != obf:
             # Catch the escaped raw form in prose too; the unescaped form
@@ -896,7 +908,7 @@ class OutputMasker:
         if threat_key is not None:
             threat = obj[threat_key]
             if isinstance(threat, str) and threat.strip() and threat.strip() not in SKIP_VALUES:
-                out[threat_key] = self._mask_scalar(DOMAIN, threat, mapping, keep)
+                out[threat_key] = self._mask_scalar(DOMAIN, threat, mapping, keep=keep)
         return out
 
     def _mask_url_host(self, value: str, mapping: dict[str, str], keep: frozenset[str]) -> str:
@@ -931,7 +943,7 @@ class OutputMasker:
             # else, so hand the value back untouched rather than a case-folded
             # copy of a name the response shows in clear elsewhere.
             return value
-        masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep)
+        masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep=keep)
         if ":" in masked_host:  # IPv6 literal: re-bracket
             masked_host = f"[{masked_host}]"
         netloc = f"{masked_host}:{port}" if port is not None else masked_host
@@ -987,7 +999,7 @@ class OutputMasker:
             # Host stays as the response spells it; the tail still seals.
             netloc = parts.netloc
         else:
-            masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep)
+            masked_host = self._mask_scalar(IP_OR_HOST, host, mapping, keep=keep)
             if ":" in masked_host:  # IPv6 literal: re-bracket
                 masked_host = f"[{masked_host}]"
             netloc = f"{masked_host}:{port}" if port is not None else masked_host
@@ -1071,7 +1083,7 @@ class OutputMasker:
             # are allowlisted was masked reversibly before and now burns.
             return self._burn_strings(value, keep)
         if lowered in COMPOSITE_DEVICE_VDOM and isinstance(value, str):
-            return self._mask_device_vdom(value, mapping)
+            return self._mask_device_vdom(value, mapping, keep)
         if lowered in COMPOSITE_BREAKDOWNS and isinstance(value, dict):
             return self._mask_breakdowns(value, mapping, keep)
 
@@ -1087,14 +1099,14 @@ class OutputMasker:
                 # in ``_mask_scalar``, which every pass-1 route reaches and
                 # which knows the type, so the fold that applies to a
                 # hostname is not applied to a username.
-                return self._mask_scalar(vtype, value, mapping, keep)
+                return self._mask_scalar(vtype, value, mapping, keep=keep)
             if isinstance(value, list):
                 # e.g. dns "ipaddr" is a list of resolved addresses. The keep
                 # check is the string branch's, per element: the list form of
                 # a typed key is the same key, so a kept value must survive it
                 # the same way.
                 return [
-                    self._mask_scalar(vtype, item, mapping, keep)
+                    self._mask_scalar(vtype, item, mapping, keep=keep)
                     if isinstance(item, str)
                     else self._mask_structured(item, mapping, keep)
                     for item in value
@@ -1215,7 +1227,7 @@ class OutputMasker:
             if vtype is None or vtype == TEXT or not isinstance(raw, str):
                 out.append(self._mask_text_tree(list(entry), mapping, keep))
                 continue
-            masked = self._mask_scalar(vtype, raw, mapping)
+            masked = self._mask_scalar(vtype, raw, mapping, keep=keep)
             out.append([field, op, masked] if isinstance(entry, list) else (field, op, masked))
         return out
 
