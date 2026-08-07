@@ -1142,6 +1142,20 @@ class TestKeepSetAcrossBothPasses:
             name
         )
 
+    def test_kept_name_stays_clear_in_a_compiled_filter_entry(self, masker: OutputMasker):
+        # ``filter_applied`` echoes the compiled filter back. Its handler
+        # receives the keep set but typed each entry's value through
+        # ``_mask_scalar`` without passing it on, so the echo printed a token
+        # for the name ``devname`` shows in clear on the same record. Missed
+        # twice: once when this route was written, once when every other
+        # route was threaded, because ``_mask_scalar`` still had a default
+        # that made the omission silent. It no longer has one.
+        name = "fgt-branch-01"
+        masked = masker.mask_result({"devname": name, "filter_applied": [["srcname", "==", name]]})
+
+        assert masked["devname"] == name
+        assert masked["filter_applied"] == [["srcname", "==", name]]
+
     def test_kept_names_stay_clear_inside_a_comma_joined_value(self, masker: OutputMasker):
         # FAZ joins aggregated device names into one value, and the keep set
         # is built by splitting that form -- so it holds the parts, never the
