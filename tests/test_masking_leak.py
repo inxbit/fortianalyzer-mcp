@@ -396,8 +396,8 @@ class TestFreeTextSubstitution:
         assert upper_token != lower_token
         assert upper_token in masked["msg"]
         assert lower_token in masked["msg"]
-        assert engine.unmask_username(upper_token) == "Admin"
-        assert engine.unmask_username(lower_token) == "admin"
+        assert engine.unmask_token(upper_token) == "Admin"
+        assert engine.unmask_token(lower_token) == "admin"
 
     def test_uppercase_short_values_are_not_substituted_into_prose(self, masker: OutputMasker):
         masked = masker.mask_result({"user": "abc", "msg": "ABC is a short code"})
@@ -1088,7 +1088,7 @@ class TestSoarIndicatorPair:
         out = masker.mask_result({"data": [row]})["data"][0]
 
         assert PEER_IP not in str(out)
-        assert engine.unmask_ip(out["value"]) == PEER_IP
+        assert engine.unmask_token(out["value"]) == PEER_IP
         assert out["enrichment-reputation"] == "Malicious"  # verdict stays readable
 
     def test_indicator_domain_is_masked(self, masker: OutputMasker):
@@ -1279,12 +1279,12 @@ class TestFortiViewResolvedName:
         out = masker.mask_result({"data": [row]})["data"][0]
 
         assert BAD_DOMAIN not in str(out)
-        assert FPEEngine(KEY).unmask_hostname(out["dstip_hostname"]) == BAD_DOMAIN
+        assert FPEEngine(KEY).unmask_token(out["dstip_hostname"]) == BAD_DOMAIN
 
     def test_address_form_stays_reversible(self, masker: OutputMasker):
         out = masker.mask_result({"dstip_hostname": PEER_IP})["dstip_hostname"]
 
-        assert FPEEngine(KEY).unmask_ip(out) == PEER_IP
+        assert FPEEngine(KEY).unmask_token(out) == PEER_IP
 
     @pytest.mark.parametrize("key", ["srcip_hostname", "dstip_hostname"])
     def test_both_columns_take_the_resolved_form_reversibly(self, masker: OutputMasker, key: str):
@@ -1295,7 +1295,7 @@ class TestFortiViewResolvedName:
 
         assert BAD_DOMAIN not in out
         assert not out.startswith("masked-unrepresentable-")
-        assert FPEEngine(KEY).unmask_hostname(out) == BAD_DOMAIN
+        assert FPEEngine(KEY).unmask_token(out) == BAD_DOMAIN
 
 
 class TestIncidentWorkflowPrincipals:

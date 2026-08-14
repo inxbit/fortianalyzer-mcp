@@ -103,7 +103,7 @@ class TestStructureWalk:
         assert masked["logs"][0]["bytes"] == 42
         assert masked["logs"][0]["srcip"] != "192.0.2.102"
         ipaddress.IPv4Address(masked["logs"][0]["srcip"])
-        assert engine.unmask_ip(masked["logs"][0]["srcip"]) == "192.0.2.102"
+        assert engine.unmask_token(masked["logs"][0]["srcip"]) == "192.0.2.102"
         assert masked["logs"][0]["user"].startswith("user-")
         assert masked["logs"][1]["srcmac"] != "00:1a:2b:3c:4d:5e"
         assert masked["nested"]["event_details"]["src_ip"] != "192.0.2.7"
@@ -122,8 +122,8 @@ class TestStructureWalk:
         parts = masked["ipaddr"].split(",")
         assert len(parts) == 3
         assert "192.0.2.1" not in parts and "2001:db8::1" not in parts
-        assert engine.unmask_ip(parts[0]) == "192.0.2.1"
-        assert engine.unmask_ip(parts[2]) == "2001:db8::1"
+        assert engine.unmask_token(parts[0]) == "192.0.2.1"
+        assert engine.unmask_token(parts[2]) == "2001:db8::1"
 
     def test_skip_values_pass_through(self, masker: OutputMasker):
         masked = masker.mask_result({"user": "N/A", "srcip": "", "dstuser": "unknown"})
@@ -321,7 +321,7 @@ class TestTargetFailClosed:
         masked = masker.mask_result({"target": [{"name": "ip", "value": raw_ip}, stray]})
         valid, burned = masked["target"]
 
-        assert engine.unmask_ip(valid["value"]) == raw_ip
+        assert engine.unmask_token(valid["value"]) == raw_ip
         assert "masked-unrepresentable-" not in valid["value"]
         assert burned.startswith("masked-unrepresentable-")
         assert raw_ip not in str(masked)
