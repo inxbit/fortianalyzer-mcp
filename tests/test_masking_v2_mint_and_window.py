@@ -96,33 +96,30 @@ class TestTheDeprecationWindow:
         with pytest.raises(MaskingError, match="deprecation window is closed"):
             closed.unmask_token(minting.mask_hostname("fw-hq-01"))
 
-    def test_the_suffix_forms_are_not_refused(self) -> None:
-        """This used to assert the opposite, and the reasoning was wrong.
+    def test_the_suffix_forms_are_refused_again_now_they_have_an_envelope(self) -> None:
+        """This assertion has flipped twice, so the reasoning lives here.
 
-        It said domain and email "stay v1 the longest, so the window has to
-        reach them or closing it means nothing". They do not stay v1 the
-        longest -- they stay v1 permanently, because they have no v2
-        envelope by decision (#40). So the window reaching them did not make
-        closing it mean more, it made closing it impossible: the same engine
-        minted a domain token and then refused it, in one process with one
-        key. Closing the window broke domain and email masking outright.
+        Originally it refused, on the argument that domain and email "stay
+        v1 the longest, so the window has to reach them or closing it means
+        nothing". That was wrong while they had no v2 envelope: they did not
+        stay v1 longest, they stayed v1 permanently, so the window reaching
+        them made closing it impossible rather than meaningful. The engine
+        minted a domain token and then refused it, one process, one key.
 
-        The window retires an encoding that has a replacement. The suffix
-        form has none, so there is nothing to retire it to.
-
-        Asserted through ``unmask_token`` on purpose, which is the route the
-        old test used and the route production uses: ``ArgUnmasker``
-        resolves a marked token by calling ``unmask_token``, not the
-        primitive. Going straight to ``unmask_domain`` here would leave the
-        dispatch unguarded -- re-adding a window check on the suffix branch
-        of the dispatch passes the whole suite otherwise, while breaking
-        domain and email on the only path that matters.
+        Now they DO have an envelope and mint through it by default, so a v1
+        suffix token is genuinely legacy and refusing it is the window doing
+        its job. The route is unchanged throughout: ``unmask_token``, which
+        is what ``ArgUnmasker`` calls. Only the expected answer moved.
         """
         minting = FPEEngine(KEY)
         closed = FPEEngine(KEY, accept_v1_tokens=False)
 
-        assert closed.unmask_token(minting.mask_domain("example.com")) == "example.com"
-        assert closed.unmask_token(minting.mask_email("alice@example.com")) == "alice@example.com"
+        for v1_token in (
+            minting.mask_domain("example.com"),
+            minting.mask_email("alice@example.com"),
+        ):
+            with pytest.raises(MaskingError, match="deprecation window is closed"):
+                closed.unmask_token(v1_token)
 
     def test_a_direct_primitive_call_cannot_route_around_the_window(self) -> None:
         """The reason the check sits on the key-id split.
@@ -183,67 +180,58 @@ class TestTheDeprecationWindow:
         assert token not in blob
 
 
-class TestClosingTheWindowDoesNotRefuseOurOwnOutput:
-    """Closing the window must not break the types that have no v2 form.
+class TestClosingTheWindowWithBothEnvelopes:
+    """Closing the window retires v1, and must not retire masking with it.
 
-    domain and email_local are suffix-marked and have no v2 envelope by
-    decision (#40). Their suffix token is therefore not a legacy encoding
-    waiting to be retired, it is the only encoding they have ever had.
-    Gating the suffix key-id split on the v1 window made this build refuse
-    a token it had just minted, which made the window unclosable: closing
-    it broke domain and email masking outright.
+    This class was written when domain and email_local had no v2 envelope,
+    to pin that closing the window did not refuse them. That exemption is
+    gone now they have one: their v1 token is genuinely legacy, so it is
+    refused, while their v2 token resolves. Both halves are asserted here
+    so the window cannot quietly start refusing our own output again, which
+    is the failure this class originally caught.
     """
 
     @pytest.fixture
     def closed(self) -> FPEEngine:
         return FPEEngine(KEY, accept_v1_tokens=False)
 
-    def test_a_domain_round_trips_with_the_window_closed(self, closed: FPEEngine) -> None:
-        token = closed.mask_domain("corp.example.com")
-        assert closed.unmask_domain(token) == "corp.example.com"
-
-    def test_an_email_round_trips_with_the_window_closed(self, closed: FPEEngine) -> None:
-        token = closed.mask_email("alice@corp.example.com")
-        assert closed.unmask_email(token) == "alice@corp.example.com"
-
-    @pytest.mark.parametrize("vtype", ["domain", "email_local"])
-    def test_mint_and_resolve_agree_with_the_window_closed(
-        self, closed: FPEEngine, vtype: str
+    @pytest.mark.parametrize(
+        ("vtype", "value"),
+        [("domain", "corp.example.com"), ("email_local", "alice@corp.example.com")],
+    )
+    def test_a_v2_suffix_token_round_trips_with_the_window_closed(
+        self, closed: FPEEngine, vtype: str, value: str
     ) -> None:
-        """The self-consistency the old behaviour broke: whatever mint emits,
-        this same engine must be able to read back."""
-        value = "example.com" if vtype == "domain" else "user@example.com"
-        token = closed.mint(vtype, value)
+        """The self-consistency the exemption existed to protect: whatever
+        mint emits, this same engine reads back."""
+        assert closed.unmask_token(closed.mint(vtype, value)) == value
 
-        if vtype == "domain":
-            assert closed.unmask_domain(token) == value
-        else:
-            assert closed.unmask_email(token) == value
+    @pytest.mark.parametrize(
+        ("vtype", "value"),
+        [("domain", "corp.example.com"), ("email_local", "alice@corp.example.com")],
+    )
+    def test_the_v1_spelling_of_the_same_value_is_refused(
+        self, closed: FPEEngine, vtype: str, value: str
+    ) -> None:
+        minting = FPEEngine(KEY)
+        v1 = minting.mask_domain(value) if vtype == "domain" else minting.mask_email(value)
+
+        with pytest.raises(MaskingError, match="deprecation window is closed"):
+            closed.unmask_token(v1)
 
     def test_a_prefix_form_v1_token_is_still_refused(self, closed: FPEEngine) -> None:
-        """The exemption is scoped to the suffix form. The prefix forms do
-        have a v2 envelope, so their v1 spelling is genuinely legacy and
-        closing the window still has to refuse it."""
         open_engine = FPEEngine(KEY, accept_v1_tokens=True)
         v1_hostname = open_engine.mask_hostname("fw01")
 
         with pytest.raises(MaskingError, match="deprecation window is closed"):
             closed.unmask_hostname(v1_hostname)
 
-    def test_the_exemption_is_not_a_blanket_off_switch(self, closed: FPEEngine) -> None:
-        """Guards against 'fixing' this by disabling the window everywhere.
-
-        Asserts behaviour rather than the constructor flag. Reading
-        ``_accept_v1_tokens`` proved nothing: exempting the prefix split as
-        well leaves the flag False and the attribute assertion green while
-        the window stops refusing anything at all.
-        """
-        minting = FPEEngine(KEY)
-
-        for v1_token in (
-            minting.mask_hostname("fw01"),
-            minting.mask_username("admin"),
-            minting.mask_url_tail("/a/b?c=1"),
+    def test_closing_the_window_is_not_a_blanket_refusal(self, closed: FPEEngine) -> None:
+        """Every enveloped type still resolves with the window shut."""
+        for vtype, value in (
+            ("hostname", "fw-hq-01"),
+            ("ipv4", "192.0.2.9"),
+            ("domain", "corp.example.com"),
+            ("email_local", "alice@corp.example.com"),
         ):
-            with pytest.raises(MaskingError, match="deprecation window is closed"):
-                closed.unmask_token(v1_token)
+            assert closed.unmask_token(closed.mint(vtype, value)) == value

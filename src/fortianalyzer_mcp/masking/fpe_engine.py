@@ -261,6 +261,20 @@ _V2_SHAPE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: The two suffix-marked types. They carry no ``<marker>-`` prefix: a domain
+#: token has to keep parsing as a domain so ``<local>@<domain>`` still reads
+#: as an email, which is the whole reason they were spelled this way.
+#:
+#: Their v2 envelope therefore inserts the tag as another dotted label
+#: rather than a hyphenated field: ``<ct>.<tag>.<kid>.<mask_suffix>``.
+V2_SUFFIX_TYPES = frozenset({"domain", "email_local"})
+
+#: Width of the ``.<tag>.<kid>`` trailer on a suffix envelope, so the parse
+#: can run right to left. Fixed widths are not decoration here: ``.`` is in
+#: the string alphabet, so a ciphertext can legitimately contain dots and a
+#: label count would be ambiguous. v1 already splits its key id this way.
+_V2_SUFFIX_TRAILER = 1 + V2_TAG_HEX + 1 + _KEY_ID_LEN
+
 V2_TYPES = frozenset(
     {"ipv4", "ipv6", "mac", "serial", "hostname", "username", "domain", "email_local", "url_tail"}
 )
@@ -504,6 +518,96 @@ class FPEEngine:
         return f"{marker}-{self._key_id}-{payload}-{self.v2_tag(vtype, payload)}"
 
     @staticmethod
+    def _refuse_forged_tag(vtype: str) -> None:
+        """Count a tag failure, alarm once, and refuse.
+
+        Shared by both envelopes rather than written twice. The counter is
+        compared with ``==`` and not ``>=`` on purpose: ``>=`` fired the
+        alarm on every failure from the eighth on, so 28 failures produced
+        21 ERROR lines and the escalation meant to make a grind visible was
+        itself the flood.
+        """
+        failures = _V2_FAILURE_COUNT.get(0) + 1
+        _V2_FAILURE_COUNT.set(failures)
+        if failures == V2_FAILURE_ALARM:
+            logger.error(
+                "v2 tag verification failed %d times in one call; possible forgery attempt",
+                failures,
+            )
+        else:
+            logger.warning("v2 token failed tag verification (type=%s); refused", vtype)
+        raise MaskingError("tag mismatch: forged or corrupted token")
+
+    def v2_suffix_token(self, vtype: str, ct: str) -> str:
+        """Wrap a suffix-marked ciphertext: ``<ct>.<tag>.<kid>.<mask_suffix>``.
+
+        The prefix form cannot be reused here. A domain token has to keep
+        parsing as a domain, because the email form embeds it as
+        ``<local>@<domain-token>``; spelling it ``domain-<kid>-<ct>-<tag>``
+        would stop it being a domain and take the email form with it.
+
+        For ``email_local`` the tag covers ``<local_ct>@<domain_ct>``, so the
+        two halves are bound together and neither can be lifted out and
+        recombined with another token's half.
+        """
+        if vtype not in V2_SUFFIX_TYPES:
+            raise MaskingError(f"no v2 suffix envelope for value type: {vtype!r}")
+        return f"{ct}.{self.v2_tag(vtype, ct)}.{self._key_id}.{self._mask_suffix}"
+
+    def is_v2_suffix_shaped(self, token: str) -> bool:
+        """Does this text have the full shape of a suffix v2 envelope?
+
+        Same commitment rule as :meth:`is_v2_shaped`: a token that looks
+        like v2 is committed to v2 and never retried on v1, or a flipped tag
+        would decrypt on the v1 path and forgery refusal would not hold.
+
+        Same measured cost, too. A v1 domain token whose ciphertext happens
+        to end in a dot plus 8 lowercase hex is refused: (1/40) * (16/40)**8
+        = 1.6e-5 per token, over the 40-character string alphabet. It fails
+        closed and loudly.
+        """
+        candidate = token.strip().lower()
+        marker = "." + self._mask_suffix
+        if not candidate.endswith(marker):
+            return False
+        payload = candidate[: -len(marker)]
+        if len(payload) <= _V2_SUFFIX_TRAILER:
+            return False
+        kid = payload[-_KEY_ID_LEN:]
+        tag = payload[-(_KEY_ID_LEN + 1 + V2_TAG_HEX) : -(_KEY_ID_LEN + 1)]
+        return (
+            payload[-(_KEY_ID_LEN + 1)] == "."
+            and payload[-_V2_SUFFIX_TRAILER] == "."
+            and bool(_KEY_ID_RE.match(kid))
+            and all(c in "0123456789abcdef" for c in tag)
+        )
+
+    def v2_suffix_open(self, token: str) -> str:
+        """Verify and decrypt a suffix v2 envelope.
+
+        Total over untrusted text, like :meth:`v2_open`: this is handed
+        token-shaped strings a model supplied.
+        """
+        if not self.is_v2_suffix_shaped(token):
+            raise MaskingError("not a v2 suffix token")
+        candidate = token.strip().lower()
+        payload = candidate[: -(len(self._mask_suffix) + 1)]
+        kid = payload[-_KEY_ID_LEN:]
+        tag = payload[-(_KEY_ID_LEN + 1 + V2_TAG_HEX) : -(_KEY_ID_LEN + 1)]
+        ct = payload[:-_V2_SUFFIX_TRAILER]
+        vtype = "email_local" if "@" in ct else "domain"
+        self._check_key_id(kid, token)
+        self._spend_verification()
+        if not self.v2_tag_ok(vtype, ct, tag):
+            self._refuse_forged_tag(vtype)
+        if vtype == "domain":
+            return self._decrypt_str("domain", ct)
+        local_ct, _, domain_ct = ct.partition("@")
+        return (
+            f"{self._decrypt_str('email_local', local_ct)}@{self._decrypt_str('domain', domain_ct)}"
+        )
+
+    @staticmethod
     def is_v2_shaped(token: str) -> bool:
         """Does this text have the full shape of a v2 envelope?
 
@@ -548,6 +652,24 @@ class FPEEngine:
         Total: never raises. A malformed or foreign token is simply not
         ours, which is the answer the caller needs.
         """
+        if self.is_v2_suffix_shaped(value):
+            # There are two envelopes, and one predicate has to answer for
+            # both or the output side gets a second, narrower definition of
+            # "ours" -- which is exactly how three leaks happened here
+            # before. Without this, a suffix token echoed back into a
+            # domain-typed field is re-masked into a double token, and one
+            # restore then yields the inner token rather than the value.
+            candidate = value.strip().lower()
+            payload = candidate[: -(len(self._mask_suffix) + 1)]
+            kid = payload[-_KEY_ID_LEN:]
+            if kid != self._key_id:
+                return False
+            tag = payload[-(_KEY_ID_LEN + 1 + V2_TAG_HEX) : -(_KEY_ID_LEN + 1)]
+            ct = payload[:-_V2_SUFFIX_TRAILER]
+            try:
+                return self.v2_tag_ok("email_local" if "@" in ct else "domain", ct, tag)
+            except Exception:
+                return False
         match = _V2_SHAPE_RE.match(value.strip())
         if match is None:
             return False
@@ -799,7 +921,14 @@ class FPEEngine:
         return f"{self._encrypt_str('domain', value)}.{self._key_id}.{self._mask_suffix}"
 
     def unmask_domain(self, token: str) -> str:
-        """Reverse :meth:`mask_domain`."""
+        """Reverse :meth:`mask_domain`, or open a v2 suffix envelope.
+
+        The shape question comes first and commits, exactly as it does on
+        the prefix path: a v2 domain token is also a valid-looking v1 one,
+        so asking v1 first would decrypt a flipped tag to garbage.
+        """
+        if self.is_v2_suffix_shaped(token):
+            return self.v2_suffix_open(token)
         payload = self._strip_domain_suffix(token)
         return self._decrypt_str("domain", self._split_key_id_suffix(payload, token))
 
@@ -814,7 +943,15 @@ class FPEEngine:
         )
 
     def unmask_email(self, token: str) -> str:
-        """Reverse :meth:`mask_email`."""
+        """Reverse :meth:`mask_email`, or open a v2 suffix envelope.
+
+        Shape first and committed, same rule as the domain path. The v2
+        email token tags ``<local_ct>@<domain_ct>`` as one payload, so its
+        two halves cannot be split apart and recombined with another
+        token's half and still verify.
+        """
+        if self.is_v2_suffix_shaped(token):
+            return self.v2_suffix_open(token)
         local, _, domain = token.strip().lower().partition("@")
         if not local or not domain:
             raise MaskingError(f"not a masked email token: {token!r}")
@@ -925,6 +1062,14 @@ class FPEEngine:
         # may itself start with "host-"/"user-" by chance, but a prefix
         # token ending in ".<mask_suffix>" is astronomically unlikely.
         if candidate.endswith("." + self._mask_suffix):
+            # No v2 check here on purpose. Both primitives below ask the
+            # shape question themselves, and they are the choke point: this
+            # dispatch is bypassable (ArgUnmasker calls primitives directly),
+            # so a check placed only here would be routed around, exactly
+            # the reasoning _refuse_v1_if_window_closed already records for
+            # the key-id splits. A check in both places is redundant rather
+            # than defensive: removing this one alone leaves the suite green
+            # because the primitives still cover it.
             if "@" in candidate:
                 return self.unmask_email(candidate)
             return self.unmask_domain(candidate)
@@ -1047,12 +1192,11 @@ class FPEEngine:
         way: the v1 primitives are pinned by golden vectors shared with
         fortimanager-mcp, so their output cannot change.
 
-        ``domain`` and ``email_local`` come back v1 by an explicit branch
-        rather than by falling off the end. They are suffix-marked, so
-        their v2 spelling would be a different parse rather than a
-        different envelope, and #40 deliberately left them for later. A
-        test pins their absence; this branch is what keeps that a decision
-        instead of an oversight.
+        ``domain`` and ``email_local`` mint through the SUFFIX envelope
+        rather than the prefix one. They are suffix-marked so that a domain
+        token still parses as a domain and ``<local>@<domain>`` still reads
+        as an email; a ``domain-<kid>-<ct>-<tag>`` spelling would end both
+        properties. The envelope goes in as another dotted label instead.
 
         Raises:
             MaskingError: If the value cannot be masked, unchanged from the
@@ -1074,9 +1218,15 @@ class FPEEngine:
         if minter is not None:
             return self.v2_token(vtype, self._v1_payload(getattr(self, minter)(value)))
         if vtype == "domain":
-            return self.mask_domain(value)
+            return self.v2_suffix_token("domain", self._encrypt_str("domain", value))
         if vtype == "email_local":
-            return self.mask_email(value)
+            local, _, domain = value.strip().partition("@")
+            if not local or not domain:
+                raise MaskingError("not a valid email address")
+            payload = (
+                f"{self._encrypt_str('email_local', local)}@{self._encrypt_str('domain', domain)}"
+            )
+            return self.v2_suffix_token("email_local", payload)
         raise MaskingError(f"no minting route for value type: {vtype!r}")
 
     def _refuse_v1_if_window_closed(self, form: str) -> None:
@@ -1136,7 +1286,15 @@ class FPEEngine:
         if not _KEY_ID_RE.match(kid) or sep != "." or not ct:
             raise MaskingError(f"token carries no key id: {token!r}")
         self._check_key_id(kid, token)
-        # Deliberately NOT gated by the v1 deprecation window. The suffix
+        # Back under the window now that domain and email_local have a v2
+        # envelope. It was exempted while they had none: their suffix token
+        # was not a legacy encoding awaiting retirement, it was the only
+        # encoding they had, so closing the window made the engine refuse a
+        # token it had just minted. That is no longer true -- mint emits the
+        # v2 suffix envelope, so a v1 suffix token is genuinely legacy and
+        # closing the window is meant to refuse it.
+        self._refuse_v1_if_window_closed("suffix")
+        # Superseded comment kept out of the way: the suffix
         # form is domain and email_local, and those two have no v2 envelope
         # by design (they are suffix-marked, so a v2 spelling would be a
         # different parse, and they already carry a marker and a key id --

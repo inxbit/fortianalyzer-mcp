@@ -13,10 +13,12 @@ for rather than by its spelling:
   scan.
 * **serial** as its own type, so it has an envelope at all.
 
-The suffix-marked types (``domain``, ``email_local``) have no v2 form yet
+The suffix-marked types (``domain``, ``email_local``) carry their own
+envelope, spelled as dotted labels rather than hyphenated fields.
 and are out of scope here; see ``TestWhatIsNotCoveredYet``.
 """
 
+import logging
 import re
 from urllib.parse import urlsplit
 
@@ -230,18 +232,32 @@ class TestKeyId:
         assert "failed tag verification" not in caplog.text
 
 
-class TestWhatIsNotCoveredYet:
-    def test_the_suffix_marked_types_have_no_envelope(self, engine: FPEEngine):
+class TestTheTwoEnvelopesAreDistinct:
+    def test_the_suffix_marked_types_have_their_own_envelope(self, engine: FPEEngine):
         # domain and email_local are marked by a dotted suffix rather than a
-        # hyphenated prefix, so their v2 spelling is a different parse. They
-        # already carry a marker and a key id today, so they are not what the
-        # marked-IP work is blocked on, and they are deliberately left for a
-        # following change rather than half-built here.
+        # hyphenated prefix, because a domain token has to keep parsing as a
+        # domain: the email form embeds it as <local>@<domain-token>. So the
+        # prefix envelope genuinely does not fit them, and they are absent
+        # from V2_MARKERS and from v2_token on purpose.
+        #
+        # They are not unenveloped, though. This asserted that they were
+        # while it was true; they now carry the tag as another dotted label
+        # instead, through v2_suffix_token.
         assert "domain" not in V2_MARKERS
         assert "email_local" not in V2_MARKERS
 
         with pytest.raises(MaskingError, match="no v2 envelope"):
             engine.v2_token("domain", "abc")
+
+        for vtype, value in (("domain", "example.com"), ("email_local", "a@example.com")):
+            token = engine.mint(vtype, value)
+            assert engine.is_v2_suffix_shaped(token)
+            assert engine.v2_suffix_open(token) == value
+
+    def test_a_prefix_type_is_refused_by_the_suffix_envelope(self, engine: FPEEngine):
+        """The two envelopes do not accept each other's types."""
+        with pytest.raises(MaskingError, match="no v2 suffix envelope"):
+            engine.v2_suffix_token("hostname", "abc")
 
     def test_the_marker_set_matches_the_sibling_server(self):
         # These spellings already shipped in fortimanager-mcp's reserved
@@ -293,3 +309,186 @@ class TestSpecPin:
             r"(?:ip4|ip6|mac|sn|url|host|user)-[0-9a-f]{4}-.+-[0-9a-f]{8}",
             engine.v2_token("hostname", _ct(engine.mask_hostname("fw-hq-01"))),
         )
+
+
+class TestTheSuffixEnvelope:
+    """The domain/email_local envelope: ``<ct>.<tag>.<kid>.<mask_suffix>``.
+
+    Spelled as dotted labels rather than the prefix form's hyphenated
+    fields so the token keeps parsing as a domain, which is what lets
+    ``<local>@<domain-token>`` still read as an email.
+    """
+
+    @staticmethod
+    def _parts(engine: FPEEngine, token: str) -> tuple[str, str, str]:
+        """Split a suffix token into (ct, tag, kid).
+
+        Not rsplit(".", 3): mask_suffix is itself dotted ("masked.invalid"),
+        so counting from the right lands inside the marker.
+        """
+        payload = token[: -(len(engine.mask_suffix) + 1)]
+        ct, tag, kid = payload.rsplit(".", 2)
+        return ct, tag, kid
+
+    @pytest.mark.parametrize(
+        ("vtype", "value"),
+        [("domain", "corp.example.com"), ("email_local", "alice@corp.example.com")],
+    )
+    def test_it_round_trips(self, engine: FPEEngine, vtype: str, value: str):
+        assert engine.v2_suffix_open(engine.mint(vtype, value)) == value
+
+    def test_a_domain_token_is_still_shaped_like_a_domain(self, engine: FPEEngine):
+        token = engine.mint("domain", "corp.example.com")
+        assert token.endswith("." + engine.mask_suffix)
+        assert "@" not in token
+
+    def test_an_email_token_is_still_shaped_like_an_email(self, engine: FPEEngine):
+        token = engine.mint("email_local", "alice@corp.example.com")
+        assert token.count("@") == 1
+        assert token.endswith("." + engine.mask_suffix)
+
+    @pytest.mark.parametrize("vtype", ["domain", "email_local"])
+    def test_a_flipped_tag_is_refused(self, engine: FPEEngine, vtype: str):
+        value = "corp.example.com" if vtype == "domain" else "alice@corp.example.com"
+        ct, tag, kid = self._parts(engine, engine.mint(vtype, value))
+        flipped = ("f" * len(tag)) if tag != "f" * len(tag) else ("0" * len(tag))
+
+        with pytest.raises(MaskingError, match="tag mismatch"):
+            engine.v2_suffix_open(f"{ct}.{flipped}.{kid}.{engine.mask_suffix}")
+
+    def test_a_forged_token_is_not_retried_on_the_v1_path(self, engine: FPEEngine):
+        """The commitment rule. A v2 suffix token is also a byte-valid v1
+        one, so a fallback would decrypt a flipped tag to plausible garbage
+        and forgery refusal would not hold at all."""
+        ct, tag, kid = self._parts(engine, engine.mint("domain", "corp.example.com"))
+        flipped = ("f" * len(tag)) if tag != "f" * len(tag) else ("0" * len(tag))
+
+        with pytest.raises(MaskingError, match="tag mismatch"):
+            engine.unmask_token(f"{ct}.{flipped}.{kid}.{engine.mask_suffix}")
+
+    def test_a_foreign_key_id_is_refused(self, engine: FPEEngine):
+        ct, tag, _ = self._parts(engine, engine.mint("domain", "corp.example.com"))
+        foreign = f"{ct}.{tag}.ffff.{engine.mask_suffix}"
+
+        with pytest.raises(MaskingError):
+            engine.v2_suffix_open(foreign)
+
+    def test_an_email_half_cannot_be_recombined(self, engine: FPEEngine):
+        """The email tag covers ``<local_ct>@<domain_ct>`` as one payload,
+        so a half lifted from another token does not verify."""
+        a = engine.mint("email_local", "alice@corp.example.com")
+        b = engine.mint("email_local", "bob@other.example.net")
+        a_local = a.split("@")[0]
+        b_rest = b.split("@")[1]
+
+        with pytest.raises(MaskingError, match="tag mismatch"):
+            engine.v2_suffix_open(f"{a_local}@{b_rest}")
+
+    def test_a_domain_tag_does_not_verify_as_an_email(self, engine: FPEEngine):
+        """Per-type domain separation, same property the prefix form has."""
+        domain_ct = self._parts(engine, engine.mint("domain", "corp.example.com"))[0]
+        assert engine.v2_tag("domain", domain_ct) != engine.v2_tag("email_local", domain_ct)
+
+    def test_a_v1_token_is_not_mistaken_for_v2(self, engine: FPEEngine):
+        assert not engine.is_v2_suffix_shaped(engine.mask_domain("corp.example.com"))
+        assert not engine.is_v2_suffix_shaped(engine.mask_email("alice@corp.example.com"))
+
+    def test_a_bare_name_is_not_mistaken_for_v2(self, engine: FPEEngine):
+        for value in ("corp.example.com", "fw01", "", "."):
+            assert not engine.is_v2_suffix_shaped(value)
+
+    @pytest.mark.parametrize("vtype", ["domain", "email_local"])
+    def test_the_primitive_route_also_commits_to_v2(self, engine: FPEEngine, vtype: str):
+        """``unmask_token`` is not the only way in. The primitives are
+        callable directly, and a v2 token is a byte-valid v1 one, so each
+        route has to ask the shape question itself: dropping the check from
+        either one alone leaves the other covering it, and the whole suite
+        stays green."""
+        value = "corp.example.com" if vtype == "domain" else "alice@corp.example.com"
+        token = engine.mint(vtype, value)
+
+        primitive = engine.unmask_domain if vtype == "domain" else engine.unmask_email
+        assert primitive(token) == value
+
+    @pytest.mark.parametrize("vtype", ["domain", "email_local"])
+    def test_the_dispatch_route_also_commits_to_v2(self, engine: FPEEngine, vtype: str):
+        """The other half of the pair above, through the route production
+        uses: ArgUnmasker resolves a marked token via unmask_token."""
+        value = "corp.example.com" if vtype == "domain" else "alice@corp.example.com"
+        assert engine.unmask_token(engine.mint(vtype, value)) == value
+
+    def test_a_v1_token_ending_in_a_non_hex_label_still_resolves(self, engine: FPEEngine):
+        """The shape predicate checks the tag is hex, not merely that a
+        label of the right width is there. Without that, a v1 token whose
+        ciphertext happens to end in a dot and eight non-hex characters is
+        committed to v2 and refused, when it is a perfectly good v1 token.
+        """
+        v1 = f"somect.abcdefgh.{engine.key_id}.{engine.mask_suffix}"
+        assert not engine.is_v2_suffix_shaped(v1)
+
+    def test_the_suffix_envelope_charges_the_verification_budget(self, engine: FPEEngine) -> None:
+        """The budget bounds an attacker grinding tags on the inbound path.
+        Unpinned on this envelope, removing the charge left the whole suite
+        green, and this codebase has shipped a fail-silent budget before.
+
+        The exhaustion is caught by type rather than by pytest.raises:
+        VerificationBudgetExhausted subclasses MaskingError, so a plain
+        raises(MaskingError) swallows the very thing under test.
+        """
+        from fortianalyzer_mcp.masking.fpe_engine import (
+            V2_VERIFY_BUDGET,
+            VerificationBudgetExhausted,
+            begin_v2_verification_budget,
+        )
+
+        begin_v2_verification_budget()
+        ct, tag, kid = self._parts(engine, engine.mint("domain", "corp.example.com"))
+        bad = f"{ct}.{'f' * len(tag)}.{kid}.{engine.mask_suffix}"
+        exhausted = False
+        for _ in range(V2_VERIFY_BUDGET + 2):
+            try:
+                engine.v2_suffix_open(bad)
+            except VerificationBudgetExhausted:
+                exhausted = True
+                break
+            except MaskingError:
+                continue
+        begin_v2_verification_budget()
+        assert exhausted, "the suffix envelope never charged the verification budget"
+
+    def test_the_suffix_alarm_fires_once_not_per_failure(self, engine: FPEEngine, caplog) -> None:
+        """`>=` fired on every failure from the eighth on, so the escalation
+        meant to make a grind visible was itself the flood."""
+        from fortianalyzer_mcp.masking.fpe_engine import begin_v2_verification_budget
+
+        begin_v2_verification_budget()
+        ct, tag, kid = self._parts(engine, engine.mint("domain", "corp.example.com"))
+        bad = f"{ct}.{'f' * len(tag)}.{kid}.{engine.mask_suffix}"
+        with caplog.at_level(logging.ERROR):
+            for _ in range(12):
+                with pytest.raises(MaskingError):
+                    engine.v2_suffix_open(bad)
+        assert sum("possible forgery attempt" in r.message for r in caplog.records) == 1
+        begin_v2_verification_budget()
+
+    def test_the_trailer_separator_is_required(self, engine: FPEEngine) -> None:
+        """Without the leading dot of ``.<tag>.<kid>`` the predicate widens
+        from a 1.6e-5 false refusal to 6.6e-4, for no gain."""
+        assert not engine.is_v2_suffix_shaped(f"abcdeadbeef.{engine.key_id}.{engine.mask_suffix}")
+
+    @pytest.mark.parametrize("vtype", ["domain", "email_local"])
+    def test_our_own_suffix_token_is_recognised_as_ours(
+        self, engine: FPEEngine, vtype: str
+    ) -> None:
+        """One predicate has to answer for both envelopes. Without this a
+        suffix token echoed back into a typed field is re-masked into a
+        double token, and one restore yields the inner token."""
+        value = "corp.example.com" if vtype == "domain" else "alice@corp.example.com"
+        assert engine.is_own_v2_token(engine.mint(vtype, value))
+
+    def test_a_foreign_suffix_token_is_not_ours(self, engine: FPEEngine) -> None:
+        other = FPEEngine("1" * 32)
+        assert not engine.is_own_v2_token(other.mint("domain", "corp.example.com"))
+
+    def test_a_real_domain_is_not_mistaken_for_ours(self, engine: FPEEngine) -> None:
+        assert not engine.is_own_v2_token("corp.example.com")
