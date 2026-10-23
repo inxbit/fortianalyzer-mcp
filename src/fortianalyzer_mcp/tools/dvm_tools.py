@@ -538,12 +538,12 @@ async def search_devices(
             dvmdb reads a bare list of conditions as OR. Fields: name, ip, sn,
             hostname, desc, os_ver, mr, patch, platform_str, conn_status,
             dev_status, mgmt_mode, adm_usr, vdom, hdisk_size, build.
-            Ops: eq, ne, gt, gte, lt, lte, contains, not_in. Not supported
-            here (hard error): "in" (issue one call per value),
-            "not_contains" (no spelling works against this endpoint; use "ne"
-            with exact values or exclude matches yourself), and "contains" on
-            os_ver, mr and patch, which are integers (use "eq" with a number,
-            or os_version_filter).
+            Ops: eq, ne, gt, gte, lt, lte, contains, in, not_in. "in" is an
+            OR over its values, nested as one group inside the chain. Not
+            supported here (hard error): "not_contains" (no spelling works
+            against this endpoint; use "ne" with exact values or exclude
+            matches yourself), and "contains" on os_ver, mr and patch, which
+            are integers (use "eq" with a number, or os_version_filter).
             Aliases accepted for field names: device_name (name),
             serial/serial_number (sn), os_version (os_ver),
             platform (platform_str), connection_status (conn_status),

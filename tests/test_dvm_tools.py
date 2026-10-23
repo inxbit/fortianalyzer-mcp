@@ -199,6 +199,22 @@ class TestSearchDevicesStructuredFilters:
 
         assert fake.captured == [["name", "!=", "myfw01"], "&&", ["name", "!=", "myfw01-old"]]
 
+    async def test_in_nests_as_an_or_group_beside_a_narrow_param(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = self._install(monkeypatch)
+
+        await dvm_tools.search_devices(
+            name_filter="old",
+            filters=[FilterCondition(field="name", op="in", value=["myfw01", "myfw01-old"])],
+        )
+
+        assert fake.captured == [
+            ["name", "like", "%old%"],
+            "&&",
+            [["name", "==", "myfw01"], "||", ["name", "==", "myfw01-old"]],
+        ]
+
     async def test_response_echoes_the_compiled_filter(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

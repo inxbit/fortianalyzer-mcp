@@ -293,17 +293,34 @@ _ARRAY_OPS: dict[str, str] = {
 }
 
 
-def _and_join(entries: list[list[object]]) -> list[object]:
-    """Join entries so a row must match all of them: ``[c1, "&&", c2, ...]``.
-
-    A single entry goes out unchanged as ``[c1]``; no entries give ``[]``.
-    """
+def _chain(terms: Sequence[list[object]], separator: str) -> list[object]:
+    """``[t1, separator, t2, separator, ...]``; ``[t1]`` for one term."""
     joined: list[object] = []
-    for entry in entries:
+    for term in terms:
         if joined:
-            joined.append("&&")
-        joined.append(entry)
+            joined.append(separator)
+        joined.append(term)
     return joined
+
+
+def _is_group(term: list[object]) -> bool:
+    """An ``"||"`` group leads with an entry; an entry leads with its field."""
+    return bool(term) and isinstance(term[0], list)
+
+
+def _and_join(terms: list[list[object]]) -> list[object]:
+    """Join terms so a row must match all of them: ``[t1, "&&", t2, ...]``.
+
+    A term is an entry or an ``"||"`` group from ``in``. A lone entry goes out
+    unchanged as ``[c1]`` and a lone group as itself, ``[c1, "||", c2]``; no
+    terms give ``[]``. Beside other terms a group stays nested rather than
+    spliced into the chain: the precedence of ``"&&"`` against ``"||"`` in one
+    flat list is undocumented, and ``[[a, "||", b], "&&", c]`` is the
+    documented form.
+    """
+    if len(terms) == 1 and _is_group(terms[0]):
+        return terms[0]
+    return _chain(terms, "&&")
 
 
 def compile_to_array(
@@ -331,11 +348,11 @@ def compile_to_array(
     wildcards, so a needle containing ``_`` can over-match by one character --
     accepted, since the alternative is an operator that never matches at all.
 
-    ``in`` and ``not_contains`` are refused rather than guessed. ``in``'s
-    OR-separator syntax is documented for FortiManager but unexercised in this
-    repo; for ``not_contains`` every candidate spelling (``!contain``,
-    ``not like``) silently matches zero rows live, so there is nothing correct
-    to emit.
+    ``in`` compiles to ``==`` entries joined with ``"||"``, the array
+    dialect's OR, and goes into the ``"&&"`` chain as one nested group --
+    see ``_and_join``. ``not_contains`` is refused rather than guessed: every
+    candidate spelling (``!contain``, ``not like``) silently matches zero rows
+    live, so there is nothing correct to emit.
 
     ``contains`` against a field stored as an enum code (``state``,
     ``conn_status``) is refused for the same reason -- the wildcards would wrap
@@ -346,12 +363,14 @@ def compile_to_array(
     Returns:
         ``(filter, warnings)``. ``filter`` is ``[]`` for no conditions,
         ``[c1]`` for one, and ``[c1, "&&", c2, ...]`` otherwise. ``not_in``
-        contributes one ``!=`` entry per value to the same chain.
+        contributes one ``!=`` entry per value to the same chain; ``in``
+        contributes one ``[c1, "||", c2, ...]`` group, or a plain entry for a
+        single value.
 
     Raises:
-        ValidationError: on ``in``, ``not_contains``, a substring op against a
-            field stored as an enum code or a plain integer, a value/op
-            mismatch, a boolean value, or an unknown field.
+        ValidationError: on ``not_contains``, a substring op against a field
+            stored as an enum code or a plain integer, a value/op mismatch, a
+            boolean value, or an unknown field.
     """
     entries: list[list[object]] = []
     warnings: list[str] = []
@@ -384,6 +403,15 @@ def compile_to_array(
                 entries.append([field, "!=", coerce_value(vocabulary, field, item)])
             continue
 
+        if op == "in":
+            alternatives = [
+                [field, "==", coerce_value(vocabulary, field, item)] for item in _values(condition)
+            ]
+            entries.append(
+                alternatives[0] if len(alternatives) == 1 else _chain(alternatives, "||")
+            )
+            continue
+
         if op == "not_contains":
             raise ValidationError(
                 f"Filter op 'not_contains' on '{field}' is not supported against this "
@@ -392,10 +420,8 @@ def compile_to_array(
                 "yourself."
             )
 
-        raise ValidationError(
-            f"Filter op '{op}' on '{field}' is not supported against this endpoint: "
-            "the array dialect has no verified OR form for it (query_logs accepts it "
-            "because the string dialect does). Issue one call per value instead."
+        raise ValidationError(  # pragma: no cover - every op in the enum is handled above
+            f"Filter op '{op}' is not supported on the array dialect."
         )
 
     return _and_join(entries), warnings

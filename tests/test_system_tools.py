@@ -153,6 +153,24 @@ class TestListTasksStructuredFilters:
 
         assert fake.captured == [["state", "==", 4], "&&", ["num_err", ">", 0]]
 
+    async def test_in_on_state_is_an_or_group_inside_the_chain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = self._install(monkeypatch)
+
+        await system_tools.list_tasks(
+            filters=[
+                FilterCondition(field="state", op="in", value=["error", "warning"]),
+                FilterCondition(field="num_err", op="gt", value=0),
+            ]
+        )
+
+        assert fake.captured == [
+            [["state", "==", 5], "||", ["state", "==", 8]],
+            "&&",
+            ["num_err", ">", 0],
+        ]
+
     async def test_response_echoes_the_compiled_filter(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

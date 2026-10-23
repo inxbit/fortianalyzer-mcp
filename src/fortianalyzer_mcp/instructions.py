@@ -84,18 +84,18 @@ FortiAnalyzer's own parser accepts more than that, but nothing beyond this set
 is verified against this API here, so treat anything else as an experiment you
 run through `filter`.
 
-search_devices and list_tasks take the same `filters` parameter, with three
-exceptions: `in` is rejected there (their array dialect has no verified OR
-form -- issue one call per value; `not_in` works, compiled to `!=` conditions
-joined with "&&"), `not_contains` is rejected too, because every candidate
-spelling silently matches zero rows on the appliance -- use `ne` with exact
-values or exclude matches yourself -- and `contains` is rejected on the
-code-valued fields (`state`, `conn_status`), where a substring would compare
-against the stored integer rather than the name you wrote and `%1%` would
-match both 1 and 10. Filter those with `eq`/`ne` and a name; the refusal lists
-the accepted names. `contains` is rejected on `os_ver`, `mr` and `patch` as
-well: dvmdb stores a version as those three integers, and a substring match
-does not text-match an integer.
+search_devices and list_tasks take the same `filters` parameter, with two
+exceptions: `not_contains` is rejected there, because every candidate spelling
+silently matches zero rows on the appliance -- use `ne` with exact values or
+exclude matches yourself -- and `contains` is rejected on the code-valued
+fields (`state`, `conn_status`), where a substring would compare against the
+stored integer rather than the name you wrote and `%1%` would match both 1 and
+10. Filter those with `eq`/`ne` and a name; the refusal lists the accepted
+names. `contains` is rejected on `os_ver`, `mr` and `patch` as well: dvmdb
+stores a version as those three integers, and a substring match does not
+text-match an integer. `in` compiles to `==` conditions joined with "||",
+nested as one group when other conditions are present; `not_in` compiles to
+`!=` conditions joined with "&&".
 Their field sets are small enough to enumerate, so an unknown field name there
 is a hard error listing the valid names; for logtypes an unrecognised name is
 passed through with a warning instead, since the appliance's catalogue is

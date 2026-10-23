@@ -107,6 +107,9 @@ _DEVICE_POOL = [
     FilterCondition(field="conn_status", op="eq", value="up"),
     FilterCondition(field="name", op="not_in", value=["a", "b", "c"]),
     FilterCondition(field="sn", op="not_in", value=["FG100F0000"]),
+    FilterCondition(field="name", op="in", value=["a", "b"]),
+    FilterCondition(field="os_ver", op="in", value=[6, 7, 8]),
+    FilterCondition(field="sn", op="in", value=["FG100F0000"]),
 ]
 
 
@@ -142,6 +145,17 @@ _MULTI_CONDITION_CALLS: list[tuple[Any, dict[str, Any]]] = [
             "name_filter": "fgt",
             "connection_status": "down",
             "filters": [FilterCondition(field="desc", op="contains", value="branch")],
+        },
+    ),
+    (
+        dvm_tools.search_devices,
+        {"filters": [FilterCondition(field="name", op="in", value=["myfw01", "myfw01-old"])]},
+    ),
+    (
+        dvm_tools.search_devices,
+        {
+            "os_version_filter": "7",
+            "filters": [FilterCondition(field="mr", op="in", value=[4, 6])],
         },
     ),
     (

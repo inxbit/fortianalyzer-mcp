@@ -404,13 +404,51 @@ class TestArrayDialect:
             ["platform_str", "like", "%VM%"],
         ]
 
-    def test_in_is_refused_rather_than_guessed(self) -> None:
-        """The refusal states its reason, like not_contains does -- a caller
-        who knows ``in`` works on query_logs deserves the why, not just a no."""
-        with pytest.raises(ValidationError) as exc:
-            compile_to_array([_c("name", "in", ["a", "b"])], "device")
-        assert "one call per value" in str(exc.value)
-        assert "OR form" in str(exc.value)
+    def test_in_alone_is_a_flat_or_chain(self) -> None:
+        """``"||"`` is the array dialect's OR, measured on FortiManager 7.6.7
+        (fortimanager-mcp#98) and on this appliance for #146."""
+        result, _ = compile_to_array([_c("name", "in", ["a", "b", "c"])], "device")
+        assert result == [
+            ["name", "==", "a"],
+            "||",
+            ["name", "==", "b"],
+            "||",
+            ["name", "==", "c"],
+        ]
+
+    def test_in_with_one_value_is_a_single_entry(self) -> None:
+        result, _ = compile_to_array([_c("name", "in", ["a"])], "device")
+        assert result == [["name", "==", "a"]]
+
+    def test_in_nests_as_one_group_inside_the_and_chain(self) -> None:
+        """Never ``[a, "||", b, "&&", c]``: the precedence of a mixed flat
+        chain is undocumented, so the OR group is nested instead."""
+        result, _ = compile_to_array(
+            [_c("name", "in", ["a", "b"]), _c("platform_str", "contains", "VM")], "device"
+        )
+        assert result == [
+            [["name", "==", "a"], "||", ["name", "==", "b"]],
+            "&&",
+            ["platform_str", "like", "%VM%"],
+        ]
+
+    def test_two_in_conditions_are_two_nested_groups(self) -> None:
+        result, _ = compile_to_array([_c("os_ver", "in", [6, 7]), _c("mr", "in", [2, 4])], "device")
+        assert result == [
+            [["os_ver", "==", 6], "||", ["os_ver", "==", 7]],
+            "&&",
+            [["mr", "==", 2], "||", ["mr", "==", 4]],
+        ]
+
+    def test_in_coerces_each_enum_name_to_its_code(self) -> None:
+        result, _ = compile_to_array([_c("state", "in", ["error", "warning"])], "task")
+        assert result == [["state", "==", 5], "||", ["state", "==", 8]]
+
+    def test_in_with_a_single_value_joins_the_and_chain_unnested(self) -> None:
+        result, _ = compile_to_array(
+            [_c("name", "in", ["a"]), _c("platform_str", "contains", "VM")], "device"
+        )
+        assert result == [["name", "==", "a"], "&&", ["platform_str", "like", "%VM%"]]
 
     def test_no_conditions_compiles_to_an_empty_list(self) -> None:
         result, warnings = compile_to_array([], "device")
