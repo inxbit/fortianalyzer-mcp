@@ -1782,6 +1782,81 @@ class TestCompiledFilterEntries:
 
         assert masked["filter_applied"] == ["a note", ["only", "two"]]
 
+    def test_an_and_chain_masks_each_entry_and_keeps_its_separators(self, masker: OutputMasker):
+        """The array dialect joins entries with "&&" (#146). The separator is a
+        bare string between entries and must come back as itself, while each
+        entry beside it is still typed by its own field."""
+        host = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+        user = masker.mask_result({"user": ANALYST})["user"]
+        masked = masker.mask_result(
+            {
+                "count": 0,
+                "filter_applied": [
+                    ["hostname", "==", SRC_NAME],
+                    "&&",
+                    ["user", "==", ANALYST],
+                    "&&",
+                    ["os_ver", "==", 7],
+                ],
+            }
+        )
+
+        assert SRC_NAME not in str(masked)
+        assert ANALYST not in str(masked)
+        assert masked["filter_applied"] == [
+            ["hostname", "==", host],
+            "&&",
+            ["user", "==", user],
+            "&&",
+            ["os_ver", "==", 7],
+        ]
+
+    @pytest.mark.parametrize("width", [2, 3])
+    def test_a_nested_or_group_masks_each_entry_by_its_field(
+        self, masker: OutputMasker, width: int
+    ):
+        """``in`` compiles to an ``"||"`` group nested in the ``"&&"`` chain.
+
+        Two alternatives make a three-part list whose "field" is a list, three
+        make a five-part one; either way the group used to fall to the
+        free-text scan, which cannot see a hostname in a response that matched
+        nothing, so it rode back out in clear beside the caller's own token.
+        """
+        names = [SRC_NAME, "fw-dr.example.org", "fw-lab.example.net"][:width]
+        tokens = [masker.mask_result({"hostname": name})["hostname"] for name in names]
+
+        def group(values: list[str]) -> list[object]:
+            out: list[object] = []
+            for value in values:
+                if out:
+                    out.append("||")
+                out.append(["hostname", "==", value])
+            return out
+
+        masked = masker.mask_result(
+            {
+                "count": 0,
+                "filter_applied": [group(names), "&&", ["user", "==", ANALYST]],
+            }
+        )
+
+        for name in names:
+            assert name not in str(masked)
+        assert masked["filter_applied"][0] == group(tokens)
+        assert masked["filter_applied"][1] == "&&"
+
+    def test_a_top_level_or_chain_masks_each_entry(self, masker: OutputMasker):
+        """``in`` alone goes out flat: ``[c1, "||", c2]``."""
+        token = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+        masked = masker.mask_result(
+            {
+                "count": 0,
+                "filter_applied": [["hostname", "==", SRC_NAME], "||", ["os_ver", "==", 7]],
+            }
+        )
+
+        assert masked["filter_applied"] == [["hostname", "==", token], "||", ["os_ver", "==", 7]]
+
 
 class TestProjectionEchoIsNotAnOracle:
     """``fields_returned`` echoes what ``fields`` resolved to.

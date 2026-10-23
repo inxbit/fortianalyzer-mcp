@@ -160,16 +160,30 @@ def test_filters_parameter_is_named(instructions: str) -> None:
     assert "filters" in instructions
 
 
-def test_in_is_caveated_for_the_array_dialect_tools(instructions: str) -> None:
-    """``in`` hard-errors on search_devices/list_tasks (compile_to_array
-    refuses it), so a guide listing ``in`` unqualified beside "the same
-    filters parameter" promises an op that fails on two of its consumers.
-    The remedy phrase is asserted because it matches the error the caller
-    would otherwise hit blind.
+def test_in_is_documented_for_the_array_dialect_tools(instructions: str) -> None:
+    """``in`` used to hard-error on search_devices/list_tasks, and the guide
+    told callers to issue one call per value. It now compiles to an ``"||"``
+    group (#146), so the guide has to say how it combines with the ``"&&"``
+    chain, and must stop steering callers into the per-value workaround.
     """
     assert "search_devices" in instructions
     assert "list_tasks" in instructions
-    assert "one call per value" in instructions
+    assert 'joined with "||"' in instructions
+    assert "one call per value" not in instructions
+
+
+def test_the_array_dialect_join_is_stated_not_implied(instructions: str) -> None:
+    """A bare list of conditions is an OR on dvmdb and task (#146).
+
+    The guide used to say the narrow parameters were "ANDed with filters"
+    while the wire shape was that bare list, so a caller trusting the text got
+    the union. It has to name the separator that actually makes the AND, and
+    the version parameter whose old substring match could not work.
+    """
+    assert "bare list of conditions as OR" in instructions
+    assert 'joined into one chain with "&&"' in instructions
+    assert "os_version_filter" in instructions
+    assert "ANDed with `filters`" not in instructions
 
 
 def test_unverified_operators_are_not_advertised(instructions: str) -> None:

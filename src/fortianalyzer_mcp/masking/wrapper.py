@@ -2091,12 +2091,23 @@ class OutputMasker:
         masked IPv4 is itself a valid IPv4, so masking in pass 1 and then
         letting the free-text scan walk the same entries would mask it twice.
 
+        The array dialect joins entries with bare ``"&&"``/``"||"`` strings and
+        nests an ``in`` as an ``"||"`` group (#146). A separator is not an
+        entry and passes through the text scan unchanged. A group leads with an
+        entry rather than a field name, so it recurses and each entry inside it
+        is typed the same way; left to the shape check below, a two-way group
+        is a "three-part entry" whose field is a list, and every width of it
+        fell to the text scan with the hostnames inside in clear.
+
         Anything that is not a three-part entry, or whose field carries no
         type, falls back to the ordinary free-text treatment rather than being
         guessed at.
         """
         out: list[Any] = []
         for entry in value:
+            if isinstance(entry, list | tuple) and entry and isinstance(entry[0], list | tuple):
+                out.append(self._mask_filter_entries(entry, mapping, keep))
+                continue
             if not isinstance(entry, list | tuple) or len(entry) != 3:
                 out.append(self._mask_text_tree(entry, mapping, keep))
                 continue

@@ -5,8 +5,9 @@ FortiAnalyzer speaks two unrelated filter syntaxes and this module owns both:
 * the **string dialect** -- logview, fortiview, eventmgmt, incidentmgmt:
   ``"srcip==10.0.0.1 and dstport==443"``, with parenthesised OR groups.
 * the **array dialect** -- dvmdb, config, task:
-  ``[["name", "like", "%fgt%"], ["conn_status", "==", 2]]``, entries
-  implicitly ANDed.
+  ``[["name", "like", "%fgt%"], "&&", ["conn_status", "==", 2]]``. A bare
+  list of entries is an OR on the appliance, so entries are joined with
+  ``"&&"``.
 
 Callers describe a query once as ``FilterCondition`` objects; this module emits
 whichever dialect the endpoint speaks. That is what makes operator spelling
@@ -38,6 +39,7 @@ from fortianalyzer_mcp.query.fields import (
     coerce_value,
     enum_names,
     enum_value_warning,
+    is_integer_field,
     resolve_field,
 )
 from fortianalyzer_mcp.utils.validation import ValidationError, sanitize_filter_value
@@ -141,6 +143,26 @@ def _reject_substring_on_enum(vocabulary: str, field: str, op: str) -> None:
         f"'{field}' as a numeric code, so a substring match would compare against the "
         f"code and not the name -- '%1%' matches both 1 and 10. Use op 'eq' or 'ne' "
         f"with one of: {', '.join(names)}."
+    )
+
+
+def _reject_substring_on_integer(vocabulary: str, field: str, op: str) -> None:
+    """Refuse a substring op on a field FortiAnalyzer stores as a plain integer.
+
+    ``like`` does not text-match an integer. dvmdb splits a firmware version
+    across ``os_ver`` (7), ``mr`` (6) and ``patch`` (7); measured on 7.6.7
+    (#146), ``os_ver like "%7%"`` returned seven devices, every one with
+    ``os_ver=0``, and none of the four on 7. No single field holds "7.6"
+    either, so there is no substring to look for in the first place.
+    """
+    if op not in _LIKE_OPS or not is_integer_field(vocabulary, field):
+        return
+    raise ValidationError(
+        f"Filter on '{field}' with op '{op}' is not supported: FortiAnalyzer stores "
+        f"'{field}' as an integer, and a substring match does not text-match an "
+        "integer. Use op 'eq' (or gt/gte/lt/lte) with a whole number. For a firmware "
+        "version, dvmdb splits it across os_ver, mr and patch -- 7.6 is os_ver eq 7 "
+        'and mr eq 6, which search_devices\' os_version_filter="7.6" builds for you.'
     )
 
 
@@ -271,17 +293,54 @@ _ARRAY_OPS: dict[str, str] = {
 }
 
 
+def _chain(terms: Sequence[list[object]], separator: str) -> list[object]:
+    """``[t1, separator, t2, separator, ...]``; ``[t1]`` for one term."""
+    joined: list[object] = []
+    for term in terms:
+        if joined:
+            joined.append(separator)
+        joined.append(term)
+    return joined
+
+
+def _is_group(term: list[object]) -> bool:
+    """An ``"||"`` group leads with an entry; an entry leads with its field."""
+    return bool(term) and isinstance(term[0], list)
+
+
+def _and_join(terms: list[list[object]]) -> list[object]:
+    """Join terms so a row must match all of them: ``[t1, "&&", t2, ...]``.
+
+    A term is an entry or an ``"||"`` group from ``in``. A lone entry goes out
+    unchanged as ``[c1]`` and a lone group as itself, ``[c1, "||", c2]``; no
+    terms give ``[]``. Beside other terms a group stays nested rather than
+    spliced into the chain: the precedence of ``"&&"`` against ``"||"`` in one
+    flat list is undocumented, and ``[[a, "||", b], "&&", c]`` is the
+    documented form.
+    """
+    if len(terms) == 1 and _is_group(terms[0]):
+        return terms[0]
+    return _chain(terms, "&&")
+
+
 def compile_to_array(
     conditions: Sequence[FilterCondition],
     vocabulary: str,
-) -> tuple[list[list[object]], list[str]]:
+) -> tuple[list[object], list[str]]:
     """Compile conditions into the array dialect (dvmdb, config, task).
 
-    Entries are implicitly ANDed, the only combining form proven here --
-    ``search_devices`` and ``list_tasks`` both rely on it. Values are *not*
-    quoted or escaped: they travel as JSON scalars and are never interpolated
-    into a filter string, so the string dialect's injection boundary does not
-    apply.
+    The appliance reads a bare list of entries as an OR, not an AND. Measured
+    on 7.6.7 build 3737 (#146): ``[["name", "==", a], ["name", "==", b]]``
+    returned both devices, and two ``!=`` entries excluded nothing. Entries are
+    therefore joined with ``"&&"`` -- ``[c1, "&&", c2, "&&", c3]`` returns the
+    intersection, in a flat chain of any length. This is the only place the
+    join happens: ``search_devices`` and ``list_tasks`` pass their narrow
+    parameters in here as conditions, so those and ``filters`` always end up
+    in the same chain.
+
+    Values are *not* quoted or escaped: they travel as JSON scalars and are
+    never interpolated into a filter string, so the string dialect's injection
+    boundary does not apply.
 
     ``contains`` compiles to ``like`` with ``%`` wildcards: the documented
     ``contain`` spelling is accepted by live dvmdb and task endpoints and
@@ -289,23 +348,29 @@ def compile_to_array(
     wildcards, so a needle containing ``_`` can over-match by one character --
     accepted, since the alternative is an operator that never matches at all.
 
-    ``in`` and ``not_contains`` are refused rather than guessed. ``in``'s
-    OR-separator syntax is documented for FortiManager but unexercised in this
-    repo; for ``not_contains`` every candidate spelling (``!contain``,
-    ``not like``) silently matches zero rows live, so there is nothing correct
-    to emit.
+    ``in`` compiles to ``==`` entries joined with ``"||"``, the array
+    dialect's OR, and goes into the ``"&&"`` chain as one nested group --
+    see ``_and_join``. ``not_contains`` is refused rather than guessed: every
+    candidate spelling (``!contain``, ``not like``) silently matches zero rows
+    live, so there is nothing correct to emit.
 
     ``contains`` against a field stored as an enum code (``state``,
     ``conn_status``) is refused for the same reason -- the wildcards would wrap
-    the code rather than the name. See ``_reject_substring_on_enum``.
+    the code rather than the name. See ``_reject_substring_on_enum``. So is
+    ``contains`` against a plain integer (``os_ver``, ``mr``, ``patch``), which
+    ``like`` does not text-match. See ``_reject_substring_on_integer``.
 
     Returns:
-        ``(entries, warnings)``.
+        ``(filter, warnings)``. ``filter`` is ``[]`` for no conditions,
+        ``[c1]`` for one, and ``[c1, "&&", c2, ...]`` otherwise. ``not_in``
+        contributes one ``!=`` entry per value to the same chain; ``in``
+        contributes one ``[c1, "||", c2, ...]`` group, or a plain entry for a
+        single value.
 
     Raises:
-        ValidationError: on ``in``, ``not_contains``, a substring op against a
-            field stored as an enum code, a value/op mismatch, a boolean value,
-            or an unknown field.
+        ValidationError: on ``not_contains``, a substring op against a field
+            stored as an enum code or a plain integer, a value/op mismatch, a
+            boolean value, or an unknown field.
     """
     entries: list[list[object]] = []
     warnings: list[str] = []
@@ -319,8 +384,9 @@ def compile_to_array(
         # Before coercion, so the message is about the operator rather than
         # about a partial enum name failing to coerce. ``not_contains`` is
         # refused wholesale below, so on this dialect only ``contains`` can
-        # reach a code-valued field.
+        # reach a code-valued or integer field.
         _reject_substring_on_enum(vocabulary, field, op)
+        _reject_substring_on_integer(vocabulary, field, op)
 
         if op in _ARRAY_OPS:
             value = coerce_value(vocabulary, field, _scalar(condition))
@@ -337,6 +403,15 @@ def compile_to_array(
                 entries.append([field, "!=", coerce_value(vocabulary, field, item)])
             continue
 
+        if op == "in":
+            alternatives = [
+                [field, "==", coerce_value(vocabulary, field, item)] for item in _values(condition)
+            ]
+            entries.append(
+                alternatives[0] if len(alternatives) == 1 else _chain(alternatives, "||")
+            )
+            continue
+
         if op == "not_contains":
             raise ValidationError(
                 f"Filter op 'not_contains' on '{field}' is not supported against this "
@@ -345,10 +420,8 @@ def compile_to_array(
                 "yourself."
             )
 
-        raise ValidationError(
-            f"Filter op '{op}' on '{field}' is not supported against this endpoint: "
-            "the array dialect has no verified OR form for it (query_logs accepts it "
-            "because the string dialect does). Issue one call per value instead."
+        raise ValidationError(  # pragma: no cover - every op in the enum is handled above
+            f"Filter op '{op}' is not supported on the array dialect."
         )
 
-    return entries, warnings
+    return _and_join(entries), warnings
