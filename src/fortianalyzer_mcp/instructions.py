@@ -84,24 +84,31 @@ FortiAnalyzer's own parser accepts more than that, but nothing beyond this set
 is verified against this API here, so treat anything else as an experiment you
 run through `filter`.
 
-search_devices and list_tasks take the same `filters` parameter, with three
-exceptions: `in` is rejected there (their array dialect has no verified OR
-form -- issue one call per value; `not_in` works, compiled to ANDed `!=`),
-`not_contains` is rejected too, because every candidate spelling silently
-matches zero rows on the appliance -- use `ne` with exact values or exclude
-matches yourself -- and `contains` is rejected on the code-valued fields
-(`state`, `conn_status`), where a substring would compare against the stored
-integer rather than the name you wrote and `%1%` would match both 1 and 10.
-Filter those with `eq`/`ne` and a name; the refusal lists the accepted names.
+search_devices and list_tasks take the same `filters` parameter, with two
+exceptions: `not_contains` is rejected there, because every candidate spelling
+silently matches zero rows on the appliance -- use `ne` with exact values or
+exclude matches yourself -- and `contains` is rejected on the code-valued
+fields (`state`, `conn_status`), where a substring would compare against the
+stored integer rather than the name you wrote and `%1%` would match both 1 and
+10. Filter those with `eq`/`ne` and a name; the refusal lists the accepted
+names. `contains` is rejected on `os_ver`, `mr` and `patch` as well: dvmdb
+stores a version as those three integers, and a substring match does not
+text-match an integer. `in` compiles to `==` conditions joined with "||",
+nested as one group when other conditions are present; `not_in` compiles to
+`!=` conditions joined with "&&".
 Their field sets are small enough to enumerate, so an unknown field name there
 is a hard error listing the valid names; for logtypes an unrecognised name is
 passed through with a warning instead, since the appliance's catalogue is
 larger than the server's list.
 
-On these two tools the narrow parameters (`name_filter`, `platform_filter`,
-`connection_status`, `filter_state`) are ANDed with `filters` rather than
-overridden by it, so a condition on the same field in both places must agree
-or nothing matches.
+The array dialect reads a bare list of conditions as OR, so on these two tools
+every condition -- each narrow parameter (`name_filter`, `platform_filter`,
+`os_version_filter`, `connection_status`, `filter_state`) and each entry of
+`filters` -- is joined into one chain with "&&", and `filter_applied` echoes
+that chain as sent. A condition on the same field in both places must
+therefore agree or nothing matches. `os_version_filter` takes
+`major[.minor[.patch]]` ("7", "7.6", "7.6.7") and compiles to exact
+`os_ver`/`mr`/`patch` matches.
 
 ## Projection: `fields`
 

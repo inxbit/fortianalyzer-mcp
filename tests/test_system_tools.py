@@ -124,6 +124,53 @@ class TestListTasksStructuredFilters:
 
         assert fake.captured == [["state", "==", 4]]
 
+    async def test_filter_state_and_filters_are_anded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same array dialect as dvmdb, where a bare list is an OR (#146)."""
+        fake = self._install(monkeypatch)
+
+        result = await system_tools.list_tasks(
+            filter_state="done",
+            filters=[FilterCondition(field="title", op="contains", value="report")],
+        )
+
+        expected = [["state", "==", 4], "&&", ["title", "like", "%report%"]]
+        assert fake.captured == expected
+        assert result["filter_applied"] == expected
+
+    async def test_two_structured_conditions_are_anded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = self._install(monkeypatch)
+
+        await system_tools.list_tasks(
+            filters=[
+                FilterCondition(field="state", op="eq", value="done"),
+                FilterCondition(field="num_err", op="gt", value=0),
+            ]
+        )
+
+        assert fake.captured == [["state", "==", 4], "&&", ["num_err", ">", 0]]
+
+    async def test_in_on_state_is_an_or_group_inside_the_chain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = self._install(monkeypatch)
+
+        await system_tools.list_tasks(
+            filters=[
+                FilterCondition(field="state", op="in", value=["error", "warning"]),
+                FilterCondition(field="num_err", op="gt", value=0),
+            ]
+        )
+
+        assert fake.captured == [
+            [["state", "==", 5], "||", ["state", "==", 8]],
+            "&&",
+            ["num_err", ">", 0],
+        ]
+
     async def test_response_echoes_the_compiled_filter(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -81,10 +81,10 @@ class TestDictFiltersAreCoerced:
     ) -> None:
         result = await execute_advanced_tool(
             tool_name="search_devices",
-            parameters={"filters": [{"field": "os_version", "op": "contains", "value": "7.6"}]},
+            parameters={"filters": [{"field": "platform", "op": "contains", "value": "VM"}]},
         )
 
-        assert fake_client.captured == [["os_ver", "like", "%7.6%"]]
+        assert fake_client.captured == [["platform_str", "like", "%VM%"]]
         assert result["status"] == "success"
 
     async def test_op_defaults_to_eq_like_the_model_does(
@@ -105,15 +105,17 @@ class TestDictFiltersAreCoerced:
             tool_name="search_devices",
             parameters={
                 "filters": [
-                    FilterCondition(field="os_version", op="contains", value="7.6"),
+                    FilterCondition(field="platform", op="contains", value="VM"),
                     {"field": "conn_status", "op": "eq", "value": "down"},
                 ]
             },
         )
 
-        assert fake_client.captured is not None
-        assert ["os_ver", "like", "%7.6%"] in fake_client.captured
-        assert ["conn_status", "==", 2] in fake_client.captured
+        assert fake_client.captured == [
+            ["platform_str", "like", "%VM%"],
+            "&&",
+            ["conn_status", "==", 2],
+        ]
 
     async def test_absent_and_none_filters_stay_untouched(
         self, execute_advanced_tool: Any, fake_client: FakeDeviceClient

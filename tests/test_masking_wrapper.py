@@ -896,6 +896,35 @@ class TestMutatingToolGate:
         # the message names the tool's parameter, not the innermost dict key
         assert "devices" in result["message"]
 
+    @pytest.mark.parametrize("separator", ["&&", "||"])
+    async def test_array_filter_separators_are_not_mistaken_for_tokens(
+        self, monkeypatch: pytest.MonkeyPatch, separator: str
+    ):
+        """The array dialect joins conditions with bare "&&"/"||" strings
+        (#146). Neither is token-shaped, so a filter made only of real values
+        runs, and a real token inside the same chain is still refused."""
+        from fortianalyzer_mcp.tool_annotations import CREATES
+
+        mcp = self._install(monkeypatch)
+        engine = FPEEngine(KEY)
+        token = engine.mask_hostname("fw-branch.example.com")
+        calls: list[object] = []
+
+        @mcp.tool(annotations=CREATES)
+        async def fake_write(filter: list) -> dict:
+            calls.append(filter)
+            return {"status": "success"}
+
+        clean = [["name", "==", "fgt-01"], separator, [["mr", "==", 6], "&&", ["os_ver", "==", 7]]]
+        assert (await fake_write(filter=clean))["status"] == "success"
+        assert calls == [clean]
+
+        tainted = [["name", "==", "fgt-01"], separator, ["name", "==", token]]
+        result = await fake_write(filter=tainted)
+
+        assert calls == [clean]
+        assert result["error"] == "masked_token_in_mutating_args"
+
     @pytest.mark.parametrize(
         "legit",
         [
