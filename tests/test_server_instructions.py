@@ -172,6 +172,20 @@ def test_in_is_caveated_for_the_array_dialect_tools(instructions: str) -> None:
     assert "one call per value" in instructions
 
 
+def test_the_array_dialect_join_is_stated_not_implied(instructions: str) -> None:
+    """A bare list of conditions is an OR on dvmdb and task (#146).
+
+    The guide used to say the narrow parameters were "ANDed with filters"
+    while the wire shape was that bare list, so a caller trusting the text got
+    the union. It has to name the separator that actually makes the AND, and
+    the version parameter whose old substring match could not work.
+    """
+    assert "bare list of conditions as OR" in instructions
+    assert 'joined into one chain with "&&"' in instructions
+    assert "os_version_filter" in instructions
+    assert "ANDed with `filters`" not in instructions
+
+
 def test_unverified_operators_are_not_advertised(instructions: str) -> None:
     """regex/isnull are documented by Fortinet but unproven through the API
     here, so the guide must not promise them.

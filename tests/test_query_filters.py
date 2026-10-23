@@ -279,7 +279,11 @@ class TestStringEnumValues:
 
 
 class TestArrayDialect:
-    """dvmdb/config/task take a list of [field, op, value] entries, ANDed."""
+    """dvmdb/config/task take [field, op, value] entries joined by "&&".
+
+    A bare list of entries is an OR on the appliance (#146), so every entry
+    after the first is preceded by the "&&" separator.
+    """
 
     def test_eq_emits_one_entry(self) -> None:
         result, _ = compile_to_array([_c("name", "eq", "fgt-01")], "device")
@@ -291,11 +295,41 @@ class TestArrayDialect:
         result, _ = compile_to_array([_c("name", "contains", "fgt")], "device")
         assert result == [["name", "like", "%fgt%"]]
 
-    def test_multiple_conditions_become_multiple_entries(self) -> None:
+    def test_two_conditions_are_joined_with_and(self) -> None:
+        """Measured on 7.6.7 (#146): the bare ``[[name == a], [name == b]]``
+        returned both devices, the union. ``"&&"`` is the intersection."""
         result, _ = compile_to_array(
-            [_c("name", "contains", "fgt"), _c("os_ver", "contains", "7.")], "device"
+            [_c("name", "contains", "fgt"), _c("platform_str", "contains", "VM")], "device"
         )
-        assert result == [["name", "like", "%fgt%"], ["os_ver", "like", "%7.%"]]
+        assert result == [["name", "like", "%fgt%"], "&&", ["platform_str", "like", "%VM%"]]
+
+    def test_three_conditions_form_one_flat_and_chain(self) -> None:
+        result, _ = compile_to_array(
+            [_c("name", "eq", "a"), _c("os_ver", "eq", 7), _c("mr", "eq", 6)], "device"
+        )
+        assert result == [
+            ["name", "==", "a"],
+            "&&",
+            ["os_ver", "==", 7],
+            "&&",
+            ["mr", "==", 6],
+        ]
+
+    @pytest.mark.parametrize("field", ["os_ver", "mr", "patch", "os_version"])
+    def test_contains_on_an_integer_version_field_is_refused(self, field: str) -> None:
+        """dvmdb stores the version as three integers, and ``like`` does not
+        text-match an integer: measured on 7.6.7 (#146), ``os_ver like "%7%"``
+        returned only the ``os_ver=0`` devices and none of the four on 7."""
+        with pytest.raises(ValidationError) as exc:
+            compile_to_array([_c(field, "contains", "7.6")], "device")
+        message = str(exc.value)
+        assert "integer" in message
+        assert "'eq'" in message
+        assert "os_version_filter" in message
+
+    def test_eq_on_an_integer_version_field_still_compiles(self) -> None:
+        result, _ = compile_to_array([_c("os_ver", "eq", 7)], "device")
+        assert result == [["os_ver", "==", 7]]
 
     def test_not_contains_is_refused_rather_than_guessed(self) -> None:
         """``!contain`` and ``not like`` both silently match zero rows live,
@@ -347,9 +381,28 @@ class TestArrayDialect:
         result, _ = compile_to_array([_c("desc", "eq", 'has "quotes" and spaces')], "device")
         assert result == [["desc", "==", 'has "quotes" and spaces']]
 
-    def test_not_in_becomes_one_negated_entry_per_value(self) -> None:
+    def test_not_in_becomes_negated_entries_joined_with_and(self) -> None:
+        """Bare, these were an OR of ``!=``, which every row satisfies: measured
+        on 7.6.7 (#146), excluding two names returned all 17 devices,
+        both excluded names included."""
         result, _ = compile_to_array([_c("name", "not_in", ["a", "b"])], "device")
-        assert result == [["name", "!=", "a"], ["name", "!=", "b"]]
+        assert result == [["name", "!=", "a"], "&&", ["name", "!=", "b"]]
+
+    def test_not_in_with_one_value_is_a_single_entry(self) -> None:
+        result, _ = compile_to_array([_c("name", "not_in", ["a"])], "device")
+        assert result == [["name", "!=", "a"]]
+
+    def test_not_in_joins_the_same_chain_as_its_neighbours(self) -> None:
+        result, _ = compile_to_array(
+            [_c("name", "not_in", ["a", "b"]), _c("platform_str", "contains", "VM")], "device"
+        )
+        assert result == [
+            ["name", "!=", "a"],
+            "&&",
+            ["name", "!=", "b"],
+            "&&",
+            ["platform_str", "like", "%VM%"],
+        ]
 
     def test_in_is_refused_rather_than_guessed(self) -> None:
         """The refusal states its reason, like not_contains does -- a caller

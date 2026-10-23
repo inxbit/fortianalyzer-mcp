@@ -243,6 +243,52 @@ class TestArrayDialectConditions:
         entries, _ = compile_to_array(resolved["filters"], "task")
         assert entries == [["state", "==", 1]]
 
+    def test_two_masked_conditions_resolve_into_one_and_chain(self) -> None:
+        """Both values resolve and the compiler, not the caller, adds the "&&"
+        separator (#146): it is never part of what the unmasker walks."""
+        engine = _engine()
+        unmasker = ArgUnmasker(engine)
+        ip_token = engine.mask_ip("192.0.2.5")
+        host_token = engine.mask_hostname("host.example.com")
+
+        resolved = unmasker.unmask_args(
+            {
+                "filters": [
+                    FilterCondition(field="ip", op="eq", value=ip_token),
+                    FilterCondition(field="hostname", op="contains", value=host_token),
+                ]
+            }
+        )
+        entries, _ = compile_to_array(resolved["filters"], "device")
+
+        assert entries == [
+            ["ip", "==", "192.0.2.5"],
+            "&&",
+            ["hostname", "like", "%host.example.com%"],
+        ]
+
+    @pytest.mark.parametrize("separator", ["&&", "||"])
+    def test_a_compiled_chain_fed_back_keeps_its_separators(self, separator: str) -> None:
+        """A caller can paste a ``filter_applied`` echo back as an argument.
+        The separators are bare strings in that list; each one has to survive
+        unmasking as itself while the tokens around it resolve."""
+        engine = _engine()
+        unmasker = ArgUnmasker(engine)
+        token = engine.mask_hostname("host.example.com")
+        echo = [
+            ["hostname", "==", token],
+            separator,
+            [["name", "==", token], separator, ["name", "==", "fgt-01"]],
+        ]
+
+        resolved = unmasker.unmask_args({"filter_applied": echo})["filter_applied"]
+
+        assert resolved == [
+            ["hostname", "==", "host.example.com"],
+            separator,
+            [["name", "==", "host.example.com"], separator, ["name", "==", "fgt-01"]],
+        ]
+
 
 class TestAliasTypingInvariant:
     """No device or task field may reach an IP/MAC type the log table cannot see.

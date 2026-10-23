@@ -741,6 +741,9 @@ class Vocabulary:
     coercions: Mapping[str, Mapping[str, int]]
     complete: bool
     projection: frozenset[str] = frozenset()
+    #: Fields stored as plain integers, measured not to text-match under
+    #: ``like`` -- see ``filters._reject_substring_on_integer``.
+    integers: frozenset[str] = frozenset()
 
 
 _GENERIC_LOG = Vocabulary(
@@ -824,6 +827,9 @@ _VOCABULARIES: Mapping[str, Vocabulary] = {
         coercions={"conn_status": _CONN_STATUS_CODES},
         complete=True,
         projection=_DEVICE_PROJECTION,
+        # The firmware version, split across three integers: 7.6.7 is
+        # os_ver 7, mr 6, patch 7. Measured on 7.6.7 (#146).
+        integers=frozenset({"os_ver", "mr", "patch"}),
     ),
     "task": Vocabulary(
         name="task",
@@ -1064,3 +1070,12 @@ def enum_names(vocabulary: str, canonical_field: str) -> tuple[str, ...] | None:
     """
     mapping = get_vocabulary(vocabulary).coercions.get(canonical_field)
     return None if mapping is None else tuple(sorted(mapping))
+
+
+def is_integer_field(vocabulary: str, canonical_field: str) -> bool:
+    """Whether FortiAnalyzer stores this field as a plain integer.
+
+    Distinct from an enum code (``enum_names``): there is no name to translate,
+    so the remedy for a refused substring match is a number, not a name.
+    """
+    return canonical_field in get_vocabulary(vocabulary).integers

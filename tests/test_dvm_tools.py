@@ -122,10 +122,10 @@ class TestSearchDevicesStructuredFilters:
         fake = self._install(monkeypatch)
 
         await dvm_tools.search_devices(
-            filters=[FilterCondition(field="os_version", op="contains", value="7.6")]
+            filters=[FilterCondition(field="platform", op="contains", value="VM")]
         )
 
-        assert fake.captured == [["os_ver", "like", "%7.6%"]]
+        assert fake.captured == [["platform_str", "like", "%VM%"]]
 
     async def test_enum_name_is_coerced(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = self._install(monkeypatch)
@@ -139,16 +139,65 @@ class TestSearchDevicesStructuredFilters:
     async def test_structured_and_narrow_params_are_anded(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Every narrow parameter and every structured condition lands in one
+        "&&" chain. Measured on 7.6.7 (#146): the bare list for
+        name_filter="myfw01" plus platform_filter="Syslog" returned both
+        myfw01 devices *and* six syslog devices, where the answer was 0."""
         fake = self._install(monkeypatch)
 
         await dvm_tools.search_devices(
             name_filter="fgt",
-            filters=[FilterCondition(field="os_version", op="contains", value="7.6")],
+            platform_filter="VM",
+            os_version_filter="7.6",
+            connection_status="up",
+            filters=[FilterCondition(field="desc", op="contains", value="branch")],
         )
 
-        assert fake.captured is not None
-        assert ["name", "like", "%fgt%"] in fake.captured
-        assert ["os_ver", "like", "%7.6%"] in fake.captured
+        assert fake.captured == [
+            ["name", "like", "%fgt%"],
+            "&&",
+            ["platform_str", "like", "%VM%"],
+            "&&",
+            ["os_ver", "==", 7],
+            "&&",
+            ["mr", "==", 6],
+            "&&",
+            ["conn_status", "==", 1],
+            "&&",
+            ["desc", "like", "%branch%"],
+        ]
+
+    async def test_two_narrow_params_are_anded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._install(monkeypatch)
+
+        result = await dvm_tools.search_devices(name_filter="myfw01", platform_filter="Syslog")
+
+        expected = [["name", "like", "%myfw01%"], "&&", ["platform_str", "like", "%Syslog%"]]
+        assert fake.captured == expected
+        assert result["filter_applied"] == expected
+
+    async def test_two_structured_conditions_are_anded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = self._install(monkeypatch)
+
+        await dvm_tools.search_devices(
+            filters=[
+                FilterCondition(field="name", op="eq", value="myfw01"),
+                FilterCondition(field="name", op="eq", value="myfw01-old"),
+            ]
+        )
+
+        assert fake.captured == [["name", "==", "myfw01"], "&&", ["name", "==", "myfw01-old"]]
+
+    async def test_not_in_is_anded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = self._install(monkeypatch)
+
+        await dvm_tools.search_devices(
+            filters=[FilterCondition(field="name", op="not_in", value=["myfw01", "myfw01-old"])]
+        )
+
+        assert fake.captured == [["name", "!=", "myfw01"], "&&", ["name", "!=", "myfw01-old"]]
 
     async def test_response_echoes_the_compiled_filter(
         self, monkeypatch: pytest.MonkeyPatch
@@ -207,6 +256,70 @@ class TestSearchDevicesStructuredFilters:
 
         assert result["status"] == "error"
         assert "conn_status" in result["message"]
+
+
+class TestSearchDevicesOsVersion:
+    """os_version_filter splits "major[.minor[.patch]]" into integer equality.
+
+    dvmdb stores the version across three integers, ``os_ver`` (7), ``mr`` (6)
+    and ``patch`` (7), and ``like`` does not text-match an integer: measured on
+    7.6.7 (#146), the old ``os_ver like "%7%"`` returned seven devices, all with
+    ``os_ver=0``, and none of the four on 7.
+    """
+
+    class Unreachable:
+        async def list_devices(self, **kwargs: Any) -> list[dict[str, Any]]:
+            raise AssertionError("must not reach the API")
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ("7", [["os_ver", "==", 7]]),
+            ("7.6", [["os_ver", "==", 7], "&&", ["mr", "==", 6]]),
+            (
+                "v7.6.7",
+                [["os_ver", "==", 7], "&&", ["mr", "==", 6], "&&", ["patch", "==", 7]],
+            ),
+            (" 7.4 ", [["os_ver", "==", 7], "&&", ["mr", "==", 4]]),
+        ],
+    )
+    async def test_version_splits_into_integer_fields(
+        self, version: str, expected: list[Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = TestSearchDevicesStructuredFilters.FakeClient()
+        monkeypatch.setattr(dvm_tools, "_get_client", lambda: fake)
+
+        result = await dvm_tools.search_devices(os_version_filter=version)
+
+        assert result["status"] == "success"
+        assert fake.captured == expected
+
+    @pytest.mark.parametrize("version", ["7.x", "7.6.7.1", " ", "seven", "7..6", "7.", "-7"])
+    async def test_malformed_version_is_refused_before_any_request(
+        self, version: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dvm_tools, "_get_client", lambda: self.Unreachable())
+
+        result = await dvm_tools.search_devices(os_version_filter=version)
+
+        assert result["status"] == "error"
+        assert result["error"] == "validation_error"
+        assert "Invalid os_version_filter" in result["message"]
+
+    # Superscript two, and Arabic-Indic seven and six.
+    @pytest.mark.parametrize("version", ["²", "7.²", "٧.٦"])
+    async def test_non_ascii_digits_are_refused_by_the_validator(
+        self, version: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``str.isdigit`` accepts all three: the superscript then fails in
+        ``int()``, and the Arabic-Indic digits are read as 7.6."""
+        monkeypatch.setattr(dvm_tools, "_get_client", lambda: self.Unreachable())
+
+        result = await dvm_tools.search_devices(os_version_filter=version)
+
+        assert result["status"] == "error"
+        assert result["error"] == "validation_error"
+        assert "Invalid os_version_filter" in result["message"]
 
 
 class TestSearchDevicesProjection:

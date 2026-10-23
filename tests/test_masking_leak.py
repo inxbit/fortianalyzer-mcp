@@ -1782,6 +1782,35 @@ class TestCompiledFilterEntries:
 
         assert masked["filter_applied"] == ["a note", ["only", "two"]]
 
+    def test_an_and_chain_masks_each_entry_and_keeps_its_separators(self, masker: OutputMasker):
+        """The array dialect joins entries with "&&" (#146). The separator is a
+        bare string between entries and must come back as itself, while each
+        entry beside it is still typed by its own field."""
+        host = masker.mask_result({"hostname": SRC_NAME})["hostname"]
+        user = masker.mask_result({"user": ANALYST})["user"]
+        masked = masker.mask_result(
+            {
+                "count": 0,
+                "filter_applied": [
+                    ["hostname", "==", SRC_NAME],
+                    "&&",
+                    ["user", "==", ANALYST],
+                    "&&",
+                    ["os_ver", "==", 7],
+                ],
+            }
+        )
+
+        assert SRC_NAME not in str(masked)
+        assert ANALYST not in str(masked)
+        assert masked["filter_applied"] == [
+            ["hostname", "==", host],
+            "&&",
+            ["user", "==", user],
+            "&&",
+            ["os_ver", "==", 7],
+        ]
+
 
 class TestProjectionEchoIsNotAnOracle:
     """``fields_returned`` echoes what ``fields`` resolved to.

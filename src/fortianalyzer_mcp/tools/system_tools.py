@@ -330,9 +330,11 @@ async def list_tasks(
             the numeric codes the appliance stores: pending, running,
             cancelling, cancelled, done, error, aborting, aborted, warning,
             to_continue, unknown.
-        filters: Structured conditions, each {field, op, value}, ANDed with
-            filter_state. Fields: id, title, src, user, adom, state, percent,
-            num_done, num_err, num_lines, num_warn, start_tm, end_tm.
+        filters: Structured conditions, each {field, op, value}. They and
+            filter_state are joined into one "&&" chain, since the task
+            endpoint reads a bare list of conditions as OR. Fields: id, title,
+            src, user, adom, state, percent, num_done, num_err, num_lines,
+            num_warn, start_tm, end_tm.
             Ops: eq, ne, gt, gte, lt, lte, contains, not_in. Not supported
             here (hard error): "in" (issue one call per value) and
             "not_contains" (no spelling works against this endpoint; use "ne"
@@ -344,8 +346,9 @@ async def list_tasks(
             - status: "success" or "error"
             - count: Number of tasks
             - tasks: List of task objects with id, state, progress, etc.
-            - filter_applied: The compiled filter entries sent to the
-              appliance, or None when nothing narrowed the listing
+            - filter_applied: The compiled filter sent to the appliance, its
+              entries joined with "&&", or None when nothing narrowed the
+              listing
             - message: Error message if failed
 
     Example:
@@ -363,7 +366,10 @@ async def list_tasks(
         # Build filter if state specified. FAZ stores state as a numeric code,
         # so translate the documented state names before filtering; a name the
         # enum doesn't know is rejected instead of silently matching nothing.
-        entries: list[list[Any]] = []
+        # The state compiles together with ``filters`` in one call: the task
+        # endpoint reads a bare list of entries as an OR (#146), and
+        # compile_to_array is the only place entries are joined with "&&".
+        conditions: list[FilterCondition] = []
         if filter_state:
             state_code = TASK_STATE_CODES.get(filter_state.strip().lower())
             if state_code is None:
@@ -373,10 +379,10 @@ async def list_tasks(
                     message=f"Invalid filter_state '{filter_state}'. Must be one of: {valid}",
                     operation="list_tasks",
                 )
-            entries.append(["state", "==", state_code])
+            conditions.append(FilterCondition(field="state", op="eq", value=state_code))
         if filters:
-            structured, _ = compile_to_array(filters, "task")
-            entries.extend(structured)
+            conditions.extend(filters)
+        entries, _ = compile_to_array(conditions, "task")
         filter_list = entries or None
 
         tasks = await client.list_tasks(filter=filter_list)
