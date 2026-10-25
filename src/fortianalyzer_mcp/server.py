@@ -11,6 +11,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
+from fortianalyzer_mcp import __version__
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient
 from fortianalyzer_mcp.instructions import build_instructions
 from fortianalyzer_mcp.query.filters import FilterCondition
@@ -61,6 +62,7 @@ if settings.MCP_ALLOWED_HOSTS:
 # deployment stateful and unbound by the allowed-hosts list.
 mcp = MCPServer(
     "FortiAnalyzer API Server",
+    version=__version__,
     # Cross-cutting usage guidance that no single tool docstring can carry --
     # chiefly that ``tid`` means five incompatible things across the async
     # families. See ``instructions.py`` for why it is server-level. The masking
