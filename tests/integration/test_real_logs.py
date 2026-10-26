@@ -52,11 +52,10 @@ async def test_get_logfiles_state(faz_client: FortiAnalyzerClient, test_adom: st
 async def test_search_traffic_logs(
     faz_client: FortiAnalyzerClient,
     test_adom: str,
-    test_device: str | None,
+    device_filter: list[dict[str, str]],
     time_range_last_hour: dict[str, str],
 ):
     """Test searching traffic logs from the last hour."""
-    device_filter = [{"devname": test_device}] if test_device else []
     # Start log search
     start_result = await faz_client.logsearch_start(
         adom=test_adom,
@@ -89,11 +88,10 @@ async def test_search_traffic_logs(
 async def test_search_event_logs(
     faz_client: FortiAnalyzerClient,
     test_adom: str,
-    test_device: str | None,
+    device_filter: list[dict[str, str]],
     time_range_last_hour: dict[str, str],
 ):
     """Test searching event logs from the last hour."""
-    device_filter = [{"devname": test_device}] if test_device else []
     # Start log search
     start_result = await faz_client.logsearch_start(
         adom=test_adom,
@@ -126,11 +124,10 @@ async def test_search_event_logs(
 async def test_search_logs_with_filter(
     faz_client: FortiAnalyzerClient,
     test_adom: str,
-    test_device: str | None,
+    device_filter: list[dict[str, str]],
     time_range_last_day: dict[str, str],
 ):
     """Test searching logs with a filter expression."""
-    device_filter = [{"devname": test_device}] if test_device else []
     # Start log search with filter
     start_result = await faz_client.logsearch_start(
         adom=test_adom,
@@ -158,14 +155,17 @@ async def test_search_logs_with_filter(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_logsearch_count(
+async def test_logsearch_progress_and_total_count(
     faz_client: FortiAnalyzerClient,
     test_adom: str,
-    test_device: str | None,
+    device_filter: list[dict[str, str]],
     time_range_last_hour: dict[str, str],
 ):
-    """Test getting log search count/progress."""
-    device_filter = [{"devname": test_device}] if test_device else []
+    """Test that the fetch response carries the progress and total the tools read.
+
+    There is no separate count endpoint (#27): completion is ``percentage``
+    on the fetch, and the total is its ``total-count``.
+    """
     # Start log search
     start_result = await faz_client.logsearch_start(
         adom=test_adom,
@@ -177,15 +177,16 @@ async def test_logsearch_count(
     assert "tid" in start_result
     tid = start_result["tid"]
 
-    # Get count/progress
-    count_result = await faz_client.logsearch_count(test_adom, tid)
-    assert count_result is not None
-    # Should contain progress information
-    assert (
-        "progress-percent" in count_result
-        or "percentage" in count_result
-        or "matched-logs" in count_result
-    )
+    # Poll for completion (max 30 seconds)
+    for _ in range(30):
+        fetch_result = await faz_client.logsearch_fetch(adom=test_adom, tid=tid, limit=10)
+        percentage = fetch_result.get("percentage", 0)
+        if percentage >= 100:
+            break
+        await asyncio.sleep(1)
+
+    assert fetch_result.get("percentage", 0) >= 100
+    assert "total-count" in fetch_result
 
 
 @pytest.mark.integration
@@ -193,11 +194,10 @@ async def test_logsearch_count(
 async def test_logsearch_cancel(
     faz_client: FortiAnalyzerClient,
     test_adom: str,
-    test_device: str | None,
+    device_filter: list[dict[str, str]],
     time_range_last_hour: dict[str, str],
 ):
     """Test cancelling a log search."""
-    device_filter = [{"devname": test_device}] if test_device else []
     # Start log search
     start_result = await faz_client.logsearch_start(
         adom=test_adom,
