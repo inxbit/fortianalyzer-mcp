@@ -151,6 +151,14 @@ Create a `.env` file from the example:
 cp .env.example .env
 ```
 
+The `.env` is located relative to the package source, so it is read when the
+server runs from a source checkout or an editable install (`pip install -e .`,
+the install documented above). A regular `pip install .`, a wheel, or an image
+built from one does not read it; pass the settings as environment variables
+instead. The Docker Compose example above is unaffected, because `env_file:`
+injects the values as environment variables. When no `.env` was read and a
+required setting is missing, the startup error names the path that was checked.
+
 Edit `.env` with your FortiAnalyzer settings:
 
 ```bash
