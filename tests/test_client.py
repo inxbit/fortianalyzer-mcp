@@ -226,7 +226,9 @@ def _bare_client() -> FortiAnalyzerClient:
 
 
 class TestEnsureConnected:
-    """Tests for the reconnect-once guard tools call before issuing requests."""
+    """ensure_connected() connects a client that is not connected; tools call
+    it upfront, and with connect_on_demand (the server's client) every request
+    runs it first."""
 
     async def test_reconnects_once_when_dropped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A dropped session is revived by exactly one connect() call."""
@@ -258,6 +260,93 @@ class TestEnsureConnected:
         await client.ensure_connected()
 
         assert reconnects == []
+
+    async def test_concurrent_callers_share_one_failed_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Callers queued behind a failed connect get its error instead of
+        each waiting out another connect timeout of their own."""
+        import asyncio
+
+        client = _bare_client()
+        connects: list[int] = []
+
+        async def fake_connect() -> None:
+            connects.append(1)
+            await asyncio.sleep(0)
+            raise ConnectionError("Failed to connect to FortiAnalyzer: timed out")
+
+        monkeypatch.setattr(client, "connect", fake_connect)
+
+        results = await asyncio.gather(
+            client.ensure_connected(),
+            client.ensure_connected(),
+            client.ensure_connected(),
+            return_exceptions=True,
+        )
+
+        assert connects == [1]
+        assert all(isinstance(r, ConnectionError) for r in results)
+
+    async def test_call_after_a_failed_attempt_tries_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed attempt is not cached: the next call connects anew, so the
+        client recovers once FortiAnalyzer is reachable."""
+        client = _bare_client()
+        connects: list[int] = []
+
+        async def fake_connect() -> None:
+            connects.append(1)
+            if len(connects) == 1:
+                raise ConnectionError("Failed to connect to FortiAnalyzer: timed out")
+            client._connected = True
+            client._fmg = MagicMock()
+
+        monkeypatch.setattr(client, "connect", fake_connect)
+
+        with pytest.raises(ConnectionError):
+            await client.ensure_connected()
+        await client.ensure_connected()
+
+        assert client.is_connected
+        assert len(connects) == 2
+
+    async def test_caller_behind_a_cancelled_attempt_connects_itself(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancelled attempt has no outcome to share, not even an older
+        failure: the caller waiting behind it makes its own attempt."""
+        import asyncio
+
+        client = _bare_client()
+        connects: list[int] = []
+        started = asyncio.Event()
+
+        async def fake_connect() -> None:
+            connects.append(1)
+            if len(connects) == 1:
+                raise ConnectionError("Failed to connect to FortiAnalyzer: timed out")
+            if len(connects) == 2:
+                started.set()
+                await asyncio.Event().wait()  # hangs until cancelled
+            client._connected = True
+            client._fmg = MagicMock()
+
+        monkeypatch.setattr(client, "connect", fake_connect)
+
+        with pytest.raises(ConnectionError):
+            await client.ensure_connected()
+        first = asyncio.create_task(client.ensure_connected())
+        await started.wait()
+        second = asyncio.create_task(client.ensure_connected())
+        await asyncio.sleep(0)
+        first.cancel()
+        await second
+
+        assert first.cancelled()
+        assert client.is_connected
+        assert len(connects) == 3
 
 
 class TestExecuteResilient:
@@ -528,6 +617,54 @@ class TestNotConnectedReconnect:
 
         assert len(calls) == 1
         assert reconnects == []
+
+    async def test_connect_on_demand_connects_before_the_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The server's client, whose startup connect failed, connects on its
+        next call instead of answering "Not connected" until a restart."""
+        client = _bare_client()  # _ever_connected is False
+        client.connect_on_demand = True
+        order: list[str] = []
+
+        async def fake_connect() -> None:
+            order.append("connect")
+            client._connected = True
+            client._fmg = MagicMock()
+
+        monkeypatch.setattr(client, "connect", fake_connect)
+
+        async def factory() -> str:
+            order.append("call")
+            return "ok"
+
+        result = await client._execute_resilient(factory, sleep=_no_sleep)
+
+        assert result == "ok"
+        assert order == ["connect", "call"]
+
+    async def test_failed_connect_on_demand_skips_the_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One connect attempt per call; the request itself never runs."""
+        client = _bare_client()
+        client.connect_on_demand = True
+        order: list[str] = []
+
+        async def fake_connect() -> None:
+            order.append("connect")
+            raise ConnectionError("Failed to connect to FortiAnalyzer: timed out")
+
+        monkeypatch.setattr(client, "connect", fake_connect)
+
+        async def factory() -> str:
+            order.append("call")
+            return "ok"
+
+        with pytest.raises(ConnectionError):
+            await client._execute_resilient(factory, sleep=_no_sleep)
+
+        assert order == ["connect"]
 
 
 class TestConcurrentReconnect:

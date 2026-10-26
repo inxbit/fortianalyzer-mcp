@@ -38,7 +38,8 @@ class FortiAnalyzerClient:
     """
 
     # Resilience: bounded transient retry with exponential backoff. Reconnect
-    # is handled separately by ensure_connected() (tools call it upfront).
+    # is handled separately by ensure_connected() (tools call it upfront, and
+    # with connect_on_demand every request does).
     _TRANSIENT_RETRIES = 2
     _TRANSIENT_BACKOFF_BASE = 0.5  # seconds; doubled each retry
     # FAZ error codes worth a retry on the same session: internal/general error.
@@ -59,6 +60,7 @@ class FortiAnalyzerClient:
         ca_bundle: str | None = None,
         timeout: int = 30,
         max_retries: int = 3,
+        connect_on_demand: bool = False,
     ) -> None:
         """Initialize FortiAnalyzer client."""
         self.host = host.replace("https://", "").replace("http://", "").rstrip("/")
@@ -77,12 +79,18 @@ class FortiAnalyzerClient:
         self.ca_bundle = ca_bundle
         self.timeout = timeout
         self.max_retries = max_retries
+        # Whether a request on a client that is not connected makes the
+        # connect itself (ensure_connected) before it runs. The server sets
+        # this so a failed startup connect is retried on the next tool call;
+        # without it such a request raises "Not connected".
+        self.connect_on_demand = connect_on_demand
 
         self._fmg: FortiManager | None = None
         self._connected = False
         # True once a login has succeeded at least once. Distinguishes a session
         # that dropped after being connected (revive it) from a client that was
-        # never connected (a direct API call should still raise "Not connected").
+        # never connected (a direct API call should still raise "Not connected",
+        # unless connect_on_demand makes the first connect before it).
         self._ever_connected = False
         self._faz_version: tuple[int, int, int] | None = None  # (major, minor, patch)
         self._faz_tz: ZoneInfo | None = None  # cached FAZ system timezone
@@ -93,6 +101,11 @@ class FortiAnalyzerClient:
         # lets a waiter detect that a peer already reconnected while it blocked.
         self._reconnect_lock = asyncio.Lock()
         self._reconnect_generation = 0
+        # Failed ensure_connected() attempts. Lets callers that queued behind a
+        # failed connect share its error instead of each waiting out another
+        # full timeout.
+        self._failed_connects = 0
+        self._last_connect_error: Exception | None = None
         # Serialize all blocking pyfmg I/O. pyfmg shares one requests.Session
         # and req_id counter, neither safe under concurrent use from worker
         # threads. One in-flight FAZ request at a time matches the previous
@@ -102,7 +115,9 @@ class FortiAnalyzerClient:
         logger.info(f"Initialized FortiAnalyzer client for {self.host}")
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "FortiAnalyzerClient":
+    def from_settings(
+        cls, settings: Settings, *, connect_on_demand: bool = False
+    ) -> "FortiAnalyzerClient":
         """Create client from settings."""
         return cls(
             host=settings.FORTIANALYZER_HOST,
@@ -113,6 +128,7 @@ class FortiAnalyzerClient:
             ca_bundle=settings.FORTIANALYZER_CA_BUNDLE or None,
             timeout=settings.FORTIANALYZER_TIMEOUT,
             max_retries=settings.FORTIANALYZER_MAX_RETRIES,
+            connect_on_demand=connect_on_demand,
         )
 
     def resolve_verify(self) -> bool | str:
@@ -323,18 +339,36 @@ class FortiAnalyzerClient:
         return self._fmg
 
     async def ensure_connected(self) -> None:
-        """Reconnect once if the session has dropped.
+        """Connect if not connected, sharing one attempt between concurrent callers.
 
-        Tools call this before issuing requests so an idle-closed session is
-        transparently revived. FortiAnalyzer can report not-connected after a
-        streamable HTTP session closes; a fresh request should reconnect rather
-        than surface a raw "Not connected" error. Raises ConnectionError if the
-        single reconnect attempt fails.
+        Tools call this before issuing requests, and with
+        ``connect_on_demand`` every request runs it first (see
+        :meth:`_execute_resilient`). The server's client, whose startup
+        connect fails when FortiAnalyzer is not reachable, therefore connects
+        on the next tool call instead of failing every call until a restart.
+
+        Callers that arrive while an attempt is in flight wait for it under
+        the reconnect lock. If that attempt failed, they re-raise its error
+        rather than each starting another attempt and waiting out another
+        full connect timeout. Raises whatever :meth:`connect` raised.
         """
         if self.is_connected:
             return
-        logger.warning("FortiAnalyzer session not connected; reconnecting once")
-        await self.connect()
+        observed = self._failed_connects
+        async with self._reconnect_lock:
+            if self.is_connected:
+                return
+            if self._failed_connects != observed and self._last_connect_error is not None:
+                # The attempt this caller queued behind failed: share its error.
+                raise self._last_connect_error
+            try:
+                await self.connect()
+            except Exception as e:
+                # CancelledError is not an Exception: a cancelled attempt is not
+                # counted, and the callers waiting behind it make their own.
+                self._last_connect_error = e
+                self._failed_connects += 1
+                raise
 
     def _is_transient_error(self, exc: Exception) -> bool:
         """Classify whether an error is worth a bounded retry.
@@ -370,7 +404,8 @@ class FortiAnalyzerClient:
         # A local not-connected error means the session dropped mid-request --
         # but only revive it if we were genuinely connected before. A client that
         # never connected must still surface "Not connected" rather than silently
-        # attempting a first login on an arbitrary API call.
+        # attempting a first login on an arbitrary API call; a first connect is
+        # made only on request, by connect_on_demand.
         if (
             self._ever_connected
             and isinstance(exc, ConnectionError)
@@ -408,6 +443,10 @@ class FortiAnalyzerClient:
     ) -> Any:
         """Run an async request factory with reconnect-once + transient retry.
 
+        With ``connect_on_demand``, a client that is not connected connects
+        first (:meth:`ensure_connected`); if that fails, its error is raised
+        and the factory never runs.
+
         A stale-session error triggers exactly one forced reconnect (re-login)
         and a retry — this revives a session the appliance dropped while the
         local client still believed it was connected. Transient FAZ/network
@@ -423,6 +462,9 @@ class FortiAnalyzerClient:
         accepted, so replaying it is safe.
         """
         sleeper = sleep or asyncio.sleep
+        if self.connect_on_demand:
+            # Outside the retry loop: one connect attempt per call, not one per retry.
+            await self.ensure_connected()
         retries_left = self._TRANSIENT_RETRIES if idempotent else 0
         reconnect_left = 1
         attempt = 0
