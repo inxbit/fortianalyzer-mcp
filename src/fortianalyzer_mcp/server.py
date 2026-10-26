@@ -1,5 +1,7 @@
 """FortiAnalyzer MCP Server implementation."""
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import logging
@@ -498,34 +500,61 @@ def main() -> None:
         run_http()
 
 
+async def _connect_in_background(client: FortiAnalyzerClient) -> None:
+    """Make the startup connect attempt without holding up the transport.
+
+    Awaiting it before serving made ``initialize`` wait out the whole connect
+    timeout when FortiAnalyzer was unreachable with username/password auth:
+    30 s by default, which is also Claude Code's MCP connect timeout, so the
+    server showed as failed. A failure here only logs. The client keeps
+    trying on each tool call (``ensure_connected``), so tools work once
+    FortiAnalyzer is reachable.
+    """
+    try:
+        await client.ensure_connected()
+        logger.info("FortiAnalyzer connection established")
+    except Exception as e:
+        logger.warning(
+            f"FortiAnalyzer connection failed: {e}. Tools retry the connection on their next call."
+        )
+
+
+def _start_faz_client() -> "asyncio.Task[None]":
+    """Create the global client and start connecting it in the background.
+
+    Returns the connect task, for :func:`_stop_faz_client` to cancel.
+    """
+    global faz_client
+
+    logger.info("Initializing FortiAnalyzer connection")
+    faz_client = FortiAnalyzerClient.from_settings(settings, connect_on_demand=True)
+    return asyncio.create_task(_connect_in_background(faz_client))
+
+
+async def _stop_faz_client(connect_task: "asyncio.Task[None]") -> None:
+    """Cancel a pending connect, then disconnect."""
+    connect_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await connect_task
+    logger.info("Closing FortiAnalyzer connection")
+    if faz_client:
+        await faz_client.disconnect()
+
+
 def run_stdio() -> None:
-    """Run MCP server in stdio mode for LM Studio and similar clients."""
-    import asyncio
+    """Run MCP server in stdio mode for LM Studio and similar clients.
+
+    Starts serving at once and connects in the background.
+    """
 
     async def stdio_main() -> None:
         """Main coroutine for stdio mode."""
-        global faz_client
-
-        # Initialize FortiAnalyzer connection
-        logger.info("Initializing FortiAnalyzer connection")
-        faz_client = FortiAnalyzerClient.from_settings(settings)
-
+        connect_task = _start_faz_client()
         try:
-            await faz_client.connect()
-            logger.info("FortiAnalyzer connection established")
-        except Exception as e:
-            logger.warning(f"FortiAnalyzer connection failed: {e}. Server will still start.")
-
-        try:
-            # Run MCPServer in stdio mode
             await mcp.run_stdio_async()
         finally:
-            # Cleanup
-            logger.info("Closing FortiAnalyzer connection")
-            if faz_client:
-                await faz_client.disconnect()
+            await _stop_faz_client(connect_task)
 
-    # Run the async main
     asyncio.run(stdio_main())
 
 
@@ -643,21 +672,11 @@ def run_http() -> None:
         """Ensure MCP session manager and FortiAnalyzer client start."""
         # Start MCP session manager
         async with mcp.session_manager.run():
-            # Initialize FortiAnalyzer connection
-            global faz_client
-            logger.info("Initializing FortiAnalyzer connection")
-            faz_client = FortiAnalyzerClient.from_settings(settings)
+            connect_task = _start_faz_client()
             try:
-                await faz_client.connect()
-                logger.info("FortiAnalyzer connection established")
-                yield
-            except Exception as e:
-                logger.warning(f"FortiAnalyzer connection failed: {e}. Server will still start.")
                 yield
             finally:
-                logger.info("Closing FortiAnalyzer connection")
-                if faz_client:
-                    await faz_client.disconnect()
+                await _stop_faz_client(connect_task)
 
     # Build middleware stack
     middleware = [Middleware(AuthMiddleware)]
