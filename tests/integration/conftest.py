@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fortianalyzer_mcp.api.client import FortiAnalyzerClient  # noqa: E402
+from fortianalyzer_mcp.utils.validation import build_device_filter  # noqa: E402
 
 
 @pytest.fixture
@@ -60,6 +61,16 @@ def test_device() -> str | None:
     Example: TEST_DEVICE=myfw01
     """
     return os.getenv("TEST_DEVICE")
+
+
+@pytest.fixture
+def device_filter(test_device: str | None) -> list[dict[str, str]]:
+    """Logview device filter, built the way the tools build it.
+
+    The appliance rejects an empty list ("Device type is unknown!"), so with
+    TEST_DEVICE unset this is all FortiGates, as the tools default to.
+    """
+    return build_device_filter(test_device)
 
 
 @pytest.fixture
