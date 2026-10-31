@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency security floors raised to the patched releases (twin of rstierli/fortimanager-mcp#38).** `pydantic-settings>=2.3.0` and `starlette>=0.37.0` admitted releases with published advisories, and nothing upstream raises them: mcp 2.3.0 does not depend on pydantic-settings, and the tightest starlette constraint in the tree is sse-starlette 3.6.0's `>=0.49.1`. An environment that already held an older release kept it. The floors are now `pydantic-settings>=2.14.2` (GHSA-4xgf-cpjx-pc3j) and `starlette>=1.3.1` (PYSEC-2026-249), the same as FortiManager MCP; `pip-audit` reports both advisories on 2.14.1 and 1.3.0 and none on the floors. A test pins them.
+
 ### Fixed
 
 - **Two mcp 1.x leftovers after the move to mcp 2.x.** The log-noise suppression in `configure_logging` named `httpx`, but mcp 2.x uses `httpx2`, which logs under its own name, so the line silenced a logger this tree no longer has; it now names `httpx2`. `httpx>=0.27.0` was still a declared dependency although nothing in `src/` or `tests/` imports it and nothing else in the tree pulls it (starlette wants it only under its `full` extra), so it is dropped. `tests/test_dependency_contract.py` pins both. Twin of rstierli/fortimanager-mcp#95.
