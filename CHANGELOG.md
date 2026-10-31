@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two mcp 1.x leftovers after the move to mcp 2.x.** The log-noise suppression in `configure_logging` named `httpx`, but mcp 2.x uses `httpx2`, which logs under its own name, so the line silenced a logger this tree no longer has; it now names `httpx2`. `httpx>=0.27.0` was still a declared dependency although nothing in `src/` or `tests/` imports it and nothing else in the tree pulls it (starlette wants it only under its `full` extra), so it is dropped. `tests/test_dependency_contract.py` pins both. Twin of rstierli/fortimanager-mcp#95.
+
 ## [2.14.0] - 2026-10-26
 
 Minor release. **Upgrade if you use `search_devices` or `list_tasks` with more than one condition.** Since 2.13.0 those tools OR'd conditions together, so they returned more rows than the filter matched, and `os_version_filter` never matched (#146). Also in this release: `in` on those two tools; a v2 masking-token envelope with forgery refusal (v1 tokens still accepted by default); masking fixes from the #80 sweep and #73; masked tokens inside TEXT values now resolve when sent back; and the server now answers MCP clients at once and connects to FortiAnalyzer in the background, so an unreachable appliance no longer stalls startup or leaves the tools dead until a restart.
