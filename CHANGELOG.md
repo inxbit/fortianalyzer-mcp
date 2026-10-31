@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Two mcp 1.x leftovers after the move to mcp 2.x.** The log-noise suppression in `configure_logging` named `httpx`, but mcp 2.x uses `httpx2`, which logs under its own name, so the line silenced a logger this tree no longer has; it now names `httpx2`. `httpx>=0.27.0` was still a declared dependency although nothing in `src/` or `tests/` imports it and nothing else in the tree pulls it (starlette wants it only under its `full` extra), so it is dropped. `tests/test_dependency_contract.py` pins both. Twin of rstierli/fortimanager-mcp#95.
+- **Two mcp 1.x leftovers after the move to mcp 2.x.** The log-noise suppression in `configure_logging` named `httpx`, but mcp 2.x uses `httpx2`, which logs under its own name, so the line silenced a logger this tree no longer has; it now names `httpx2`. `httpx>=0.27.0` was still a declared dependency although nothing in `src/` or `tests/` imports it and nothing else in the tree pulls it (starlette wants it only under its `full` extra), so it is dropped. `tests/test_dependency_contract.py` pins both. Twin of rstierli/fortimanager-mcp#95, fixed there by #96.
 
 ## [2.14.0] - 2026-10-26
 
