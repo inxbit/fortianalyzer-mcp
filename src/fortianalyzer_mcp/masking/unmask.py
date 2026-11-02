@@ -114,6 +114,32 @@ _FILTER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 # not whitespace or a word character, and it is nothing the URL split treats
 # specially, so a resolver sees it exactly as it would see the backslash.
 _HELD_BACKSLASH = ""
+# An odd run of held caller backslashes directly before a plaintext backslash.
+# Kept as written, the caller's last backslash would pair with the escape the
+# plaintext gets and change what the value says.
+_HELD_RUN_BEFORE_BACKSLASH_RE = re.compile(
+    r"(?<!" + _HELD_BACKSLASH + r")(?:" + _HELD_BACKSLASH + r"{2})*" + _HELD_BACKSLASH + r"\\"
+)
+
+
+def _stays_one_literal(value: str, quote: str) -> bool:
+    """Whether ``value`` placed between ``quote`` characters is one quoted literal.
+
+    Reads it the way the escape pass writes it: a backslash takes the next
+    character with it, a bare ``quote`` would end the literal, and a backslash
+    in last place would escape the closing quote.
+    """
+    i = 0
+    while i < len(value):
+        if value[i] == "\\":
+            if i + 1 == len(value):
+                return False
+            i += 2
+        elif value[i] == quote:
+            return False
+        else:
+            i += 1
+    return True
 
 
 class ArgUnmasker:
@@ -384,6 +410,12 @@ class ArgUnmasker:
                 return match.group(0)
             head = match.group(0)[: match.start("quote") - match.start()]
             if quote:
+                if _HELD_RUN_BEFORE_BACKSLASH_RE.search(resolved):
+                    logger.warning(
+                        "caller backslash would pair with a resolved backslash; "
+                        "token left unresolved"
+                    )
+                    return match.group(0)
                 # Preserve caller quoting and escape delimiters introduced by
                 # the resolved value so it cannot terminate the clause early.
                 # The caller's held backslashes go back exactly as written.
@@ -392,6 +424,16 @@ class ArgUnmasker:
                     .replace(quote, "\\" + quote)
                     .replace(_HELD_BACKSLASH, "\\")
                 )
+                # A caller backslash kept as written can pair with the escape
+                # in front of a resolved quote and leave that quote bare, or
+                # sit last and escape the closing quote. Either would let the
+                # resolved text end the clause, so fail closed instead.
+                if not _stays_one_literal(escaped, quote):
+                    logger.warning(
+                        "resolved filter value would not stay inside its quotes; "
+                        "token left unresolved"
+                    )
+                    return match.group(0)
                 return f"{head}{quote}{escaped}{quote}"
             # Use the same safe-bare or double-quoted convention as callers.
             return f"{head}{sanitize_filter_value(resolved)}"

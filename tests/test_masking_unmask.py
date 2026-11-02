@@ -852,6 +852,107 @@ class TestQuotedClauseKeepsCallerText:
         assert unmasker.unmask_filter(expression) == expression
 
 
+class TestHeldBackslashCannotPairWithResolvedText:
+    """A caller backslash kept as written must not pair with escaped plaintext.
+
+    A value that cannot be decomposed as a URL is sealed whole, so a hostile
+    ``url`` value can resolve to plaintext that opens with a quote or a
+    backslash, and its escaped form then opens with a backslash. An odd run
+    of caller backslashes directly before it would consume that escape and
+    leave the quote bare, closing the clause early. Those clauses fail
+    closed: the token stays as written.
+    """
+
+    HOSTILE = '" or srcip=="203.0.113.9'
+
+    @staticmethod
+    def _stays_one_literal(value: str, quote: str = '"') -> bool:
+        i = 0
+        while i < len(value):
+            if value[i] == "\\":
+                if i + 1 == len(value):
+                    return False
+                i += 2
+            elif value[i] == quote:
+                return False
+            else:
+                i += 1
+        return True
+
+    def _sealed(self, masker: OutputMasker, plaintext: str) -> str:
+        token = masker.mask_result({"url": plaintext})["url"]
+        assert token.startswith("url-"), token
+        return token
+
+    def test_odd_caller_backslash_before_a_quote_fails_closed(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ):
+        token = self._sealed(masker, self.HOSTILE)
+        expression = f'srcuuid_name=="CORP\\{token}"'
+
+        assert unmasker.unmask_filter(expression) == expression
+
+    def test_odd_caller_backslash_before_an_escaped_quote_fails_closed(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ):
+        token = self._sealed(masker, "\\" + self.HOSTILE)
+        expression = f'srcuuid_name=="CORP\\{token}"'
+
+        assert unmasker.unmask_filter(expression) == expression
+
+    def test_odd_caller_backslash_before_a_plaintext_backslash_fails_closed(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ):
+        # No quote ends up bare here, but the caller's escape would consume
+        # the plaintext's own backslash and change what the value says.
+        token = self._sealed(masker, "\\x")
+        expression = f'srcuuid_name=="CORP\\{token}"'
+
+        assert unmasker.unmask_filter(expression) == expression
+
+    def test_odd_caller_backslash_at_the_end_fails_closed(
+        self, unmasker: ArgUnmasker, engine: FPEEngine
+    ):
+        # Kept as written, a trailing lone backslash would escape the
+        # closing quote of the rebuilt clause.
+        token = engine.mint("hostname", "edge-fw-01")
+        expression = f'srcuuid_name=="{token} CORP\\"'
+
+        assert unmasker.unmask_filter(expression) == expression
+
+    def test_even_caller_run_before_a_quote_still_resolves_safely(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ):
+        token = self._sealed(masker, self.HOSTILE)
+
+        result = unmasker.unmask_filter(f'srcuuid_name=="CORP\\\\{token}"')
+
+        assert result == 'srcuuid_name=="CORP\\\\\\" or srcip==\\"203.0.113.9"'
+
+    def test_even_caller_run_before_a_plaintext_backslash_still_resolves(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ):
+        token = self._sealed(masker, "\\x")
+
+        result = unmasker.unmask_filter(f'srcuuid_name=="CORP\\\\{token}"')
+
+        assert result == 'srcuuid_name=="CORP' + "\\" * 4 + 'x"'
+
+    @pytest.mark.parametrize("run", [0, 1, 2, 3])
+    @pytest.mark.parametrize("plaintext", ['"x', '\\"x', "\\x", "x\\", 'x"'])
+    def test_rebuilt_value_always_stays_one_quoted_literal(
+        self, masker: OutputMasker, unmasker: ArgUnmasker, run: int, plaintext: str
+    ):
+        token = self._sealed(masker, plaintext)
+        expression = f'srcuuid_name=="CORP{chr(92) * run}{token}"'
+
+        result = unmasker.unmask_filter(expression)
+
+        prefix, suffix = 'srcuuid_name=="', '"'
+        assert result.startswith(prefix) and result.endswith(suffix)
+        assert self._stays_one_literal(result[len(prefix) : -len(suffix)])
+
+
 class TestResolveNeverRaises:
     def test_url_host_engine_failure_passes_through(
         self, unmasker: ArgUnmasker, engine: FPEEngine, monkeypatch: pytest.MonkeyPatch
