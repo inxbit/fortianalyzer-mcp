@@ -108,6 +108,12 @@ _FILTER_CLAUSE_RE = re.compile(
     r"(?P<quote>(?P<q>[\"'])?)(?P<value>(?(q)[^\"']+|[^\"'\s()]+))(?P=quote)"
 )
 _FILTER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# Stands in for the caller's own backslashes while a quoted clause value is
+# resolved, so that the escape pass afterwards touches only what resolution
+# introduced. No token can contain it (every token alphabet is ASCII), it is
+# not whitespace or a word character, and it is nothing the URL split treats
+# specially, so a resolver sees it exactly as it would see the backslash.
+_HELD_BACKSLASH = ""
 
 
 class ArgUnmasker:
@@ -338,14 +344,37 @@ class ArgUnmasker:
                 wc = re.match(r"^(%*)(.*?)(%*)$", raw)
                 if wc:
                     lead, core, trail = wc.group(1), wc.group(2), wc.group(3)
+            quote = match.group("quote")
+            # A quoted value is already in the caller's escaping, and no token
+            # contains a backslash, so every backslash here is the caller's.
+            # Hold them out of the escape pass below: without this, resolving
+            # one token doubled them, and the same caller text reached the
+            # appliance differently depending on whether a token sat beside it.
+            held = core
+            if quote and "\\" in core:
+                if _HELD_BACKSLASH in core:
+                    logger.warning(
+                        "quoted filter value carries the reserved hold-out character; "
+                        "token left unresolved"
+                    )
+                    return match.group(0)
+                held = core.replace("\\", _HELD_BACKSLASH)
             if field.lower() in COMPOSITE_URL_FULL:
-                resolved = self.resolve_url(core)
+                resolved = self.resolve_url(held)
             elif field.lower() in COMPOSITE_PREFIXED:
-                resolved = self.resolve_prefixed(core)
+                resolved = self.resolve_prefixed(held)
             else:
                 vtype = FIELD_TYPES.get(field.lower())
-                resolved = self.resolve_scalar(core, vtype)
-            if resolved == core:
+                resolved = self.resolve_scalar(held, vtype)
+            if resolved == held:
+                return match.group(0)
+            if resolved.count(_HELD_BACKSLASH) != held.count(_HELD_BACKSLASH):
+                # The resolved plaintext itself carries the hold-out character,
+                # so the caller's backslashes can no longer be told apart.
+                logger.warning(
+                    "resolved filter value carries the reserved hold-out character; "
+                    "token left unresolved"
+                )
                 return match.group(0)
             resolved = f"{lead}{resolved}{trail}"
             if _FILTER_CONTROL_RE.search(resolved):
@@ -353,12 +382,16 @@ class ArgUnmasker:
                     "resolved filter value has control characters; token left unresolved"
                 )
                 return match.group(0)
-            quote = match.group("quote")
             head = match.group(0)[: match.start("quote") - match.start()]
             if quote:
                 # Preserve caller quoting and escape delimiters introduced by
                 # the resolved value so it cannot terminate the clause early.
-                escaped = resolved.replace("\\", "\\\\").replace(quote, "\\" + quote)
+                # The caller's held backslashes go back exactly as written.
+                escaped = (
+                    resolved.replace("\\", "\\\\")
+                    .replace(quote, "\\" + quote)
+                    .replace(_HELD_BACKSLASH, "\\")
+                )
                 return f"{head}{quote}{escaped}{quote}"
             # Use the same safe-bare or double-quoted convention as callers.
             return f"{head}{sanitize_filter_value(resolved)}"

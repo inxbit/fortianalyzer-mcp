@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Resolving a token inside a quoted filter value no longer doubles the caller's own backslashes.** `unmask_filter` escapes the resolved value before putting it back between the caller's quotes, so a plaintext carrying a quote or a backslash cannot end the clause early. It escaped the whole value, though, and when the token sat inside a label the rest of that value was the caller's text, already in the caller's escaping. `srcuuid_name=="CORP\\grp <token>"` reached FortiAnalyzer as `"CORP\\\\grp edge-fw-01"`, two literal backslashes, while the same clause with no token in it passed through as written. The same applied to a `like` pattern and to the path of a `url` value whose host token resolved. No token contains a backslash, so every backslash in a quoted value before resolution is the caller's; those are now held out of the escape pass and put back as written, and only what the resolution introduced is escaped. A quoted value that already carries the reserved hold-out character, or whose resolved plaintext does, is left unresolved with a warning, the same fail-closed outcome as a resolved value with a control character. Unquoted clauses are unchanged.
+
 ## [2.14.2] - 2026-11-02
 
 Patch release. **Upgrade if you run the server in Docker, under systemd or in Kubernetes:** stopping it waited out the full `FORTIANALYZER_TIMEOUT` (30 s by default) whenever FortiAnalyzer did not answer, so `docker stop` killed the container instead. A token-mode server now stops at once and a password-mode one within 5 s. Also in this release: with an API token, the server now checks that it can reach FortiAnalyzer before it reports itself connected, so `/health` no longer says `fortianalyzer_connected: true` against an unreachable appliance, and an invalid token fails at connect.

@@ -776,6 +776,82 @@ class TestFilterInjectionGuard:
         assert unmasker.unmask_filter(f'user=="{token}"') == 'user=="jdoe"'
 
 
+class TestQuotedClauseKeepsCallerText:
+    """Resolving a token must not re-escape the caller's own quoted text.
+
+    A quoted clause value is already in the caller's escaping, and no token
+    contains a backslash, so every backslash present before resolution is
+    the caller's. Only what the resolution introduces gets escaped; the rest
+    of the value reaches the appliance exactly as it would with no token in
+    the clause at all.
+    """
+
+    def test_embedded_token_leaves_caller_backslash_as_written(
+        self, unmasker: ArgUnmasker, engine: FPEEngine
+    ):
+        token = engine.mint("hostname", "edge-fw-01")
+
+        result = unmasker.unmask_filter(f'srcuuid_name=="CORP\\\\grp {token}"')
+
+        assert result == 'srcuuid_name=="CORP\\\\grp edge-fw-01"'
+
+    def test_same_caller_text_with_no_token_is_the_reference(self, unmasker: ArgUnmasker):
+        expression = 'srcuuid_name=="CORP\\\\grp edge-fw-01"'
+
+        assert unmasker.unmask_filter(expression) == expression
+
+    def test_like_clause_leaves_caller_backslash_as_written(
+        self, unmasker: ArgUnmasker, engine: FPEEngine
+    ):
+        token = engine.mint("hostname", "edge-fw-01")
+
+        result = unmasker.unmask_filter(f'srcuuid_name like "%CORP\\\\grp {token}%"')
+
+        assert result == 'srcuuid_name like "%CORP\\\\grp edge-fw-01%"'
+
+    def test_url_host_token_leaves_caller_tail_as_written(
+        self, unmasker: ArgUnmasker, engine: FPEEngine
+    ):
+        host = engine.mint("hostname", "edge.example.com")
+
+        result = unmasker.unmask_filter(f'url=="https://{host}/a\\\\b"')
+
+        assert result == 'url=="https://edge.example.com/a\\\\b"'
+
+    def test_resolved_plaintext_is_still_escaped(self, masker: OutputMasker, unmasker: ArgUnmasker):
+        masked = masker.mask_result({"url": 'https://ex.example.com/p"q\\r'})["url"]
+
+        result = unmasker.unmask_filter(f'url=="{masked}"')
+
+        assert result == 'url=="https://ex.example.com/p\\"q\\\\r"'
+
+    def test_caller_and_plaintext_backslashes_in_one_clause(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ):
+        masked = masker.mask_result({"url": 'https://ex.example.com/p"q\\r'})["url"]
+
+        result = unmasker.unmask_filter(f'srcuuid_name=="CORP\\\\grp {masked}"')
+
+        assert result.startswith('srcuuid_name=="CORP\\\\grp https://ex.example.com/')
+        assert result.endswith('p\\"q\\\\r"')
+
+    def test_caller_text_holding_the_reserved_character_is_left_unresolved(
+        self, unmasker: ArgUnmasker, engine: FPEEngine
+    ):
+        token = engine.mint("hostname", "edge-fw-01")
+        expression = f'srcuuid_name=="CORP\\\\grp {token}"'
+
+        assert unmasker.unmask_filter(expression) == expression
+
+    def test_plaintext_holding_the_reserved_character_is_left_unresolved(
+        self, masker: OutputMasker, unmasker: ArgUnmasker
+    ):
+        masked = masker.mask_result({"url": "https://ex.example.com/pq"})["url"]
+        expression = f'srcuuid_name=="CORP\\\\grp {masked}"'
+
+        assert unmasker.unmask_filter(expression) == expression
+
+
 class TestResolveNeverRaises:
     def test_url_host_engine_failure_passes_through(
         self, unmasker: ArgUnmasker, engine: FPEEngine, monkeypatch: pytest.MonkeyPatch
